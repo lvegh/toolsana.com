@@ -1,0 +1,180 @@
+const express = require('express');
+const { basicRateLimit } = require('../middleware/rateLimit');
+const { sendSuccess } = require('../middleware/errorHandler');
+
+const router = express.Router();
+
+/**
+ * API Root Endpoint
+ */
+router.get('/', basicRateLimit, (req, res) => {
+  const apiInfo = {
+    name: 'ToolzyHub API',
+    version: process.env.API_VERSION || 'v1',
+    description: 'Secure Node.js API server for ToolzyHub with token protection and rate limiting',
+    environment: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString(),
+      endpoints: {
+        health: '/health',
+        version: '/version',
+        status: '/status',
+        metrics: '/metrics',
+        compress: '/api/compress',
+        // Add more endpoints as they are created
+        // auth: '/api/v1/auth',
+        // upload: '/api/v1/upload',
+        // tools: '/api/v1/tools'
+      },
+    documentation: {
+      swagger: '/api/docs', // Future implementation
+      postman: '/api/postman' // Future implementation
+    },
+    support: {
+      email: 'support@toolzyhub.com',
+      github: 'https://github.com/toolzyhub/api'
+    }
+  };
+
+  sendSuccess(res, 'Welcome to ToolzyHub API', apiInfo);
+});
+
+/**
+ * API Information Endpoint
+ */
+router.get('/info', basicRateLimit, (req, res) => {
+  const info = {
+    api: {
+      name: 'ToolzyHub API',
+      version: process.env.API_VERSION || 'v1',
+      description: 'Secure Node.js API server for ToolzyHub',
+      author: 'ToolzyHub Team',
+      license: 'MIT'
+    },
+    server: {
+      environment: process.env.NODE_ENV || 'development',
+      node_version: process.version,
+      uptime: process.uptime(),
+      memory_usage: process.memoryUsage(),
+      platform: process.platform,
+      arch: process.arch
+    },
+    features: {
+      authentication: {
+        jwt: true,
+        api_keys: true,
+        refresh_tokens: true
+      },
+      security: {
+        rate_limiting: true,
+        cors: true,
+        helmet: true,
+        xss_protection: true,
+        sql_injection_protection: true,
+        brute_force_protection: true
+      },
+      file_handling: {
+        image_processing: true,
+        file_uploads: true,
+        sharp_integration: true
+      },
+      monitoring: {
+        health_checks: true,
+        metrics: true,
+        logging: true
+      },
+      caching: {
+        redis: process.env.REDIS_HOST ? true : false
+      }
+    },
+    limits: {
+      max_file_size: process.env.MAX_FILE_SIZE || '10MB',
+      rate_limit: {
+        window: process.env.RATE_LIMIT_WINDOW_MS || '15 minutes',
+        max_requests: process.env.RATE_LIMIT_MAX_REQUESTS || 100
+      }
+    }
+  };
+
+  sendSuccess(res, 'API information retrieved', info);
+});
+
+/**
+ * API Documentation Endpoint (placeholder)
+ */
+router.get('/docs', basicRateLimit, (req, res) => {
+  const docs = {
+    message: 'API Documentation',
+    swagger_ui: '/api/docs/swagger', // Future implementation
+    openapi_spec: '/api/docs/openapi.json', // Future implementation
+    postman_collection: '/api/docs/postman.json', // Future implementation
+    endpoints: {
+      authentication: {
+        login: 'POST /api/v1/auth/login',
+        register: 'POST /api/v1/auth/register',
+        refresh: 'POST /api/v1/auth/refresh',
+        logout: 'POST /api/v1/auth/logout'
+      },
+      file_operations: {
+        upload: 'POST /api/v1/upload',
+        process_image: 'POST /api/v1/upload/process',
+        delete: 'DELETE /api/v1/upload/:id'
+      },
+      image_compression: {
+        compress_jpg: 'POST /api/compress/jpg',
+        batch_compress: 'POST /api/compress/batch',
+        compression_info: 'GET /api/compress/info'
+      },
+      health_monitoring: {
+        health: 'GET /health',
+        detailed_health: 'GET /health/detailed',
+        readiness: 'GET /ready',
+        liveness: 'GET /live',
+        metrics: 'GET /metrics',
+        status: 'GET /status',
+        version: 'GET /version'
+      }
+    },
+    authentication: {
+      type: 'Bearer Token or API Key',
+      header: 'Authorization: Bearer <token> or X-API-Key: <api_key>',
+      token_expiry: process.env.JWT_EXPIRES_IN || '24h'
+    },
+    error_handling: {
+      format: {
+        success: false,
+        message: 'Error description',
+        timestamp: 'ISO 8601 timestamp',
+        errors: 'Array of detailed errors (optional)'
+      },
+      status_codes: {
+        200: 'Success',
+        201: 'Created',
+        400: 'Bad Request',
+        401: 'Unauthorized',
+        403: 'Forbidden',
+        404: 'Not Found',
+        429: 'Too Many Requests',
+        500: 'Internal Server Error'
+      }
+    }
+  };
+
+  sendSuccess(res, 'API documentation', docs);
+});
+
+// Import and use route modules as they are created
+const compressRoutes = require('./compress');
+
+// Register routes
+router.use('/compress', compressRoutes);
+
+// Example for future routes:
+// const authRoutes = require('./auth');
+// const uploadRoutes = require('./upload');
+// const toolsRoutes = require('./tools');
+
+// router.use('/auth', authRoutes);
+// router.use('/upload', uploadRoutes);
+// router.use('/tools', toolsRoutes);
+
+module.exports = router;
