@@ -42,6 +42,22 @@ const uploadPng = multer({
   }
 });
 
+// Configure multer for file uploads (WebP)
+const uploadWebp = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Check if file is WebP
+    if (file.mimetype === 'image/webp') {
+      cb(null, true);
+    } else {
+      cb(new Error('File must be a WebP image'), false);
+    }
+  }
+});
+
 /**
  * POST /api/compress/jpg
  * Compress JPG/JPEG images
@@ -222,10 +238,99 @@ router.post('/png', basicRateLimit, uploadPng.single('file'), async (req, res) =
 });
 
 /**
+ * POST /api/compress/webp
+ * Compress WebP images
+ */
+router.post('/webp', basicRateLimit, uploadWebp.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    // Get quality parameter (default to 80)
+    const quality = parseInt(req.body.quality) || 80;
+
+    // Validate quality range (0-100 for WebP)
+    if (quality < 0 || quality > 100) {
+      return sendError(res, 'Quality must be between 0 and 100', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalSize = originalBuffer.length;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+
+    logger.info('Starting WebP compression', {
+      originalName: req.file.originalname,
+      originalSize,
+      quality,
+      mimetype: req.file.mimetype
+    });
+
+    // Compress WebP with Sharp
+    const compressedBuffer = await sharp(originalBuffer)
+      .webp({
+        quality, // 0-100, where 100 is maximum quality
+        effort: 6, // 0-6, where 6 is maximum effort (slower but better compression)
+        lossless: false
+      })
+      .toBuffer();
+
+    // Calculate compression statistics
+    const compressedSize = compressedBuffer.length;
+    const compressionRatio = (
+      ((originalSize - compressedSize) / originalSize) * 100
+    ).toFixed(1);
+
+    // Generate filename
+    const filename = `${originalName}_compressed.webp`;
+
+    logger.info('WebP compression completed', {
+      originalName: req.file.originalname,
+      originalSize,
+      compressedSize,
+      compressionRatio: `${compressionRatio}%`,
+      quality
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': 'image/webp',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': compressedSize.toString(),
+      'X-Original-Size': originalSize.toString(),
+      'X-Compressed-Size': compressedSize.toString(),
+      'X-Compression-Ratio': compressionRatio,
+      'X-Quality': quality.toString(),
+      'X-Original-Filename': req.file.originalname
+    });
+
+    // Send the compressed image
+    res.send(compressedBuffer);
+
+  } catch (error) {
+    logger.error('WebP compression error:', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size
+    });
+
+    if (error.message.includes('File must be a WebP image')) {
+      return sendError(res, 'File must be a WebP image', 400);
+    }
+
+    return sendError(res, 'Failed to compress image', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
  * POST /api/compress/batch
  * Compress multiple JPG/JPEG images
  */
-router.post('/batch', basicRateLimit, uploadJpg.array('files', 10), async (req, res) => {
+router.post('/batch', basicRateLimit, uploadJpg.array('files', 5), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return sendError(res, 'No files provided', 400);
@@ -334,7 +439,7 @@ router.get('/info', basicRateLimit, (req, res) => {
     },
     limits: {
       maxFileSize: '10MB',
-      maxBatchFiles: 10,
+      maxBatchFiles: 5,
       jpgQualityRange: '1-100',
       pngCompressionRange: '0-9'
     },
@@ -373,7 +478,7 @@ router.get('/info', basicRateLimit, (req, res) => {
         endpoint: '/api/compress/batch',
         contentType: 'multipart/form-data',
         fields: {
-          files: 'Array of JPG/JPEG image files (required, max 10)',
+          files: 'Array of JPG/JPEG image files (required, max 5)',
           quality: 'Compression quality 1-100 (optional, default: 80)'
         },
         response: 'JSON with compressed images as base64 and statistics'

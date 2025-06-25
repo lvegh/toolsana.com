@@ -20,6 +20,7 @@ router.get('/', basicRateLimit, (req, res) => {
         status: '/status',
         metrics: '/metrics',
         compress: '/api/compress',
+        convert: '/api/convert',
         // Add more endpoints as they are created
         // auth: '/api/v1/auth',
         // upload: '/api/v1/upload',
@@ -30,7 +31,7 @@ router.get('/', basicRateLimit, (req, res) => {
       postman: '/api/postman' // Future implementation
     },
     support: {
-      email: 'support@toolzyhub.com',
+      email: 'support@toolzyhub.app',
       github: 'https://github.com/toolzyhub/api'
     }
   };
@@ -121,8 +122,25 @@ router.get('/docs', basicRateLimit, (req, res) => {
       },
       image_compression: {
         compress_jpg: 'POST /api/compress/jpg',
+        compress_png: 'POST /api/compress/png',
+        compress_webp: 'POST /api/compress/webp',
         batch_compress: 'POST /api/compress/batch',
         compression_info: 'GET /api/compress/info'
+      },
+      image_conversion: {
+        jpg_to_png: 'POST /api/convert/jpg-to-png',
+        png_to_jpg: 'POST /api/convert/png-to-jpg',
+        png_to_webp: 'POST /api/convert/png-to-webp',
+        png_to_avif: 'POST /api/convert/png-to-avif',
+        jpg_to_webp: 'POST /api/convert/jpg-to-webp',
+        jpg_to_avif: 'POST /api/convert/jpg-to-avif',
+        webp_to_avif: 'POST /api/convert/webp_to_avif',
+        webp_to_jpg: 'POST /api/convert/webp_to_jpg',
+        webp_to_png: 'POST /api/convert/webp_to_png',
+        avif_to_png: 'POST /api/convert/avif_to_png',
+        avif_to_jpg: 'POST /api/convert/avif_to_jpg',
+        avif_to_webp: 'POST /api/convert/avif_to_webp',
+        conversion_info: 'GET /api/convert/info'
       },
       health_monitoring: {
         health: 'GET /health',
@@ -164,9 +182,13 @@ router.get('/docs', basicRateLimit, (req, res) => {
 
 // Import and use route modules as they are created
 const compressRoutes = require('./compress');
+const convertRoutes = require('./convert');
+const hashRoutes = require('./hash');
 
 // Register routes
 router.use('/compress', compressRoutes);
+router.use('/convert', convertRoutes);
+router.use('/hash', hashRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
