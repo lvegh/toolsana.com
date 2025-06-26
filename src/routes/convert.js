@@ -4,6 +4,7 @@ const sharp = require('sharp');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const Potrace = require('potrace');
 
 const router = express.Router();
 
@@ -68,6 +69,1081 @@ const uploadAvif = multer({
     } else {
       cb(new Error('File must be an AVIF image'), false);
     }
+  }
+});
+
+// Add this to your convert.js file
+
+// Configure multer for SVG file uploads
+const uploadSvg = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Check if file is SVG
+    if (file.mimetype === 'image/svg+xml' || file.mimetype === 'text/xml' || file.originalname.toLowerCase().endsWith('.svg')) {
+      cb(null, true);
+    } else {
+      cb(new Error('File must be an SVG image'), false);
+    }
+  }
+});
+
+// Configure multer for any image file uploads
+const uploadAnyImage = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Check if file is an image
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('File must be an image'), false);
+    }
+  }
+});
+
+/**
+ * POST /api/convert/image-to-base64
+ * Convert any image to Base64 string
+ */
+router.post('/image-to-base64', basicRateLimit, uploadAnyImage.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+    const includeDataUrl = req.body.includeDataUrl === 'true';
+    const copyFormat = req.body.copyFormat || 'dataurl'; // 'dataurl', 'base64only', 'css', 'html', 'json'
+
+    logger.info('Starting Image to Base64 conversion', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      mimetype: req.file.mimetype,
+      includeDataUrl,
+      copyFormat
+    });
+
+    // Get image metadata
+    const metadata = await sharp(originalBuffer).metadata();
+
+    logger.info('Image metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      channels: metadata.channels,
+      format: metadata.format,
+      hasAlpha: metadata.hasAlpha,
+      colorspace: metadata.space
+    });
+
+    // Convert buffer to base64
+    const base64String = originalBuffer.toString('base64');
+    const mimeType = req.file.mimetype;
+    const dataUrl = `data:${mimeType};base64,${base64String}`;
+
+    // Generate different formats based on request
+    let output = '';
+    let contentType = 'text/plain';
+    let filename = `${originalName}_base64.txt`;
+
+    switch (copyFormat) {
+      case 'dataurl':
+        output = dataUrl;
+        filename = `${originalName}_dataurl.txt`;
+        break;
+      
+      case 'base64only':
+        output = base64String;
+        filename = `${originalName}_base64.txt`;
+        break;
+      
+      case 'css':
+        output = `background-image: url('${dataUrl}');`;
+        filename = `${originalName}_css.css`;
+        contentType = 'text/css';
+        break;
+      
+      case 'html':
+        output = `<img src="${dataUrl}" alt="${originalName}" />`;
+        filename = `${originalName}_html.html`;
+        contentType = 'text/html';
+        break;
+      
+      case 'json':
+        output = JSON.stringify({
+          filename: req.file.originalname,
+          mimeType: mimeType,
+          size: originalBuffer.length,
+          width: metadata.width,
+          height: metadata.height,
+          base64: base64String,
+          dataUrl: dataUrl
+        }, null, 2);
+        filename = `${originalName}_data.json`;
+        contentType = 'application/json';
+        break;
+      
+      default:
+        output = dataUrl;
+        break;
+    }
+
+    logger.info('Image to Base64 conversion completed', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      base64Length: base64String.length,
+      outputLength: output.length,
+      format: copyFormat,
+      mimeType,
+      filename
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': Buffer.byteLength(output, 'utf8').toString(),
+      'X-Original-Filename': req.file.originalname,
+      'X-Original-Size': originalBuffer.length.toString(),
+      'X-Base64-Length': base64String.length.toString(),
+      'X-Output-Format': copyFormat,
+      'X-Mime-Type': mimeType,
+      'X-Image-Width': (metadata.width || 'unknown').toString(),
+      'X-Image-Height': (metadata.height || 'unknown').toString(),
+      'X-Image-Channels': (metadata.channels || 'unknown').toString()
+    });
+
+    // Send the base64 output
+    res.send(output);
+
+  } catch (error) {
+    logger.error('Image to Base64 conversion error:', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size,
+      copyFormat: req.body?.copyFormat
+    });
+
+    if (error.message.includes('File must be an image')) {
+      return sendError(res, 'File must be an image', 400);
+    }
+
+    if (error.message.includes('Input buffer contains unsupported image format')) {
+      return sendError(res, 'Unsupported image format', 400);
+    }
+
+    return sendError(res, 'Failed to convert image to Base64', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * POST /api/convert/base64-to-image
+ * Convert Base64 string to image
+ */
+router.post('/base64-to-image', basicRateLimit, async (req, res) => {
+  try {
+    const { base64Data, filename, outputFormat } = req.body;
+
+    if (!base64Data) {
+      return sendError(res, 'No Base64 data provided', 400);
+    }
+
+    logger.info('Starting Base64 to Image conversion', {
+      base64Length: base64Data.length,
+      filename: filename || 'converted',
+      outputFormat: outputFormat || 'auto'
+    });
+
+    let base64String = base64Data;
+    let detectedMimeType = null;
+
+    // Handle data URL format
+    if (base64Data.startsWith('data:')) {
+      const dataUrlMatch = base64Data.match(/^data:([^;]+);base64,(.+)$/);
+      if (dataUrlMatch) {
+        detectedMimeType = dataUrlMatch[1];
+        base64String = dataUrlMatch[2];
+        logger.info('Detected data URL format', { mimeType: detectedMimeType });
+      } else {
+        return sendError(res, 'Invalid data URL format', 400);
+      }
+    }
+
+    // Convert base64 to buffer
+    let imageBuffer;
+    try {
+      imageBuffer = Buffer.from(base64String, 'base64');
+    } catch (bufferError) {
+      return sendError(res, 'Invalid Base64 string', 400);
+    }
+
+    if (imageBuffer.length === 0) {
+      return sendError(res, 'Empty Base64 data', 400);
+    }
+
+    // Get image metadata to validate and determine format
+    let metadata;
+    try {
+      metadata = await sharp(imageBuffer).metadata();
+    } catch (sharpError) {
+      return sendError(res, 'Invalid image data in Base64 string', 400);
+    }
+
+    logger.info('Decoded image metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      format: metadata.format,
+      hasAlpha: metadata.hasAlpha,
+      colorspace: metadata.space,
+      size: imageBuffer.length
+    });
+
+    // Determine output format
+    let targetFormat = outputFormat || metadata.format || 'png';
+    let outputMimeType = `image/${targetFormat}`;
+    let outputBuffer = imageBuffer;
+
+    // Convert if different format requested
+    if (outputFormat && outputFormat !== metadata.format) {
+      try {
+        let sharpInstance = sharp(imageBuffer);
+        
+        switch (outputFormat.toLowerCase()) {
+          case 'png':
+            outputBuffer = await sharpInstance.png().toBuffer();
+            outputMimeType = 'image/png';
+            break;
+          case 'jpg':
+          case 'jpeg':
+            outputBuffer = await sharpInstance.jpeg({ quality: 90 }).toBuffer();
+            outputMimeType = 'image/jpeg';
+            targetFormat = 'jpg';
+            break;
+          case 'webp':
+            outputBuffer = await sharpInstance.webp({ quality: 90 }).toBuffer();
+            outputMimeType = 'image/webp';
+            break;
+          case 'avif':
+            outputBuffer = await sharpInstance.avif({ quality: 90 }).toBuffer();
+            outputMimeType = 'image/avif';
+            break;
+          default:
+            // Keep original format
+            outputBuffer = imageBuffer;
+            outputMimeType = detectedMimeType || `image/${metadata.format}`;
+            targetFormat = metadata.format;
+        }
+      } catch (conversionError) {
+        logger.error('Format conversion error:', conversionError);
+        // Fall back to original format
+        outputBuffer = imageBuffer;
+        outputMimeType = detectedMimeType || `image/${metadata.format}`;
+        targetFormat = metadata.format;
+      }
+    } else {
+      outputMimeType = detectedMimeType || `image/${metadata.format}`;
+    }
+
+    // Generate filename
+    const outputFilename = filename 
+      ? `${filename.replace(/\.[^/.]+$/, '')}.${targetFormat}`
+      : `converted_image.${targetFormat}`;
+
+    logger.info('Base64 to Image conversion completed', {
+      inputBase64Length: base64Data.length,
+      outputSize: outputBuffer.length,
+      outputFormat: targetFormat,
+      outputMimeType,
+      filename: outputFilename,
+      originalFormat: metadata.format,
+      converted: outputFormat && outputFormat !== metadata.format
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': outputMimeType,
+      'Content-Disposition': `attachment; filename="${outputFilename}"`,
+      'Content-Length': outputBuffer.length.toString(),
+      'X-Original-Format': metadata.format,
+      'X-Output-Format': targetFormat,
+      'X-Image-Width': (metadata.width || 'unknown').toString(),
+      'X-Image-Height': (metadata.height || 'unknown').toString(),
+      'X-Original-Base64-Length': base64Data.length.toString(),
+      'X-Converted': (outputFormat && outputFormat !== metadata.format) ? 'true' : 'false'
+    });
+
+    // Send the converted image
+    res.send(outputBuffer);
+
+  } catch (error) {
+    logger.error('Base64 to Image conversion error:', {
+      error: error.message,
+      stack: error.stack,
+      base64Length: req.body?.base64Data?.length,
+      filename: req.body?.filename,
+      outputFormat: req.body?.outputFormat
+    });
+
+    return sendError(res, 'Failed to convert Base64 to image', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * POST /api/convert/png-to-svg
+ * Convert PNG images to SVG using JavaScript Potrace (Railway-compatible)
+ */
+router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+    const threshold = parseInt(req.body.threshold) || 128;
+    const turdSize = parseInt(req.body.turdSize) || 2;
+    const alphaMax = parseFloat(req.body.alphaMax) || 1.0;
+    const optCurve = req.body.optCurve !== 'false';
+    const optTolerance = parseFloat(req.body.optTolerance) || 0.2;
+    const turnPolicy = req.body.turnPolicy || 'minority';
+    const color = req.body.color || 'auto';
+
+    // Validate parameters
+    if (threshold < 0 || threshold > 255) {
+      return sendError(res, 'Threshold must be between 0 and 255', 400);
+    }
+
+    if (turdSize < 0 || turdSize > 100) {
+      return sendError(res, 'Turd size must be between 0 and 100', 400);
+    }
+
+    if (alphaMax < 0 || alphaMax > 1.3) {
+      return sendError(res, 'Alpha max must be between 0 and 1.3', 400);
+    }
+
+    if (optTolerance < 0 || optTolerance > 1) {
+      return sendError(res, 'Optimization tolerance must be between 0 and 1', 400);
+    }
+
+    const validTurnPolicies = ['black', 'white', 'left', 'right', 'minority', 'majority'];
+    if (!validTurnPolicies.includes(turnPolicy)) {
+      return sendError(res, 'Invalid turn policy', 400);
+    }
+
+    logger.info('Starting PNG to SVG conversion (JavaScript Potrace)', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      mimetype: req.file.mimetype,
+      threshold,
+      turdSize,
+      alphaMax,
+      optCurve,
+      optTolerance,
+      turnPolicy,
+      color
+    });
+
+    // Get PNG metadata
+    const metadata = await sharp(originalBuffer).metadata();
+
+    logger.info('PNG metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      channels: metadata.channels,
+      format: metadata.format,
+      hasAlpha: metadata.hasAlpha,
+      colorspace: metadata.space
+    });
+
+    // Configure potrace options for JavaScript implementation
+    const potraceOptions = {
+      threshold: threshold,
+      turdSize: turdSize,
+      alphaMax: alphaMax,
+      optCurve: optCurve,
+      optTolerance: optTolerance,
+      turnPolicy: turnPolicy
+    };
+
+    // Add color if specified (not 'auto')
+    if (color !== 'auto') {
+      potraceOptions.color = color;
+    }
+
+    logger.info('JavaScript Potrace options', potraceOptions);
+
+    // Use JavaScript Potrace to trace the image
+    const svgString = await new Promise((resolve, reject) => {
+      Potrace.trace(originalBuffer, potraceOptions, (err, svg) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(svg);
+        }
+      });
+    });
+
+    // Verify the SVG was generated
+    if (!svgString || svgString.length === 0) {
+      throw new Error('Vectorization resulted in empty SVG');
+    }
+
+    // Additional validation - check if SVG is valid
+    if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
+      throw new Error('Generated SVG is invalid or corrupted');
+    }
+
+    // Convert string to buffer for consistent handling
+    const svgBuffer = Buffer.from(svgString, 'utf8');
+
+    // Generate filename
+    const filename = `${originalName}.svg`;
+
+    const compressionRatio = ((originalBuffer.length - svgBuffer.length) / originalBuffer.length * 100).toFixed(2);
+
+    logger.info('PNG to SVG conversion completed (JavaScript Potrace)', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      convertedSize: svgBuffer.length,
+      compressionRatio: compressionRatio + '%',
+      svgLength: svgString.length,
+      threshold,
+      turdSize,
+      alphaMax,
+      optCurve,
+      optTolerance,
+      turnPolicy,
+      color,
+      filename
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': 'image/svg+xml',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': svgBuffer.length.toString(),
+      'X-Original-Filename': req.file.originalname,
+      'X-Original-Size': originalBuffer.length.toString(),
+      'X-Converted-Size': svgBuffer.length.toString(),
+      'X-Compression-Ratio': compressionRatio + '%',
+      'X-Threshold': threshold.toString(),
+      'X-Turd-Size': turdSize.toString(),
+      'X-Alpha-Max': alphaMax.toString(),
+      'X-Opt-Curve': optCurve.toString(),
+      'X-Opt-Tolerance': optTolerance.toString(),
+      'X-Turn-Policy': turnPolicy,
+      'X-Color': color,
+      'X-Original-Width': (metadata.width || 'unknown').toString(),
+      'X-Original-Height': (metadata.height || 'unknown').toString(),
+      'X-Original-Channels': (metadata.channels || 'unknown').toString(),
+      'X-Engine': 'potrace-js'
+    });
+
+    // Send the converted SVG
+    res.send(svgBuffer);
+
+  } catch (error) {
+    logger.error('PNG to SVG conversion error (JavaScript Potrace):', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size,
+      threshold: req.body?.threshold,
+      turdSize: req.body?.turdSize,
+      alphaMax: req.body?.alphaMax,
+      optCurve: req.body?.optCurve,
+      optTolerance: req.body?.optTolerance,
+      turnPolicy: req.body?.turnPolicy,
+      color: req.body?.color
+    });
+
+    if (error.message.includes('File must be a PNG image')) {
+      return sendError(res, 'File must be a PNG image', 400);
+    }
+
+    if (error.message.includes('Vectorization resulted in empty SVG')) {
+      return sendError(res, 'Vectorization failed. The image may be too complex or contain no traceable content.', 500);
+    }
+
+    if (error.message.includes('Generated SVG is invalid')) {
+      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
+    }
+
+    if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+      return sendError(res, 'Image file could not be processed. Please ensure the file is a valid PNG.', 400);
+    }
+
+    return sendError(res, 'Failed to convert PNG to SVG', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * POST /api/convert/jpg-to-svg
+ * Convert JPG/JPEG images to SVG using JavaScript Potrace (Railway-compatible)
+ */
+router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+    const threshold = parseInt(req.body.threshold) || 128;
+    const turdSize = parseInt(req.body.turdSize) || 2;
+    const alphaMax = parseFloat(req.body.alphaMax) || 1.0;
+    const optCurve = req.body.optCurve !== 'false';
+    const optTolerance = parseFloat(req.body.optTolerance) || 0.2;
+    const turnPolicy = req.body.turnPolicy || 'minority';
+    const color = req.body.color || 'auto';
+
+    // Same validation as PNG to SVG...
+    if (threshold < 0 || threshold > 255) {
+      return sendError(res, 'Threshold must be between 0 and 255', 400);
+    }
+
+    if (turdSize < 0 || turdSize > 100) {
+      return sendError(res, 'Turd size must be between 0 and 100', 400);
+    }
+
+    if (alphaMax < 0 || alphaMax > 1.3) {
+      return sendError(res, 'Alpha max must be between 0 and 1.3', 400);
+    }
+
+    if (optTolerance < 0 || optTolerance > 1) {
+      return sendError(res, 'Optimization tolerance must be between 0 and 1', 400);
+    }
+
+    const validTurnPolicies = ['black', 'white', 'left', 'right', 'minority', 'majority'];
+    if (!validTurnPolicies.includes(turnPolicy)) {
+      return sendError(res, 'Invalid turn policy', 400);
+    }
+
+    logger.info('Starting JPG to SVG conversion (JavaScript Potrace)', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      mimetype: req.file.mimetype,
+      threshold,
+      turdSize,
+      alphaMax,
+      optCurve,
+      optTolerance,
+      turnPolicy,
+      color
+    });
+
+    // Get JPG metadata
+    const metadata = await sharp(originalBuffer).metadata();
+
+    logger.info('JPG metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      channels: metadata.channels,
+      format: metadata.format,
+      colorspace: metadata.space
+    });
+
+    // Configure potrace options for JavaScript implementation
+    const potraceOptions = {
+      threshold: threshold,
+      turdSize: turdSize,
+      alphaMax: alphaMax,
+      optCurve: optCurve,
+      optTolerance: optTolerance,
+      turnPolicy: turnPolicy
+    };
+
+    // Add color if specified (not 'auto')
+    if (color !== 'auto') {
+      potraceOptions.color = color;
+    }
+
+    logger.info('JavaScript Potrace options', potraceOptions);
+
+    // Use JavaScript Potrace to trace the JPG image
+    const svgString = await new Promise((resolve, reject) => {
+      Potrace.trace(originalBuffer, potraceOptions, (err, svg) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(svg);
+        }
+      });
+    });
+
+    // Verify the SVG was generated
+    if (!svgString || svgString.length === 0) {
+      throw new Error('Vectorization resulted in empty SVG');
+    }
+
+    // Additional validation - check if SVG is valid
+    if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
+      throw new Error('Generated SVG is invalid or corrupted');
+    }
+
+    // Convert string to buffer for consistent handling
+    const svgBuffer = Buffer.from(svgString, 'utf8');
+
+    // Generate filename
+    const filename = `${originalName}.svg`;
+
+    const compressionRatio = ((originalBuffer.length - svgBuffer.length) / originalBuffer.length * 100).toFixed(2);
+
+    logger.info('JPG to SVG conversion completed (JavaScript Potrace)', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      convertedSize: svgBuffer.length,
+      compressionRatio: compressionRatio + '%',
+      svgLength: svgString.length,
+      threshold,
+      turdSize,
+      alphaMax,
+      optCurve,
+      optTolerance,
+      turnPolicy,
+      color,
+      filename
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': 'image/svg+xml',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': svgBuffer.length.toString(),
+      'X-Original-Filename': req.file.originalname,
+      'X-Original-Size': originalBuffer.length.toString(),
+      'X-Converted-Size': svgBuffer.length.toString(),
+      'X-Compression-Ratio': compressionRatio + '%',
+      'X-Threshold': threshold.toString(),
+      'X-Turd-Size': turdSize.toString(),
+      'X-Alpha-Max': alphaMax.toString(),
+      'X-Opt-Curve': optCurve.toString(),
+      'X-Opt-Tolerance': optTolerance.toString(),
+      'X-Turn-Policy': turnPolicy,
+      'X-Color': color,
+      'X-Original-Width': (metadata.width || 'unknown').toString(),
+      'X-Original-Height': (metadata.height || 'unknown').toString(),
+      'X-Original-Format': 'JPEG',
+      'X-Engine': 'potrace-js'
+    });
+
+    // Send the converted SVG
+    res.send(svgBuffer);
+
+  } catch (error) {
+    logger.error('JPG to SVG conversion error (JavaScript Potrace):', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size,
+      threshold: req.body?.threshold,
+      turdSize: req.body?.turdSize,
+      alphaMax: req.body?.alphaMax,
+      optCurve: req.body?.optCurve,
+      optTolerance: req.body?.optTolerance,
+      turnPolicy: req.body?.turnPolicy,
+      color: req.body?.color
+    });
+
+    if (error.message.includes('File must be a JPG/JPEG image')) {
+      return sendError(res, 'File must be a JPG/JPEG image', 400);
+    }
+
+    if (error.message.includes('Vectorization resulted in empty SVG')) {
+      return sendError(res, 'Vectorization failed. The image may be too complex or contain no traceable content.', 500);
+    }
+
+    if (error.message.includes('Generated SVG is invalid')) {
+      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
+    }
+
+    if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+      return sendError(res, 'Image file could not be processed. Please ensure the file is a valid JPG.', 400);
+    }
+
+    return sendError(res, 'Failed to convert JPG to SVG', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * POST /api/convert/svg-to-jpg
+ * Convert SVG images to JPG/JPEG
+ */
+router.post('/svg-to-jpg', basicRateLimit, uploadSvg.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+    const quality = parseInt(req.body.quality) || 90;
+    const backgroundColor = req.body.backgroundColor || '#ffffff';
+    const width = parseInt(req.body.width) || null;
+    const height = parseInt(req.body.height) || null;
+    const density = parseInt(req.body.density) || 72;
+
+    // Validate quality parameter
+    if (quality < 10 || quality > 100) {
+      return sendError(res, 'Quality must be between 10 and 100', 400);
+    }
+
+    // Validate background color format
+    if (!/^#[0-9A-F]{6}$/i.test(backgroundColor)) {
+      return sendError(res, 'Background color must be a valid hex color (e.g., #ffffff)', 400);
+    }
+
+    // Validate dimensions
+    if (width && (width < 1 || width > 8000)) {
+      return sendError(res, 'Width must be between 1 and 8000 pixels', 400);
+    }
+
+    if (height && (height < 1 || height > 8000)) {
+      return sendError(res, 'Height must be between 1 and 8000 pixels', 400);
+    }
+
+    // Validate density
+    if (density < 72 || density > 300) {
+      return sendError(res, 'Density must be between 72 and 300 DPI', 400);
+    }
+
+    logger.info('Starting SVG to JPG conversion', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      mimetype: req.file.mimetype,
+      quality,
+      backgroundColor,
+      width: width || 'auto',
+      height: height || 'auto',
+      density
+    });
+
+    // Configure JPEG options
+    const jpegOptions = {
+      quality: quality,
+      progressive: true,
+      mozjpeg: true // Use mozjpeg encoder for better compression
+    };
+
+    // Convert hex color to RGB values for background
+    const rgb = {
+      r: parseInt(backgroundColor.slice(1, 3), 16),
+      g: parseInt(backgroundColor.slice(3, 5), 16),
+      b: parseInt(backgroundColor.slice(5, 7), 16)
+    };
+
+    // Convert SVG to JPG with Sharp
+    let sharpInstance = sharp(originalBuffer, {
+      density: density // Set DPI for rasterization
+    });
+
+    // Get SVG metadata to understand dimensions
+    const metadata = await sharpInstance.metadata();
+
+    logger.info('SVG metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      format: metadata.format,
+      density: metadata.density,
+      hasAlpha: metadata.hasAlpha
+    });
+
+    // Apply resizing if specified
+    if (width || height) {
+      sharpInstance = sharpInstance.resize(width, height, {
+        fit: 'inside', // Maintain aspect ratio
+        withoutEnlargement: false // Allow enlargement
+      });
+    }
+
+    // Convert to JPG with background color (SVG transparency handling)
+    const jpegBuffer = await sharpInstance
+      .flatten({ background: rgb }) // Handle transparency with background color
+      .jpeg(jpegOptions)
+      .toBuffer();
+
+    // Verify the converted buffer is valid
+    if (!jpegBuffer || jpegBuffer.length === 0) {
+      throw new Error('Conversion resulted in empty buffer');
+    }
+
+    // Additional validation - try to read the converted image
+    try {
+      const convertedMetadata = await sharp(jpegBuffer).metadata();
+      logger.info('Converted image metadata', {
+        width: convertedMetadata.width,
+        height: convertedMetadata.height,
+        format: convertedMetadata.format,
+        size: jpegBuffer.length
+      });
+    } catch (validationError) {
+      logger.error('Converted image validation failed', { error: validationError.message });
+      throw new Error('Converted image is invalid or corrupted');
+    }
+
+    // Generate filename
+    const filename = `${originalName}.jpg`;
+
+    const compressionRatio = ((originalBuffer.length - jpegBuffer.length) / originalBuffer.length * 100).toFixed(2);
+
+    logger.info('SVG to JPG conversion completed', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      convertedSize: jpegBuffer.length,
+      compressionRatio: compressionRatio + '%',
+      quality,
+      backgroundColor,
+      finalWidth: width || metadata.width,
+      finalHeight: height || metadata.height,
+      density,
+      filename
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': 'image/jpeg',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': jpegBuffer.length.toString(),
+      'X-Original-Filename': req.file.originalname,
+      'X-Original-Size': originalBuffer.length.toString(),
+      'X-Converted-Size': jpegBuffer.length.toString(),
+      'X-Compression-Ratio': compressionRatio + '%',
+      'X-Quality': quality.toString(),
+      'X-Background-Color': backgroundColor,
+      'X-Width': (width || metadata.width || 'auto').toString(),
+      'X-Height': (height || metadata.height || 'auto').toString(),
+      'X-Density': density.toString(),
+      'X-Original-Format': 'SVG'
+    });
+
+    // Send the converted image
+    res.send(jpegBuffer);
+
+  } catch (error) {
+    logger.error('SVG to JPG conversion error:', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size,
+      quality: req.body?.quality,
+      backgroundColor: req.body?.backgroundColor,
+      width: req.body?.width,
+      height: req.body?.height,
+      density: req.body?.density
+    });
+
+    if (error.message.includes('File must be an SVG image')) {
+      return sendError(res, 'File must be an SVG image', 400);
+    }
+
+    if (error.message.includes('Input buffer contains unsupported image format')) {
+      return sendError(res, 'Invalid SVG file format or corrupted file', 400);
+    }
+
+    if (error.message.includes('jpeg') || error.message.includes('Conversion resulted in empty buffer')) {
+      return sendError(res, 'JPEG encoding failed. The SVG file may be corrupted or contain unsupported elements.', 500);
+    }
+
+    if (error.message.includes('Converted image is invalid')) {
+      return sendError(res, 'Image conversion failed - resulting file is corrupted', 500);
+    }
+
+    return sendError(res, 'Failed to convert SVG to JPG', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+/**
+ * POST /api/convert/svg-to-png  
+ * Convert SVG images to PNG
+ */
+router.post('/svg-to-png', basicRateLimit, uploadSvg.single('file'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return sendError(res, 'No file provided', 400);
+    }
+
+    const originalBuffer = req.file.buffer;
+    const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
+    const compressionLevel = parseInt(req.body.compressionLevel) || 6;
+    const width = parseInt(req.body.width) || null;
+    const height = parseInt(req.body.height) || null;
+    const density = parseInt(req.body.density) || 72;
+
+    // Validate compression level parameter
+    if (compressionLevel < 0 || compressionLevel > 9) {
+      return sendError(res, 'Compression level must be between 0 and 9', 400);
+    }
+
+    // Validate dimensions
+    if (width && (width < 1 || width > 8000)) {
+      return sendError(res, 'Width must be between 1 and 8000 pixels', 400);
+    }
+
+    if (height && (height < 1 || height > 8000)) {
+      return sendError(res, 'Height must be between 1 and 8000 pixels', 400);
+    }
+
+    // Validate density
+    if (density < 72 || density > 300) {
+      return sendError(res, 'Density must be between 72 and 300 DPI', 400);
+    }
+
+    logger.info('Starting SVG to PNG conversion', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      mimetype: req.file.mimetype,
+      compressionLevel,
+      width: width || 'auto',
+      height: height || 'auto',
+      density
+    });
+
+    // Configure PNG options
+    const pngOptions = {
+      compressionLevel: compressionLevel,
+      adaptiveFiltering: true,
+      force: true // Force PNG output
+    };
+
+    // Convert SVG to PNG with Sharp
+    let sharpInstance = sharp(originalBuffer, {
+      density: density // Set DPI for rasterization
+    });
+
+    // Get SVG metadata to understand dimensions
+    const metadata = await sharpInstance.metadata();
+
+    logger.info('SVG metadata', {
+      width: metadata.width,
+      height: metadata.height,
+      format: metadata.format,
+      density: metadata.density,
+      hasAlpha: metadata.hasAlpha
+    });
+
+    // Apply resizing if specified
+    if (width || height) {
+      sharpInstance = sharpInstance.resize(width, height, {
+        fit: 'inside', // Maintain aspect ratio
+        withoutEnlargement: false // Allow enlargement
+      });
+    }
+
+    // Convert to PNG (preserves transparency)
+    const pngBuffer = await sharpInstance
+      .png(pngOptions)
+      .toBuffer();
+
+    // Verify the converted buffer is valid
+    if (!pngBuffer || pngBuffer.length === 0) {
+      throw new Error('Conversion resulted in empty buffer');
+    }
+
+    // Additional validation - try to read the converted image
+    try {
+      const convertedMetadata = await sharp(pngBuffer).metadata();
+      logger.info('Converted image metadata', {
+        width: convertedMetadata.width,
+        height: convertedMetadata.height,
+        format: convertedMetadata.format,
+        hasAlpha: convertedMetadata.hasAlpha,
+        size: pngBuffer.length
+      });
+    } catch (validationError) {
+      logger.error('Converted image validation failed', { error: validationError.message });
+      throw new Error('Converted image is invalid or corrupted');
+    }
+
+    // Generate filename
+    const filename = `${originalName}.png`;
+
+    const sizeChange = ((pngBuffer.length - originalBuffer.length) / originalBuffer.length * 100).toFixed(2);
+    const sizeChangeType = pngBuffer.length > originalBuffer.length ? 'increase' : 'decrease';
+
+    logger.info('SVG to PNG conversion completed', {
+      originalName: req.file.originalname,
+      originalSize: originalBuffer.length,
+      convertedSize: pngBuffer.length,
+      sizeChange: `${Math.abs(parseFloat(sizeChange))}% ${sizeChangeType}`,
+      compressionLevel,
+      finalWidth: width || metadata.width,
+      finalHeight: height || metadata.height,
+      density,
+      filename
+    });
+
+    // Set response headers
+    res.set({
+      'Content-Type': 'image/png',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': pngBuffer.length.toString(),
+      'X-Original-Filename': req.file.originalname,
+      'X-Original-Size': originalBuffer.length.toString(),
+      'X-Converted-Size': pngBuffer.length.toString(),
+      'X-Size-Change': `${sizeChange}%`,
+      'X-Size-Change-Type': sizeChangeType,
+      'X-Compression-Level': compressionLevel.toString(),
+      'X-Width': (width || metadata.width || 'auto').toString(),
+      'X-Height': (height || metadata.height || 'auto').toString(),
+      'X-Density': density.toString(),
+      'X-Original-Format': 'SVG'
+    });
+
+    // Send the converted image
+    res.send(pngBuffer);
+
+  } catch (error) {
+    logger.error('SVG to PNG conversion error:', {
+      error: error.message,
+      stack: error.stack,
+      originalName: req.file?.originalname,
+      fileSize: req.file?.size,
+      compressionLevel: req.body?.compressionLevel,
+      width: req.body?.width,
+      height: req.body?.height,
+      density: req.body?.density
+    });
+
+    if (error.message.includes('File must be an SVG image')) {
+      return sendError(res, 'File must be an SVG image', 400);
+    }
+
+    if (error.message.includes('Input buffer contains unsupported image format')) {
+      return sendError(res, 'Invalid SVG file format or corrupted file', 400);
+    }
+
+    if (error.message.includes('png') || error.message.includes('Conversion resulted in empty buffer')) {
+      return sendError(res, 'PNG encoding failed. The SVG file may be corrupted or contain unsupported elements.', 500);
+    }
+
+    if (error.message.includes('Converted image is invalid')) {
+      return sendError(res, 'Image conversion failed - resulting file is corrupted', 500);
+    }
+
+    return sendError(res, 'Failed to convert SVG to PNG', 500, {
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -655,7 +1731,7 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
     } else {
       // Lossy AVIF configuration
       avifOptions.quality = quality;
-      
+
       // Only use chroma subsampling for lossy compression
       if (!hasAlpha) {
         avifOptions.chromaSubsampling = '4:2:0';
@@ -1549,7 +2625,7 @@ router.post('/jpg-to-png-batch', basicRateLimit, uploadJpg.array('files', 5), as
     // Process each file
     for (let i = 0; i < req.files.length; i++) {
       const file = req.files[i];
-      
+
       try {
         const originalBuffer = file.buffer;
         const originalName = file.originalname.replace(/\.[^/.]+$/, '');
@@ -1713,7 +2789,7 @@ router.post('/png-to-jpg-batch', basicRateLimit, uploadPng.array('files', 5), as
     // Process each file
     for (let i = 0; i < req.files.length; i++) {
       const file = req.files[i];
-      
+
       try {
         const originalBuffer = file.buffer;
         const originalName = file.originalname.replace(/\.[^/.]+$/, '');

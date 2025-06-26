@@ -21,6 +21,7 @@ router.get('/', basicRateLimit, (req, res) => {
         metrics: '/metrics',
         compress: '/api/compress',
         convert: '/api/convert',
+        format: '/api/format',
         // Add more endpoints as they are created
         // auth: '/api/v1/auth',
         // upload: '/api/v1/upload',
@@ -184,11 +185,13 @@ router.get('/docs', basicRateLimit, (req, res) => {
 const compressRoutes = require('./compress');
 const convertRoutes = require('./convert');
 const hashRoutes = require('./hash');
+const formatRoutes = require('./format');
 
 // Register routes
 router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);
 router.use('/hash', hashRoutes);
+router.use('/format', formatRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');

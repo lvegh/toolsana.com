@@ -1,27 +1,193 @@
 const rateLimit = require('express-rate-limit');
 const slowDown = require('express-slow-down');
-const ExpressBrute = require('express-brute');
-const ExpressBruteRedis = require('express-brute-redis');
 const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
 
 /**
- * Create Redis store for express-brute if Redis is available
+ * Custom Brute Force Protection Class
+ * Secure replacement for express-brute with Redis backing
  */
-const createBruteStore = () => {
-  try {
-    const redisClient = getRedisClient();
-    if (redisClient && redisClient.isOpen) {
-      return new ExpressBruteRedis({
-        client: redisClient,
-        prefix: 'brute:'
-      });
-    }
-  } catch (error) {
-    logger.warn('Failed to create Redis brute store, using memory store:', error.message);
+class SecureBruteForce {
+  constructor(options = {}) {
+    this.options = {
+      freeRetries: options.freeRetries || 5,
+      minWait: options.minWait || 5 * 60 * 1000, // 5 minutes
+      maxWait: options.maxWait || 60 * 60 * 1000, // 1 hour
+      lifetime: options.lifetime || 24 * 60 * 60 * 1000, // 24 hours
+      prefix: options.prefix || 'brute:',
+      ...options
+    };
+    this.memoryStore = new Map();
   }
-  return undefined; // Use memory store as fallback
-};
+
+  /**
+   * Get Redis client or fallback to memory store
+   */
+  getStore() {
+    try {
+      const redisClient = getRedisClient();
+      if (redisClient && redisClient.isOpen) {
+        return { type: 'redis', client: redisClient };
+      }
+    } catch (error) {
+      logger.warn('Redis not available for brute force protection, using memory store');
+    }
+    return { type: 'memory', client: this.memoryStore };
+  }
+
+  /**
+   * Generate key for rate limiting
+   */
+  generateKey(req, keyGenerator) {
+    if (typeof keyGenerator === 'function') {
+      return keyGenerator(req);
+    }
+    return `${req.ip}-${req.originalUrl}`;
+  }
+
+  /**
+   * Get attempt data from store
+   */
+  async getAttempts(key) {
+    const store = this.getStore();
+    const fullKey = `${this.options.prefix}${key}`;
+
+    try {
+      if (store.type === 'redis') {
+        const data = await store.client.get(fullKey);
+        return data ? JSON.parse(data) : { count: 0, firstRequest: Date.now() };
+      } else {
+        return store.client.get(fullKey) || { count: 0, firstRequest: Date.now() };
+      }
+    } catch (error) {
+      logger.error('Error getting attempts from store:', error);
+      return { count: 0, firstRequest: Date.now() };
+    }
+  }
+
+  /**
+   * Set attempt data in store
+   */
+  async setAttempts(key, data) {
+    const store = this.getStore();
+    const fullKey = `${this.options.prefix}${key}`;
+
+    try {
+      if (store.type === 'redis') {
+        await store.client.setEx(fullKey, Math.ceil(this.options.lifetime / 1000), JSON.stringify(data));
+      } else {
+        store.client.set(fullKey, data);
+        // Clean up memory store periodically
+        setTimeout(() => {
+          if (store.client.has(fullKey)) {
+            const storedData = store.client.get(fullKey);
+            if (Date.now() - storedData.firstRequest > this.options.lifetime) {
+              store.client.delete(fullKey);
+            }
+          }
+        }, this.options.lifetime);
+      }
+    } catch (error) {
+      logger.error('Error setting attempts in store:', error);
+    }
+  }
+
+  /**
+   * Reset attempts for a key
+   */
+  async resetAttempts(key) {
+    const store = this.getStore();
+    const fullKey = `${this.options.prefix}${key}`;
+
+    try {
+      if (store.type === 'redis') {
+        await store.client.del(fullKey);
+      } else {
+        store.client.delete(fullKey);
+      }
+    } catch (error) {
+      logger.error('Error resetting attempts:', error);
+    }
+  }
+
+  /**
+   * Calculate wait time based on attempt count
+   */
+  calculateWaitTime(attempts) {
+    if (attempts <= this.options.freeRetries) {
+      return 0;
+    }
+
+    const extraAttempts = attempts - this.options.freeRetries;
+    const waitTime = Math.min(
+      this.options.minWait * Math.pow(2, extraAttempts - 1),
+      this.options.maxWait
+    );
+
+    return waitTime;
+  }
+
+  /**
+   * Create middleware function
+   */
+  prevent(keyGenerator, failCallback) {
+    return async (req, res, next) => {
+      const key = this.generateKey(req, keyGenerator);
+      
+      try {
+        const attempts = await this.getAttempts(key);
+        const now = Date.now();
+        const waitTime = this.calculateWaitTime(attempts.count);
+        const nextValidRequestDate = attempts.lastRequest ? attempts.lastRequest + waitTime : now;
+
+        // Check if we're still in the wait period
+        if (waitTime > 0 && now < nextValidRequestDate) {
+          const retryAfter = Math.ceil((nextValidRequestDate - now) / 1000);
+          
+          logger.securityLog('Brute force protection triggered', {
+            ip: req.ip,
+            userAgent: req.get('User-Agent'),
+            url: req.originalUrl,
+            method: req.method,
+            attempts: attempts.count,
+            waitTime,
+            retryAfter,
+            key: key.substring(0, 20) + '...' // Log partial key for debugging
+          });
+
+          if (typeof failCallback === 'function') {
+            return failCallback(req, res, next, nextValidRequestDate);
+          }
+
+          return res.status(429).json({
+            success: false,
+            message: 'Too many failed attempts, please try again later.',
+            retryAfter
+          });
+        }
+
+        // Store the middleware reset function for successful requests
+        req.bruteForceReset = () => this.resetAttempts(key);
+        
+        // Store the middleware fail function for failed requests
+        req.bruteForceIncrement = async () => {
+          const newAttempts = {
+            count: attempts.count + 1,
+            firstRequest: attempts.firstRequest || now,
+            lastRequest: now
+          };
+          await this.setAttempts(key, newAttempts);
+        };
+
+        next();
+      } catch (error) {
+        logger.error('Brute force protection error:', error);
+        // Don't block requests on errors, just log and continue
+        next();
+      }
+    };
+  }
+}
 
 /**
  * Basic Rate Limiter
@@ -147,95 +313,68 @@ const progressiveSlowDown = slowDown({
 });
 
 /**
- * Lazy-loaded brute force instances
+ * Create secure brute force protection instances
  */
-let bruteForceInstance = null;
-let loginBruteForceInstance = null;
+const createBruteForceProtection = (options = {}) => {
+  return new SecureBruteForce(options);
+};
+
+// Create default brute force protection instances
+const generalBruteForce = createBruteForceProtection({
+  freeRetries: 5,
+  minWait: 5 * 60 * 1000, // 5 minutes
+  maxWait: 60 * 60 * 1000, // 1 hour
+  lifetime: 24 * 60 * 60 * 1000, // 24 hours
+  prefix: 'brute:general:'
+});
+
+const loginBruteForce = createBruteForceProtection({
+  freeRetries: 3,
+  minWait: 10 * 60 * 1000, // 10 minutes
+  maxWait: 2 * 60 * 60 * 1000, // 2 hours
+  lifetime: 24 * 60 * 60 * 1000, // 24 hours
+  prefix: 'brute:login:'
+});
 
 /**
- * Get or create brute force protection instance
+ * Brute Force Protection Middleware
  */
-const getBruteForce = () => {
-  if (!bruteForceInstance) {
-    bruteForceInstance = new ExpressBrute(createBruteStore(), {
-      freeRetries: 5, // allow 5 attempts
-      minWait: 5 * 60 * 1000, // 5 minutes
-      maxWait: 60 * 60 * 1000, // 1 hour
-      lifetime: 24 * 60 * 60, // 24 hours (in seconds)
-      failCallback: (req, res, next, nextValidRequestDate) => {
-        logger.securityLog('Brute force protection triggered', {
-          ip: req.ip,
-          userAgent: req.get('User-Agent'),
-          url: req.originalUrl,
-          method: req.method,
-          nextValidRequestDate
-        });
-        
-        res.status(429).json({
-          success: false,
-          message: 'Too many failed attempts, please try again later.',
-          retryAfter: Math.ceil((nextValidRequestDate - Date.now()) / 1000)
-        });
-      },
-      handleStoreError: (error) => {
-        logger.error('Brute force store error:', error);
-        // Don't throw error, just log it and continue
-      }
+const bruteForce = generalBruteForce.prevent(
+  (req) => `${req.ip}-${req.originalUrl}`,
+  (req, res, next, nextValidRequestDate) => {
+    const retryAfter = Math.ceil((nextValidRequestDate - Date.now()) / 1000);
+    res.status(429).json({
+      success: false,
+      message: 'Too many failed attempts, please try again later.',
+      retryAfter
     });
   }
-  return bruteForceInstance;
-};
+);
 
 /**
- * Get or create login brute force protection instance
+ * Login Brute Force Protection Middleware
  */
-const getLoginBruteForce = () => {
-  if (!loginBruteForceInstance) {
-    loginBruteForceInstance = new ExpressBrute(createBruteStore(), {
-      freeRetries: 3, // allow 3 attempts
-      minWait: 10 * 60 * 1000, // 10 minutes
-      maxWait: 2 * 60 * 60 * 1000, // 2 hours
-      lifetime: 24 * 60 * 60, // 24 hours (in seconds)
-      failCallback: (req, res, next, nextValidRequestDate) => {
-        logger.securityLog('Login brute force protection triggered', {
-          ip: req.ip,
-          userAgent: req.get('User-Agent'),
-          url: req.originalUrl,
-          method: req.method,
-          nextValidRequestDate,
-          email: req.body?.email || 'unknown'
-        });
-        
-        res.status(429).json({
-          success: false,
-          message: 'Too many failed login attempts, please try again later.',
-          retryAfter: Math.ceil((nextValidRequestDate - Date.now()) / 1000)
-        });
-      },
-      handleStoreError: (error) => {
-        logger.error('Login brute force store error:', error);
-        // Don't throw error, just log it and continue
-      }
+const loginBruteForceMiddleware = loginBruteForce.prevent(
+  (req) => `${req.ip}-${req.body?.email || 'unknown'}`,
+  (req, res, next, nextValidRequestDate) => {
+    const retryAfter = Math.ceil((nextValidRequestDate - Date.now()) / 1000);
+    
+    logger.securityLog('Login brute force protection triggered', {
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      url: req.originalUrl,
+      method: req.method,
+      email: req.body?.email || 'unknown',
+      retryAfter
+    });
+    
+    res.status(429).json({
+      success: false,
+      message: 'Too many failed login attempts, please try again later.',
+      retryAfter
     });
   }
-  return loginBruteForceInstance;
-};
-
-/**
- * Brute Force Protection Middleware (disabled for now)
- */
-const bruteForce = (req, res, next) => {
-  // Temporarily disabled to avoid Redis connection issues
-  next();
-};
-
-/**
- * Login Brute Force Protection Middleware (disabled for now)
- */
-const loginBruteForce = (req, res, next) => {
-  // Temporarily disabled to avoid Redis connection issues
-  next();
-};
+);
 
 /**
  * File Upload Rate Limiter
@@ -287,13 +426,57 @@ const createCustomRateLimit = (options = {}) => {
   return rateLimit({ ...defaultOptions, ...options });
 };
 
+/**
+ * Helper middleware to reset brute force attempts on successful requests
+ */
+const resetBruteForceOnSuccess = (req, res, next) => {
+  const originalSend = res.send;
+  
+  res.send = function(data) {
+    // Reset brute force attempts on successful responses (2xx status codes)
+    if (res.statusCode >= 200 && res.statusCode < 300 && req.bruteForceReset) {
+      req.bruteForceReset().catch(error => {
+        logger.error('Error resetting brute force attempts:', error);
+      });
+    }
+    
+    return originalSend.call(this, data);
+  };
+  
+  next();
+};
+
+/**
+ * Helper middleware to increment brute force attempts on failed requests
+ */
+const incrementBruteForceOnFailure = (req, res, next) => {
+  const originalSend = res.send;
+  
+  res.send = function(data) {
+    // Increment brute force attempts on failed responses (4xx/5xx status codes)
+    if (res.statusCode >= 400 && req.bruteForceIncrement) {
+      req.bruteForceIncrement().catch(error => {
+        logger.error('Error incrementing brute force attempts:', error);
+      });
+    }
+    
+    return originalSend.call(this, data);
+  };
+  
+  next();
+};
+
 module.exports = {
   basicRateLimit,
   strictRateLimit,
   apiKeyRateLimit,
   progressiveSlowDown,
   bruteForce,
-  loginBruteForce,
+  loginBruteForce: loginBruteForceMiddleware,
   uploadRateLimit,
-  createCustomRateLimit
+  createCustomRateLimit,
+  createBruteForceProtection,
+  resetBruteForceOnSuccess,
+  incrementBruteForceOnFailure,
+  SecureBruteForce
 };
