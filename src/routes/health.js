@@ -5,14 +5,13 @@ const { getDirectorySize, formatFileSize } = require('../utils/fileSystem');
 const logger = require('../utils/logger');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { basicRateLimit } = require('../middleware/rateLimit');
-const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
 /**
  * Basic Health Check
  */
-router.get('/health', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
+router.get('/health', basicRateLimit, (req, res) => {
   const healthCheck = {
     status: 'OK',
     timestamp: new Date().toISOString(),
@@ -28,7 +27,7 @@ router.get('/health', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) 
 /**
  * Detailed Health Check
  */
-router.get('/health/detailed', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+router.get('/health/detailed', basicRateLimit, async (req, res) => {
   try {
     const startTime = Date.now();
     
@@ -117,7 +116,7 @@ router.get('/health/detailed', enhancedSecurityWithRateLimit(basicRateLimit), as
 /**
  * Readiness Check (for Kubernetes/Docker)
  */
-router.get('/ready', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+router.get('/ready', basicRateLimit, async (req, res) => {
   try {
     const checks = [];
     let allReady = true;
@@ -169,7 +168,7 @@ router.get('/ready', enhancedSecurityWithRateLimit(basicRateLimit), async (req, 
 /**
  * Liveness Check (for Kubernetes/Docker)
  */
-router.get('/live', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
+router.get('/live', basicRateLimit, (req, res) => {
   const livenessCheck = {
     alive: true,
     timestamp: new Date().toISOString(),
@@ -183,7 +182,7 @@ router.get('/live', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
 /**
  * Metrics Endpoint
  */
-router.get('/metrics', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+router.get('/metrics', basicRateLimit, async (req, res) => {
   try {
     const metrics = {
       timestamp: new Date().toISOString(),
@@ -234,7 +233,7 @@ router.get('/metrics', enhancedSecurityWithRateLimit(basicRateLimit), async (req
 /**
  * Version Information
  */
-router.get('/version', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
+router.get('/version', basicRateLimit, (req, res) => {
   const versionInfo = {
     name: 'toolzyhub-api',
     version: process.env.npm_package_version || '1.0.0',
@@ -251,7 +250,7 @@ router.get('/version', enhancedSecurityWithRateLimit(basicRateLimit), (req, res)
 /**
  * Status Summary
  */
-router.get('/status', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+router.get('/status', basicRateLimit, async (req, res) => {
   try {
     const status = {
       service: 'toolzyhub-api',
