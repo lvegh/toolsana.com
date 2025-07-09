@@ -60,7 +60,7 @@ export async function POST(request: NextRequest) {
     apiFormData.append("quality", quality.toString());
 
     // Call your compression API instead of using Sharp directly
-    const API_BASE_URL = process.env.COMPRESSION_API_URL || "http://localhost:3002";
+    const API_BASE_URL = process.env.BASE_API_URL || "http://localhost:3002";
     const response = await fetch(`${API_BASE_URL}/api/compress/jpg`, {
       method: "POST",
       body: apiFormData,
@@ -137,7 +137,7 @@ export async function POST(request: NextRequest) {
     apiFormData.append('compressionLevel', compressionLevel.toString());
 
     // Call your compression API instead of using Sharp directly
-    const API_BASE_URL = process.env.COMPRESSION_API_URL || 'http://localhost:3002';
+    const API_BASE_URL = process.env.BASE_API_URL || 'http://localhost:3002';
     const response = await fetch(`${API_BASE_URL}/api/compress/png`, {
       method: 'POST',
       body: apiFormData,
@@ -204,7 +204,7 @@ export async function POST(request: NextRequest) {
 
 ### 3. Added Environment Configuration
 ```env
-COMPRESSION_API_URL=https://your-deployed-api-url.com
+BASE_API_URL=https://your-deployed-api-url.com
 ```
 
 ## API Features
@@ -239,7 +239,7 @@ COMPRESSION_API_URL=https://your-deployed-api-url.com
 ### 2. Update Next.js Project
 1. Replace your Sharp-based route handlers with the modified code
 2. Remove Sharp from dependencies: `npm uninstall sharp`
-3. Add environment variable: `COMPRESSION_API_URL=https://your-api-url.com`
+3. Add environment variable: `BASE_API_URL=https://your-api-url.com`
 4. Deploy to Cloudflare Pages
 
 ### 3. Test Integration
@@ -267,7 +267,7 @@ The API is currently running on `http://localhost:3002` and has been tested succ
 ## Next Steps
 1. Deploy the API to your preferred hosting service
 2. Update your Next.js project with the modified code
-3. Set the `COMPRESSION_API_URL` environment variable
+3. Set the `BASE_API_URL` environment variable
 4. Deploy to Cloudflare Pages and test end-to-end functionality
 
 The solution maintains 100% compatibility with your existing frontend while offloading Sharp processing to a dedicated API server that can run anywhere Sharp is supported.

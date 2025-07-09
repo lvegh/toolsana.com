@@ -3,6 +3,7 @@ const multer = require('multer');
 const sharp = require('sharp');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
 const Potrace = require('potrace');
 
@@ -2278,7 +2279,7 @@ router.post('/webp-to-png', basicRateLimit, uploadWebp.single('file'), async (re
  * POST /api/convert/webp-to-avif
  * Convert WebP images to AVIF
  */
-router.post('/webp-to-avif', basicRateLimit, uploadWebp.single('file'), async (req, res) => {
+router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.single('file'), async (req, res) => {
   try {
     // Check if file was uploaded
     if (!req.file) {
@@ -2431,7 +2432,7 @@ router.post('/webp-to-avif', basicRateLimit, uploadWebp.single('file'), async (r
  * POST /api/convert/png-to-jpg
  * Convert PNG images to JPG/JPEG
  */
-router.post('/png-to-jpg', basicRateLimit, uploadPng.single('file'), async (req, res) => {
+router.post('/png-to-jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.single('file'), async (req, res) => {
   try {
     // Check if file was uploaded
     if (!req.file) {

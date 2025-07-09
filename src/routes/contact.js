@@ -1,6 +1,7 @@
 const express = require('express');
 const nodemailer = require('nodemailer');
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -34,7 +35,7 @@ function createTransporter() {
  * POST /api/contact/send-email
  * Send contact form email
  */
-router.post('/send-email', basicRateLimit, async (req, res) => {
+router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
 
@@ -187,7 +188,7 @@ router.post('/send-email', basicRateLimit, async (req, res) => {
  * GET /api/contact/info
  * Get contact service information
  */
-router.get('/info', basicRateLimit, (req, res) => {
+router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
   const info = {
     service: 'Contact Form Email API',
     version: '1.0.0',

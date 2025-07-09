@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const yaml = require('js-yaml');
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -132,7 +133,7 @@ const uploadText = multer({
  * POST /api/format/yaml-to-json
  * Convert YAML data to JSON format
  */
-router.post('/yaml-to-json', basicRateLimit, uploadText.single('file'), async (req, res) => {
+router.post('/yaml-to-json', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.single('file'), async (req, res) => {
   try {
     let yamlData;
 
@@ -360,7 +361,7 @@ router.post('/yaml-to-json', basicRateLimit, uploadText.single('file'), async (r
  * POST /api/format/json-to-yaml
  * Convert JSON data to YAML format
  */
-router.post('/json-to-yaml', basicRateLimit, uploadText.single('file'), async (req, res) => {
+router.post('/json-to-yaml', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.single('file'), async (req, res) => {
   try {
     let jsonData;
 
@@ -609,7 +610,7 @@ router.post('/json-to-yaml', basicRateLimit, uploadText.single('file'), async (r
  * POST /api/format/yaml-to-json-batch
  * Convert multiple YAML files to JSON
  */
-router.post('/yaml-to-json-batch', basicRateLimit, uploadText.array('files', 10), async (req, res) => {
+router.post('/yaml-to-json-batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.array('files', 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return sendError(res, 'No files provided', 400);
@@ -714,7 +715,7 @@ router.post('/yaml-to-json-batch', basicRateLimit, uploadText.array('files', 10)
  * POST /api/format/json-to-yaml-batch
  * Convert multiple JSON files to YAML
  */
-router.post('/json-to-yaml-batch', basicRateLimit, uploadText.array('files', 10), async (req, res) => {
+router.post('/json-to-yaml-batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.array('files', 10), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return sendError(res, 'No files provided', 400);
@@ -839,7 +840,7 @@ router.post('/json-to-yaml-batch', basicRateLimit, uploadText.array('files', 10)
  * POST /api/format/validate-yaml
  * Validate YAML syntax without conversion
  */
-router.post('/validate-yaml', basicRateLimit, uploadText.single('file'), async (req, res) => {
+router.post('/validate-yaml', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.single('file'), async (req, res) => {
   try {
     let yamlData;
 
@@ -894,7 +895,7 @@ router.post('/validate-yaml', basicRateLimit, uploadText.single('file'), async (
  * POST /api/format/validate-json
  * Validate JSON syntax without conversion
  */
-router.post('/validate-json', basicRateLimit, uploadText.single('file'), async (req, res) => {
+router.post('/validate-json', enhancedSecurityWithRateLimit(basicRateLimit), uploadText.single('file'), async (req, res) => {
   try {
     let jsonData;
 
@@ -945,7 +946,7 @@ router.post('/validate-json', basicRateLimit, uploadText.single('file'), async (
  * GET /api/format/info
  * Get format conversion service information
  */
-router.get('/info', basicRateLimit, (req, res) => {
+router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
   const info = {
     service: 'Format Conversion API',
     version: '1.0.0',

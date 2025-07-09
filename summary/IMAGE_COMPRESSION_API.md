@@ -137,7 +137,7 @@ export async function POST(request: NextRequest) {
     apiFormData.append("quality", quality.toString());
 
     // Call your compression API
-    const API_BASE_URL = process.env.COMPRESSION_API_URL || "http://localhost:3002";
+    const API_BASE_URL = process.env.BASE_API_URL || "http://localhost:3002";
     const response = await fetch(`${API_BASE_URL}/api/compress/jpg`, {
       method: "POST",
       body: apiFormData,
@@ -218,7 +218,7 @@ export async function POST(request) {
     apiFormData.append("quality", quality.toString());
 
     // Call your compression API
-    const API_BASE_URL = process.env.COMPRESSION_API_URL || "http://localhost:3002";
+    const API_BASE_URL = process.env.BASE_API_URL || "http://localhost:3002";
     const response = await fetch(`${API_BASE_URL}/api/compress/jpg`, {
       method: "POST",
       body: apiFormData,
@@ -274,7 +274,7 @@ export async function POST(request) {
 Add this environment variable to your Next.js project:
 
 ```env
-COMPRESSION_API_URL=https://your-api-domain.com
+BASE_API_URL=https://your-api-domain.com
 ```
 
 If not set, it defaults to `http://localhost:3002` for local development.
@@ -288,7 +288,7 @@ If not set, it defaults to `http://localhost:3002` for local development.
 
 ### 2. Update Your Next.js Project
 1. Replace your existing Sharp-based route handler with the modified code above
-2. Set the `COMPRESSION_API_URL` environment variable to point to your deployed API
+2. Set the `BASE_API_URL` environment variable to point to your deployed API
 3. Deploy your Next.js project to Cloudflare Pages
 
 ### 3. Test the Integration

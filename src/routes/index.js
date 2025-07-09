@@ -34,7 +34,7 @@ router.get('/', basicRateLimit, (req, res) => {
       postman: '/api/postman' // Future implementation
     },
     support: {
-      email: 'support@toolzyhub.app',
+      email: 'info@toolzyhub.app',
       github: 'https://github.com/toolzyhub/api'
     }
   };

@@ -5,6 +5,7 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs').promises;
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -62,7 +63,7 @@ const uploadWebp = multer({
  * POST /api/compress/jpg
  * Compress JPG/JPEG images
  */
-router.post('/jpg', basicRateLimit, uploadJpg.single('file'), async (req, res) => {
+router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.single('file'), async (req, res) => {
   try {
     // Check if file was uploaded
     if (!req.file) {
@@ -152,7 +153,7 @@ router.post('/jpg', basicRateLimit, uploadJpg.single('file'), async (req, res) =
  * POST /api/compress/png
  * Compress PNG images
  */
-router.post('/png', basicRateLimit, uploadPng.single('file'), async (req, res) => {
+router.post('/png', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.single('file'), async (req, res) => {
   try {
     // Check if file was uploaded
     if (!req.file) {
@@ -241,7 +242,7 @@ router.post('/png', basicRateLimit, uploadPng.single('file'), async (req, res) =
  * POST /api/compress/webp
  * Compress WebP images
  */
-router.post('/webp', basicRateLimit, uploadWebp.single('file'), async (req, res) => {
+router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.single('file'), async (req, res) => {
   try {
     // Check if file was uploaded
     if (!req.file) {
@@ -330,7 +331,7 @@ router.post('/webp', basicRateLimit, uploadWebp.single('file'), async (req, res)
  * POST /api/compress/batch
  * Compress multiple JPG/JPEG images
  */
-router.post('/batch', basicRateLimit, uploadJpg.array('files', 5), async (req, res) => {
+router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.array('files', 5), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return sendError(res, 'No files provided', 400);
@@ -426,7 +427,7 @@ router.post('/batch', basicRateLimit, uploadJpg.array('files', 5), async (req, r
  * GET /api/compress/info
  * Get compression service information
  */
-router.get('/info', basicRateLimit, (req, res) => {
+router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
   const info = {
     service: 'Image Compression API',
     version: '1.0.0',

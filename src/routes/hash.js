@@ -4,6 +4,7 @@ const argon2 = require('argon2');
 const { scrypt, randomBytes, timingSafeEqual } = require('crypto');
 const { promisify } = require('util');
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -14,7 +15,7 @@ const scryptAsync = promisify(scrypt);
  * POST /api/hash/argon2generate
  * Generate argon2 hash from password
  */
-router.post('/argon2generate', basicRateLimit, async (req, res) => {
+router.post('/argon2generate', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, type, memoryCost, timeCost, parallelism, hashLength } = req.body;
 
@@ -156,7 +157,7 @@ router.post('/argon2generate', basicRateLimit, async (req, res) => {
  * POST /api/hash/argon2verify
  * Verify password against argon2 hash
  */
-router.post('/argon2verify', basicRateLimit, async (req, res) => {
+router.post('/argon2verify', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, hash } = req.body;
 
@@ -246,7 +247,7 @@ router.post('/argon2verify', basicRateLimit, async (req, res) => {
  * POST /api/hash/bcryptgenerate
  * Generate bcrypt hash from password
  */
-router.post('/bcryptgenerate', basicRateLimit, async (req, res) => {
+router.post('/bcryptgenerate', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, rounds } = req.body;
 
@@ -313,7 +314,7 @@ router.post('/bcryptgenerate', basicRateLimit, async (req, res) => {
  * POST /api/hash/bcryptverify
  * Verify password against bcrypt hash
  */
-router.post('/bcryptverify', basicRateLimit, async (req, res) => {
+router.post('/bcryptverify', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, hash } = req.body;
 
@@ -382,7 +383,7 @@ router.post('/bcryptverify', basicRateLimit, async (req, res) => {
  * POST /api/hash/scryptgenerate
  * Generate scrypt hash from password
  */
-router.post('/scryptgenerate', basicRateLimit, async (req, res) => {
+router.post('/scryptgenerate', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, N, r, p, dkLen } = req.body;
 
@@ -506,7 +507,7 @@ router.post('/scryptgenerate', basicRateLimit, async (req, res) => {
  * POST /api/hash/scryptverify
  * Verify password against scrypt hash
  */
-router.post('/scryptverify', basicRateLimit, async (req, res) => {
+router.post('/scryptverify', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { password, hash } = req.body;
 
@@ -644,7 +645,7 @@ router.post('/scryptverify', basicRateLimit, async (req, res) => {
  * GET /api/hash/info
  * Get hash service information
  */
-router.get('/info', basicRateLimit, (req, res) => {
+router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) => {
   const info = {
     service: 'Password Hashing API',
     version: '1.0.0',
