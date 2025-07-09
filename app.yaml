@@ -1,0 +1,13 @@
+name: toolzyhub-api
+services:
+- name: api
+  source_dir: /
+  run_command: npm start
+  environment_slug: node-js
+  instance_count: 1
+  instance_size_slug: apps-d-1vcpu-4gb
+  envs:
+  - key: NODE_ENV
+    value: production
+  - key: PORT
+    value: "8080"

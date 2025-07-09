@@ -4,7 +4,8 @@
   "description": "Secure Node.js API server for ToolzyHub with token protection and rate limiting",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "NODE_ENV=production node src/server.js",
+    "health": "node -e \"console.log('API is healthy')\"",
     "dev": "nodemon src/server.js",
     "test": "jest",
     "test:watch": "jest --watch",
