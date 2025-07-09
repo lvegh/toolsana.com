@@ -16,7 +16,7 @@ const app = express();
 
 // Get configuration from environment
 const PORT = process.env.PORT || 3001;
-const HOST = process.env.HOST || 'localhost';
+const HOST = process.env.HOST || '0.0.0.0';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Trust proxy (important for rate limiting behind reverse proxy)
