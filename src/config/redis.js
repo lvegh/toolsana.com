@@ -4,7 +4,7 @@ const logger = require('../utils/logger');
 let redisClient = null;
 
 /**
- * Connect to Redis
+ * Connect to Redis Server
  */
 const connectRedis = async () => {
     
