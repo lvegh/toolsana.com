@@ -15,7 +15,7 @@ router.get('/', basicRateLimit, (req, res) => {
     environment: process.env.NODE_ENV || 'development',
     timestamp: new Date().toISOString(),
       endpoints: {
-/*         health: '/health', */
+        health: '/health',
         version: '/version',
         status: '/status',
         metrics: '/metrics',
@@ -189,17 +189,13 @@ const convertRoutes = require('./convert');
 const hashRoutes = require('./hash');
 const formatRoutes = require('./format');
 const contactRoutes = require('./contact');
-/* const healthRoutes = require('./health'); */
+const healthRoutes = require('./health');
 
 // Register routes
 router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);
-router.use('/hash', hashRoutes);
 router.use('/format', formatRoutes);
 router.use('/contact', contactRoutes);
-
-// Mount health routes at root level (not under /api)
-/* router.use('/', healthRoutes); */
 
 // Example for future routes:
 // const authRoutes = require('./auth');
