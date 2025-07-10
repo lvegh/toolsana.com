@@ -115,7 +115,6 @@ router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async 
     const mailOptions = {
       from: emailFrom,
       to: emailTo,
-      replyTo: email, // User's email for easy replies
       subject: `Contact Form: ${subject}`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
