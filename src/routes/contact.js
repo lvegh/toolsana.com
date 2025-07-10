@@ -16,19 +16,33 @@ function createTransporter() {
   const smtpUser = process.env.SMTP_USER;
   const smtpPass = process.env.SMTP_PASS;
 
+  // Log environment variables for debugging (without exposing sensitive data)
+  logger.info('SMTP Configuration Check:', {
+    host: !!smtpHost,
+    port: !!smtpPort,
+    user: !!smtpUser,
+    pass: !!smtpPass,
+    hostValue: smtpHost ? smtpHost.substring(0, 10) + '...' : 'undefined'
+  });
+
   if (!smtpHost || !smtpPort || !smtpUser || !smtpPass) {
     throw new Error('SMTP configuration is incomplete');
   }
 
-  return nodemailer.createTransporter({
-    host: smtpHost,
-    port: parseInt(smtpPort),
-    secure: false, // true for 465, false for other ports
-    auth: {
-      user: smtpUser,
-      pass: smtpPass,
-    },
-  });
+  try {
+    return nodemailer.createTransport({  // ✅ Fixed: createTransport (not createTransporter)
+      host: smtpHost,
+      port: parseInt(smtpPort),
+      secure: false, // true for 465, false for other ports
+      auth: {
+        user: smtpUser,
+        pass: smtpPass,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to create nodemailer transport:', error);
+    throw error;
+  }
 }
 
 /**
@@ -85,6 +99,14 @@ router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async 
     const emailFrom = process.env.EMAIL_FROM;
     const emailTo = process.env.EMAIL_TO;
 
+    // Log email configuration for debugging
+    logger.info('Email Configuration Check:', {
+      from: !!emailFrom,
+      to: !!emailTo,
+      fromValue: emailFrom ? emailFrom.substring(0, 10) + '...' : 'undefined',
+      toValue: emailTo ? emailTo.substring(0, 10) + '...' : 'undefined'
+    });
+
     if (!emailFrom || !emailTo) {
       throw new Error('Email configuration is incomplete');
     }
@@ -133,6 +155,7 @@ router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async 
     };
 
     // Send email
+    logger.info('Attempting to send email...');
     await transporter.sendMail(mailOptions);
 
     const endTime = Date.now();
