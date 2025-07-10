@@ -14,21 +14,22 @@ router.get('/', basicRateLimit, (req, res) => {
     description: 'Secure Node.js API server for ToolzyHub with token protection and rate limiting',
     environment: process.env.NODE_ENV || 'development',
     timestamp: new Date().toISOString(),
-      endpoints: {
-        health: '/health',
-        version: '/version',
-        status: '/status',
-        metrics: '/metrics',
-        compress: '/api/compress',
-        convert: '/api/convert',
-        format: '/api/format',
-        hash: '/api/hash',
-        contact: '/api/contact',
-        // Add more endpoints as they are created
-        // auth: '/api/v1/auth',
-        // upload: '/api/v1/upload',
-        // tools: '/api/v1/tools'
-      },
+    endpoints: {
+      health: '/health',
+      version: '/version',
+      status: '/status',
+      metrics: '/metrics',
+      compress: '/api/compress',
+      convert: '/api/convert',
+      format: '/api/format',
+      hash: '/api/hash',
+      contact: '/api/contact',
+      subscribe: '/api/subscribe'
+      // Add more endpoints as they are created
+      // auth: '/api/v1/auth',
+      // upload: '/api/v1/upload',
+      // tools: '/api/v1/tools'
+    },
     documentation: {
       swagger: '/api/docs', // Future implementation
       postman: '/api/postman' // Future implementation
@@ -189,6 +190,7 @@ const convertRoutes = require('./convert');
 const hashRoutes = require('./hash');
 const formatRoutes = require('./format');
 const contactRoutes = require('./contact');
+const subscribeRoutes = require('./subscribe');
 const healthRoutes = require('./health');
 
 // Register routes
@@ -198,6 +200,7 @@ router.use('/format', formatRoutes);
 router.use('/contact', contactRoutes);
 router.use('/hash', hashRoutes);
 router.use('/health', healthRoutes);
+router.use('/subscribe', subscribeRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
