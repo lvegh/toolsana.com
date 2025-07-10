@@ -196,6 +196,8 @@ router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);
 router.use('/format', formatRoutes);
 router.use('/contact', contactRoutes);
+router.use('/hash', hashRoutes);
+router.use('/health', healthRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
