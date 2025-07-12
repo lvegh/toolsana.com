@@ -702,7 +702,7 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
       return sendError(res, `Secret key cannot exceed ${maxKeyLengths[selectedAlgorithm]} bytes for ${selectedAlgorithm.toUpperCase()}`, 400);
     }
 
-    logger.info('Starting BLAKE hash generation', {
+    console.log('Starting BLAKE hash generation', {
       algorithm: selectedAlgorithm,
       inputLength: input.length,
       keyLength: hashLength,
@@ -799,7 +799,7 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
           hash = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
         } catch (keyError) {
           // If keyed hashing fails, warn and use standard hashing
-          logger.warn('Node.js crypto BLAKE key hashing failed, falling back to standard hash', {
+          console.warn('Node.js crypto BLAKE key hashing failed, falling back to standard hash', {
             algorithm: selectedAlgorithm,
             error: keyError.message,
             fallbackUsed: 'standard_hash_without_key'
@@ -842,7 +842,7 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
     });
 
   } catch (error) {
-    logger.error('BLAKE hash generation error:', {
+    console.log('BLAKE hash generation error:', {
       error: error.message,
       stack: error.stack,
       parameters: {
@@ -944,11 +944,10 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     // Generate hash with same parameters to compare
     let computedDigest;
 
-    // CRITICAL: Log the exact parameters being used for debugging
-    logger.info('BLAKE verification parameters', {
+    console.log('BLAKE verification parameters', {
       algorithm: selectedAlgorithm,
       inputLength: input.length,
-      input: input.substring(0, 50), // Log first 50 chars for debugging
+      input: input.substring(0, 50),
       expectedHashLength: hashLength,
       providedHashLength: hash.length / 2,
       hasSecretKey: !!normalizedSecretKey,
@@ -1044,8 +1043,7 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     const expectedBuffer = Buffer.from(hash.toLowerCase(), 'hex');
     const computedBuffer = Buffer.from(computedDigest.toLowerCase(), 'hex');
     
-    // CRITICAL: Log the hashes for debugging
-    logger.info('BLAKE hash comparison debug', {
+    console.log('BLAKE hash comparison debug', {
       algorithm: selectedAlgorithm,
       expectedHashPrefix: hash.toLowerCase().substring(0, 32) + '...',
       computedHashPrefix: computedDigest.toLowerCase().substring(0, 32) + '...',
@@ -1056,10 +1054,8 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
       lengthsMatch: expectedBuffer.length === computedBuffer.length
     });
     
-    // Perform the comparison
-    let isValid = false;
     if (expectedBuffer.length !== computedBuffer.length) {
-      logger.warn('BLAKE hash length mismatch detected', {
+      console.warn('BLAKE hash length mismatch detected', {
         expectedLength: expectedBuffer.length,
         computedLength: computedBuffer.length,
         algorithm: selectedAlgorithm
@@ -1070,8 +1066,7 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
       isValid = crypto.timingSafeEqual(expectedBuffer, computedBuffer);
     }
     
-    // CRITICAL: Log the final verification result
-    logger.info('BLAKE verification final result', {
+    console.log('BLAKE verification final result', {
       isValid,
       algorithm: selectedAlgorithm,
       hashesActuallyMatch: hash.toLowerCase() === computedDigest.toLowerCase(),
@@ -1103,7 +1098,7 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     });
 
   } catch (error) {
-    logger.error('BLAKE hash verification error:', {
+    console.error('BLAKE hash verification error:', {
       error: error.message,
       stack: error.stack,
       algorithm: req.body?.algorithm,
