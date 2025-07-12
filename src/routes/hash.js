@@ -739,14 +739,22 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
         const inputBuffer = Buffer.from(input, 'utf8');
         
         if (normalizedSecretKey) {
-          // BLAKE2b with key
+          // BLAKE2b with key - ensure key is properly passed
           const keyBuffer = Buffer.from(normalizedSecretKey, 'utf8');
-          const fullDigest = blake2b(inputBuffer, { key: keyBuffer, dkLen: 64 });
-          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
+          console.log('=== BLAKE2B KEY DEBUG ===', {
+            hasKey: true,
+            keyLength: keyBuffer.length,
+            keyPreview: normalizedSecretKey.substring(0, 10)
+          });
+          const fullDigest = blake2b(inputBuffer, { key: keyBuffer, dkLen: hashLength });
+          digest = Buffer.from(fullDigest).toString('hex');
         } else {
-          // Standard BLAKE2b
-          const fullDigest = blake2b(inputBuffer, { dkLen: 64 });
-          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
+          // Standard BLAKE2b without key
+          console.log('=== BLAKE2B NO KEY DEBUG ===', {
+            hasKey: false
+          });
+          const fullDigest = blake2b(inputBuffer, { dkLen: hashLength });
+          digest = Buffer.from(fullDigest).toString('hex');
         }
       } else if (selectedAlgorithm === 'blake2s') {
         // BLAKE2s using @noble/hashes for proper key support
@@ -791,9 +799,10 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
           hash = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
         } catch (keyError) {
           // If keyed hashing fails, warn and use standard hashing
-          logger.warn('Node.js crypto BLAKE key hashing failed, using standard hash', {
+          logger.warn('Node.js crypto BLAKE key hashing failed, falling back to standard hash', {
             algorithm: selectedAlgorithm,
-            error: keyError.message
+            error: keyError.message,
+            fallbackUsed: 'standard_hash_without_key'
           });
           hash = crypto.createHash(cryptoAlgorithm);
         }
@@ -1036,10 +1045,10 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     const computedBuffer = Buffer.from(computedDigest.toLowerCase(), 'hex');
     
     // CRITICAL: Log the hashes for debugging
-    logger.info('BLAKE hash comparison', {
+    logger.info('BLAKE hash comparison debug', {
       algorithm: selectedAlgorithm,
-      expectedHash: hash.toLowerCase().substring(0, 32) + '...',
-      computedHash: computedDigest.toLowerCase().substring(0, 32) + '...',
+      expectedHashPrefix: hash.toLowerCase().substring(0, 32) + '...',
+      computedHashPrefix: computedDigest.toLowerCase().substring(0, 32) + '...',
       hashesMatch: hash.toLowerCase() === computedDigest.toLowerCase(),
       hasSecretKey: !!normalizedSecretKey,
       expectedLength: expectedBuffer.length,
@@ -1050,9 +1059,10 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     // Perform the comparison
     let isValid = false;
     if (expectedBuffer.length !== computedBuffer.length) {
-      logger.warn('BLAKE hash length mismatch', {
+      logger.warn('BLAKE hash length mismatch detected', {
         expectedLength: expectedBuffer.length,
-        computedLength: computedBuffer.length
+        computedLength: computedBuffer.length,
+        algorithm: selectedAlgorithm
       });
       isValid = false;
     } else {
@@ -1060,11 +1070,13 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
       isValid = crypto.timingSafeEqual(expectedBuffer, computedBuffer);
     }
     
-    // CRITICAL: Log the final result
-    logger.info('BLAKE verification result', {
+    // CRITICAL: Log the final verification result
+    logger.info('BLAKE verification final result', {
       isValid,
       algorithm: selectedAlgorithm,
-      hashesActuallyMatch: hash.toLowerCase() === computedDigest.toLowerCase()
+      hashesActuallyMatch: hash.toLowerCase() === computedDigest.toLowerCase(),
+      processingTimeMs: Date.now() - startTime,
+      hasSecretKey: !!normalizedSecretKey
     });
 
     const endTime = Date.now();
