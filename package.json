@@ -30,6 +30,7 @@
   "author": "ToolzyHub",
   "license": "MIT",
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "argon2": "^0.43.0",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^2.4.3",
