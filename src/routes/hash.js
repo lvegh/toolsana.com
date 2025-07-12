@@ -1038,14 +1038,34 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     // CRITICAL: Log the hashes for debugging
     logger.info('BLAKE hash comparison', {
       algorithm: selectedAlgorithm,
-      expectedHash: hash.toLowerCase(),
-      computedHash: computedDigest.toLowerCase(),
+      expectedHash: hash.toLowerCase().substring(0, 32) + '...',
+      computedHash: computedDigest.toLowerCase().substring(0, 32) + '...',
       hashesMatch: hash.toLowerCase() === computedDigest.toLowerCase(),
-      hasSecretKey: !!normalizedSecretKey
+      hasSecretKey: !!normalizedSecretKey,
+      expectedLength: expectedBuffer.length,
+      computedLength: computedBuffer.length,
+      lengthsMatch: expectedBuffer.length === computedBuffer.length
     });
     
-    const isValid = expectedBuffer.length === computedBuffer.length && 
-                   crypto.timingSafeEqual(expectedBuffer, computedBuffer);
+    // Perform the comparison
+    let isValid = false;
+    if (expectedBuffer.length !== computedBuffer.length) {
+      logger.warn('BLAKE hash length mismatch', {
+        expectedLength: expectedBuffer.length,
+        computedLength: computedBuffer.length
+      });
+      isValid = false;
+    } else {
+      // Use timing-safe comparison
+      isValid = crypto.timingSafeEqual(expectedBuffer, computedBuffer);
+    }
+    
+    // CRITICAL: Log the final result
+    logger.info('BLAKE verification result', {
+      isValid,
+      algorithm: selectedAlgorithm,
+      hashesActuallyMatch: hash.toLowerCase() === computedDigest.toLowerCase()
+    });
 
     const endTime = Date.now();
     const processingTime = endTime - startTime;
