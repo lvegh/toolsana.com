@@ -782,11 +782,13 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
       
       const cryptoAlgorithm = selectedAlgorithm === 'blake2b' ? 'blake2b512' : 'blake2s256';
       
+      // IMPORTANT: BLAKE2 with crypto module behaves differently with keys
+      // We need to be explicit about when to use keys vs not
       if (normalizedSecretKey) {
-        // BLAKE2 with secret key
+        // BLAKE2 with secret key - use the key parameter
         hash = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
       } else {
-        // Standard BLAKE2
+        // Standard BLAKE2 - DO NOT pass key parameter at all
         hash = crypto.createHash(cryptoAlgorithm);
       }
       
@@ -927,6 +929,18 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     // Generate hash with same parameters to compare
     let computedDigest;
 
+    // CRITICAL: Log the exact parameters being used for debugging
+    logger.info('BLAKE verification parameters', {
+      algorithm: selectedAlgorithm,
+      inputLength: input.length,
+      input: input.substring(0, 50), // Log first 50 chars for debugging
+      expectedHashLength: hashLength,
+      providedHashLength: hash.length / 2,
+      hasSecretKey: !!normalizedSecretKey,
+      secretKey: normalizedSecretKey ? normalizedSecretKey.substring(0, 10) + '...' : null,
+      secretKeyLength: normalizedSecretKey ? normalizedSecretKey.length : 0
+    });
+
     if (selectedAlgorithm === 'blake3') {
       // For BLAKE3, try @noble/hashes first, then fallback to other packages
       let computedDigest;
@@ -995,11 +1009,13 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
       
       const cryptoAlgorithm = selectedAlgorithm === 'blake2b' ? 'blake2b512' : 'blake2s256';
       
+      // IMPORTANT: BLAKE2 with crypto module behaves differently with keys
+      // We need to be explicit about when to use keys vs not
       if (normalizedSecretKey) {
-        // BLAKE2 with secret key
+        // BLAKE2 with secret key - use the key parameter
         hashObj = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
       } else {
-        // Standard BLAKE2
+        // Standard BLAKE2 - DO NOT pass key parameter at all
         hashObj = crypto.createHash(cryptoAlgorithm);
       }
       
@@ -1012,6 +1028,15 @@ router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async
     const crypto = require('crypto');
     const expectedBuffer = Buffer.from(hash.toLowerCase(), 'hex');
     const computedBuffer = Buffer.from(computedDigest.toLowerCase(), 'hex');
+    
+    // CRITICAL: Log the hashes for debugging
+    logger.info('BLAKE hash comparison', {
+      algorithm: selectedAlgorithm,
+      expectedHash: hash.toLowerCase(),
+      computedHash: computedDigest.toLowerCase(),
+      hashesMatch: hash.toLowerCase() === computedDigest.toLowerCase(),
+      hasSecretKey: !!normalizedSecretKey
+    });
     
     const isValid = expectedBuffer.length === computedBuffer.length && 
                    crypto.timingSafeEqual(expectedBuffer, computedBuffer);
