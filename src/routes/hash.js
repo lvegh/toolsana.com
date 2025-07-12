@@ -714,90 +714,96 @@ router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), asy
 
     let digest;
 
-    if (selectedAlgorithm === 'blake3') {
-      // For BLAKE3, try @noble/hashes first, then fallback to other packages
-      let digest;
-      
-      try {
-        // Try @noble/hashes (Recommended)
+    // Use @noble/hashes for all BLAKE algorithms to ensure proper keyed hashing support
+    try {
+      if (selectedAlgorithm === 'blake3') {
+        // BLAKE3 using @noble/hashes
         const { blake3 } = require('@noble/hashes/blake3');
+        
+        const inputBuffer = Buffer.from(input, 'utf8');
         
         if (normalizedSecretKey) {
           // BLAKE3 with key
           const keyBuffer = Buffer.from(normalizedSecretKey, 'utf8');
-          const inputBuffer = Buffer.from(input, 'utf8');
           const fullDigest = blake3(inputBuffer, { key: keyBuffer });
           digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
         } else {
           // Standard BLAKE3
-          const inputBuffer = Buffer.from(input, 'utf8');
           const fullDigest = blake3(inputBuffer);
           digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
         }
-      } catch (nobleError) {
-        try {
-          // Fallback to blake3-js
-          const blake3js = require('blake3-js');
-          
-          if (normalizedSecretKey) {
-            // BLAKE3 with key
-            const hasher = blake3js.createKeyed(Buffer.from(normalizedSecretKey, 'utf8'));
-            hasher.update(Buffer.from(input, 'utf8'));
-            const fullDigest = hasher.digest();
-            digest = fullDigest.toString('hex').substring(0, hashLength * 2);
-          } else {
-            // Standard BLAKE3
-            const hasher = blake3js.createHash();
-            hasher.update(Buffer.from(input, 'utf8'));
-            const fullDigest = hasher.digest();
-            digest = fullDigest.toString('hex').substring(0, hashLength * 2);
-          }
-        } catch (blake3jsError) {
-          try {
-            // Fallback to blake3-wasm
-            const { blake3 } = require('blake3-wasm');
-            
-            if (normalizedSecretKey) {
-              // BLAKE3 with key
-              const hasher = blake3.createKeyed(Buffer.from(normalizedSecretKey, 'utf8'));
-              hasher.update(Buffer.from(input, 'utf8'));
-              const fullDigest = hasher.digest();
-              digest = fullDigest.toString('hex').substring(0, hashLength * 2);
-            } else {
-              // Standard BLAKE3
-              const hasher = blake3.createHash();
-              hasher.update(Buffer.from(input, 'utf8'));
-              const fullDigest = hasher.digest();
-              digest = fullDigest.toString('hex').substring(0, hashLength * 2);
-            }
-          } catch (wasmError) {
-            throw new Error('BLAKE3 module not available. Please install @noble/hashes, blake3-js, or blake3-wasm package.');
-          }
+      } else if (selectedAlgorithm === 'blake2b') {
+        // BLAKE2b using @noble/hashes for proper key support
+        const { blake2b } = require('@noble/hashes/blake2b');
+        
+        const inputBuffer = Buffer.from(input, 'utf8');
+        
+        if (normalizedSecretKey) {
+          // BLAKE2b with key
+          const keyBuffer = Buffer.from(normalizedSecretKey, 'utf8');
+          const fullDigest = blake2b(inputBuffer, { key: keyBuffer, dkLen: 64 });
+          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
+        } else {
+          // Standard BLAKE2b
+          const fullDigest = blake2b(inputBuffer, { dkLen: 64 });
+          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
+        }
+      } else if (selectedAlgorithm === 'blake2s') {
+        // BLAKE2s using @noble/hashes for proper key support
+        const { blake2s } = require('@noble/hashes/blake2s');
+        
+        const inputBuffer = Buffer.from(input, 'utf8');
+        
+        if (normalizedSecretKey) {
+          // BLAKE2s with key
+          const keyBuffer = Buffer.from(normalizedSecretKey, 'utf8');
+          const fullDigest = blake2s(inputBuffer, { key: keyBuffer, dkLen: 32 });
+          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
+        } else {
+          // Standard BLAKE2s
+          const fullDigest = blake2s(inputBuffer, { dkLen: 32 });
+          digest = Buffer.from(fullDigest).toString('hex').substring(0, hashLength * 2);
         }
       }
-    } else {
-      // For BLAKE2b and BLAKE2s, use Node.js crypto module
+    } catch (nobleError) {
+      // Fallback to Node.js crypto for BLAKE2 (without key support warning)
+      logger.warn('@noble/hashes not available, falling back to Node.js crypto (key support limited)', {
+        algorithm: selectedAlgorithm,
+        error: nobleError.message
+      });
+      
+      if (normalizedSecretKey) {
+        // Warn user that keyed hashing may not work properly with Node.js crypto
+        logger.warn('BLAKE keyed hashing may not work properly with Node.js crypto module', {
+          algorithm: selectedAlgorithm,
+          recommendation: 'Install @noble/hashes for proper key support'
+        });
+      }
+      
+      // Fallback to Node.js crypto (limited key support)
       const crypto = require('crypto');
       let hash;
       
       const cryptoAlgorithm = selectedAlgorithm === 'blake2b' ? 'blake2b512' : 'blake2s256';
       
-      // IMPORTANT: BLAKE2 with crypto module behaves differently with keys
-      // We need to be explicit about when to use keys vs not
       if (normalizedSecretKey) {
-        // BLAKE2 with secret key - use the key parameter
-        hash = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
+        try {
+          hash = crypto.createHash(cryptoAlgorithm, { key: Buffer.from(normalizedSecretKey, 'utf8') });
+        } catch (keyError) {
+          // If keyed hashing fails, warn and use standard hashing
+          logger.warn('Node.js crypto BLAKE key hashing failed, using standard hash', {
+            algorithm: selectedAlgorithm,
+            error: keyError.message
+          });
+          hash = crypto.createHash(cryptoAlgorithm);
+        }
       } else {
-        // Standard BLAKE2 - DO NOT pass key parameter at all
         hash = crypto.createHash(cryptoAlgorithm);
       }
       
       hash.update(input, 'utf8');
       const fullDigest = hash.digest('hex');
-      
-      // Truncate to requested length (in hex chars)
-      const hexLength = hashLength * 2; // bytes to hex chars
-      digest = fullDigest.substring(0, hexLength);
+      digest = fullDigest.substring(0, hashLength * 2);
     }
 
     const endTime = Date.now();
