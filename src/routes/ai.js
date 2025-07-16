@@ -16,12 +16,10 @@ const uploadImage = multer({
         fileSize: 20 * 1024 * 1024, // 20MB limit for AI processing
     },
     fileFilter: (req, file, cb) => {
-        // Check if file is an image
-        if (file.mimetype.startsWith('image/')) {
-            cb(null, true);
-        } else {
-            cb(new Error('File must be an image'), false);
+        if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.mimetype)) {
+            return cb(new Error('Only PNG, JPEG, and WebP files are allowed.'));
         }
+        cb(null, true);
     }
 });
 
@@ -92,15 +90,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
             logger.info('Processing with config:', config);
 
-            const processedBuffer = await sharp(originalBuffer)
-                .png() // Convert everything to PNG (more compatible)
-                .toColorspace('srgb')
-                .rotate() // Handle EXIF rotation
-                .removeMetadata() // Strip problematic metadata
-                .toBuffer();
+            const blob = new Blob([originalBuffer], { type: req.file.mimetype });
 
             // Process the image
-            const result = await removeBackground(processedBuffer, config);
+            const result = await removeBackground(blob, config);
 
             logger.info('AI processing result type:', {
                 type: typeof result,
@@ -268,7 +261,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
  * POST /api/ai/check-device-capability
  * Check if device is capable of running AI background removal locally
  */
-router.post('/check-device-capability', basicRateLimit, async (req, res) => {
+router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
     try {
         const {
             userAgent,
