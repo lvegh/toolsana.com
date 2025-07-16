@@ -289,7 +289,7 @@ router.post('/check-device-capability', basicRateLimit, async (req, res) => {
     // Initialize capability score
     let capabilityScore = 0;
     const requirements = {
-      minimumScore: 60,
+      minimumScore: 95,
       factors: {}
     };
 
