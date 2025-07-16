@@ -32,8 +32,8 @@ module.exports = {
       env_file: '.env',
 
       // Graceful shutdown
-      kill_timeout: 30000,     // 30 seconds (increased from 5s)
-      listen_timeout: 10000,   // 10 seconds (increased from 3s)
+      kill_timeout: 5000,     // 30 seconds (increased from 5s)
+      listen_timeout: 3000,   // 10 seconds (increased from 3s)
 
 
       // Health monitoring

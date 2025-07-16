@@ -10,23 +10,6 @@ const path = require('path');
 
 const router = express.Router();
 
-// Global process error handlers
-process.on('uncaughtException', (error) => {
-    logger.error('🔥 Uncaught Exception in AI module:', {
-        error: error.message,
-        stack: error.stack,
-        name: error.name
-    });
-    // Don't exit process, just log
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('🔥 Unhandled Rejection in AI module:', {
-        reason: reason,
-        promise: promise
-    });
-});
-
 // Configure multer for image file uploads
 const uploadImage = multer({
     storage: multer.memoryStorage(),
@@ -41,38 +24,28 @@ const uploadImage = multer({
     }
 });
 
-// Track processing state to prevent concurrent processing
-let isProcessing = false;
-let processingStartTime = null;
-
 /**
  * POST /api/ai/remove-background
  * Remove background from image using AI
  */
 router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit), uploadImage.single('file'), async (req, res) => {
-    // Prevent concurrent processing which can cause memory issues
-    if (isProcessing) {
-        return sendError(res, 'Another image is currently being processed. Please wait and try again.', 429);
-    }
-
-    let tempFilePath = null; // Keep for potential debugging, but won't be used
-    
     try {
         // Check if file was uploaded
         if (!req.file) {
             return sendError(res, 'No file provided', 400);
         }
 
-        isProcessing = true;
-        processingStartTime = Date.now();
-
         const originalBuffer = req.file.buffer;
         const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-        const model = req.body.model || 'medium';
+        const model = req.body.model || 'medium'; // Updated to use size-based model
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
 
-        // Validate model parameter
+        const debugPath = path.join(__dirname, '..', '..', 'uploads', 'debug-image.png');
+        fs.mkdirSync(path.dirname(debugPath), { recursive: true });
+        fs.writeFileSync(debugPath, originalBuffer);
+
+        // Validate model parameter - Updated to use new enum values
         const validModels = ['small', 'medium', 'large'];
         if (!validModels.includes(model)) {
             return sendError(res, `Invalid model. Must be one of: ${validModels.join(', ')}`, 400);
@@ -106,60 +79,31 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             });
         }
 
-        // Use buffer directly - IMG.LY accepts Uint8Array in Node.js
-        const uint8Array = new Uint8Array(originalBuffer);
-        
-        logger.info('Prepared Uint8Array for processing', { 
-            originalBufferLength: originalBuffer.length,
-            uint8ArrayLength: uint8Array.length 
-        });
-
-        // Log memory usage before processing
-        const memBefore = process.memoryUsage();
-        logger.info('Memory before processing:', {
-            rss: Math.round(memBefore.rss / 1024 / 1024) + 'MB',
-            heapUsed: Math.round(memBefore.heapUsed / 1024 / 1024) + 'MB',
-            heapTotal: Math.round(memBefore.heapTotal / 1024 / 1024) + 'MB',
-            external: Math.round(memBefore.external / 1024 / 1024) + 'MB'
-        });
-
         // Process the image with AI background removal
         const startTime = Date.now();
-        let processedBuffer;
 
+        let processedBuffer;
         try {
-            // Configure AI background removal options
+            // Configure AI background removal options - Updated config structure
             const config = {
-                publicPath: path.join(__dirname, '..', '..', 'node_modules', '@imgly', 'background-removal-node', 'dist') + path.sep,
-                debug: true,
-                proxyToWorker: true, // Use worker thread to prevent blocking
-                model: model,
+                model: model, // Now uses 'small', 'medium', or 'large'
                 output: {
                     format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
                     quality: outputQuality
-                }
+                },
+                debug: true,
             };
 
             logger.info('Processing with config:', config);
 
-            // Set up timeout to prevent hanging
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error('Processing timeout - operation took longer than 5 minutes'));
-                }, 5 * 60 * 1000); // 5 minutes timeout
-            });
+            // Process the image
+            const result = await removeBackground(originalBuffer, config);
 
-            // Race between processing and timeout
-            const processingPromise = removeBackground(uint8Array, config);
-            
-            const result = await Promise.race([processingPromise, timeoutPromise]);
-
-            logger.info('AI processing result info:', {
+            logger.info('AI processing result type:', {
                 type: typeof result,
                 constructor: result?.constructor?.name,
                 isBuffer: Buffer.isBuffer(result),
                 isArrayBuffer: result instanceof ArrayBuffer,
-                isUint8Array: result instanceof Uint8Array,
                 hasArrayBuffer: typeof result?.arrayBuffer === 'function',
                 length: result?.length || result?.byteLength || 'unknown'
             });
@@ -172,24 +116,22 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             } else if (result instanceof Uint8Array) {
                 processedBuffer = Buffer.from(result);
             } else if (result && typeof result.arrayBuffer === 'function') {
-                // Handle Blob-like objects
                 const arrayBuffer = await result.arrayBuffer();
                 processedBuffer = Buffer.from(arrayBuffer);
-            } else if (result && result.buffer && result.buffer instanceof ArrayBuffer) {
+            } else if (result && result.buffer) {
                 // Handle typed arrays
-                processedBuffer = Buffer.from(result.buffer, result.byteOffset, result.byteLength);
+                processedBuffer = Buffer.from(result.buffer);
             } else {
-                // Last resort - try direct conversion
+                // Last resort - try to convert to string then buffer
                 try {
                     processedBuffer = Buffer.from(result);
                 } catch (conversionError) {
                     logger.error('Failed to convert result to buffer:', {
                         error: conversionError.message,
                         resultType: typeof result,
-                        resultConstructor: result?.constructor?.name,
-                        resultKeys: result ? Object.keys(result) : []
+                        resultConstructor: result?.constructor?.name
                     });
-                    throw new Error(`Unable to process AI result - unexpected format: ${typeof result}`);
+                    throw new Error('Unable to process AI result - unexpected format');
                 }
             }
 
@@ -201,26 +143,22 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 model,
                 outputFormat,
                 errorName: aiError.name,
-                errorCode: aiError.code,
-                processingTime: Date.now() - startTime
+                errorCode: aiError.code
             });
 
-            // Clean up is not needed since we're not using temp files
-            logger.info('Processing failed, no cleanup needed');
-
             // Provide helpful error messages based on common issues
-            if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
-                return sendError(res, 'Processing timeout. Please try with a smaller image or try again later.', 504);
-            } else if (aiError.message.includes('memory') || aiError.message.includes('allocation') || aiError.message.includes('Memory')) {
-                return sendError(res, 'Image too large for AI processing. Please try with a smaller image.', 413);
+            if (aiError.message.includes('Invalid enum value') || aiError.message.includes('Expected')) {
+                return sendError(res, `Invalid model parameter. Use 'small', 'medium', or 'large'.`, 400);
             } else if (aiError.message.includes('model') || aiError.message.includes('Model')) {
                 return sendError(res, 'AI model could not be loaded. The service may be temporarily unavailable.', 503);
+            } else if (aiError.message.includes('memory') || aiError.message.includes('allocation') || aiError.message.includes('Memory')) {
+                return sendError(res, 'Image too large for AI processing. Please try with a smaller image.', 413);
             } else if (aiError.message.includes('format') || aiError.message.includes('decode') || aiError.message.includes('unsupported')) {
                 return sendError(res, 'Invalid or unsupported image format. Please ensure the image is not corrupted.', 400);
+            } else if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
+                return sendError(res, 'Processing timeout. Please try with a smaller image or try again later.', 504);
             } else if (aiError.message.includes('network') || aiError.message.includes('fetch')) {
                 return sendError(res, 'Network error while processing. Please try again later.', 503);
-            } else if (aiError.message.includes('worker') || aiError.message.includes('Worker')) {
-                return sendError(res, 'AI processing worker failed. Please try again.', 500);
             } else {
                 return sendError(res, 'AI background removal failed. Please try again with a different image.', 500, {
                     details: process.env.NODE_ENV === 'development' ? aiError.message : undefined
@@ -229,15 +167,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         }
 
         const processingTime = Date.now() - startTime;
-
-        // Log memory usage after processing
-        const memAfter = process.memoryUsage();
-        logger.info('Memory after processing:', {
-            rss: Math.round(memAfter.rss / 1024 / 1024) + 'MB',
-            heapUsed: Math.round(memAfter.heapUsed / 1024 / 1024) + 'MB',
-            heapTotal: Math.round(memAfter.heapTotal / 1024 / 1024) + 'MB',
-            external: Math.round(memAfter.external / 1024 / 1024) + 'MB'
-        });
 
         // Verify the processed buffer is valid
         if (!processedBuffer || processedBuffer.length === 0) {
@@ -311,8 +240,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             fileSize: req.file?.size,
             model: req.body?.model,
             outputFormat: req.body?.outputFormat,
-            outputQuality: req.body?.outputQuality,
-            processingTime: processingStartTime ? Date.now() - processingStartTime : 'unknown'
+            outputQuality: req.body?.outputQuality
         });
 
         if (error.message.includes('File must be an image')) {
@@ -327,44 +255,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             return sendError(res, 'File too large for processing', 413);
         }
 
-        if (error.message.includes('Another image is currently being processed')) {
-            return sendError(res, 'Server is busy processing another image. Please try again in a moment.', 429);
-        }
-
         return sendError(res, 'Failed to process image with AI background removal', 500, {
             details: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
-    } finally {
-        // Always clean up
-        isProcessing = false;
-        processingStartTime = null;
-        
-        // No temp files to clean up since we use Uint8Array directly
-        logger.info('Processing completed, state reset');
-
-        // Force garbage collection if available
-        if (global.gc) {
-            global.gc();
-            logger.info('Forced garbage collection');
-        }
     }
-});
-
-// Health check endpoint to monitor processing state
-router.get('/health', (req, res) => {
-    const memUsage = process.memoryUsage();
-    res.json({
-        status: 'ok',
-        isProcessing,
-        processingTime: processingStartTime ? Date.now() - processingStartTime : null,
-        memory: {
-            rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
-            heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
-            heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB',
-            external: Math.round(memUsage.external / 1024 / 1024) + 'MB'
-        },
-        uptime: process.uptime()
-    });
 });
 
 /**
@@ -418,6 +312,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
                 requirements.factors.cpu = 'poor';
             }
         } else {
+            // Missing CPU info - assume worst case
             capabilityScore += 0;
             requirements.factors.cpu = 'unknown';
         }
@@ -438,6 +333,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
                 requirements.factors.memory = 'poor';
             }
         } else {
+            // Missing memory info - assume worst case
             capabilityScore += 0;
             requirements.factors.memory = 'unknown';
         }
@@ -496,19 +392,19 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
                 requirements.factors.network = 'slow';
             }
         } else {
-            capabilityScore += 5;
+            capabilityScore += 5; // Assume moderate if unknown
             requirements.factors.network = 'unknown';
         }
 
         // Adjust score based on image size
         if (imageSize) {
-            if (imageSize > 10 * 1024 * 1024) {
+            if (imageSize > 10 * 1024 * 1024) { // > 10MB
                 capabilityScore -= 20;
                 requirements.factors.imageSize = 'very_large';
-            } else if (imageSize > 5 * 1024 * 1024) {
+            } else if (imageSize > 5 * 1024 * 1024) { // > 5MB
                 capabilityScore -= 10;
                 requirements.factors.imageSize = 'large';
-            } else if (imageSize > 2 * 1024 * 1024) {
+            } else if (imageSize > 2 * 1024 * 1024) { // > 2MB
                 capabilityScore -= 5;
                 requirements.factors.imageSize = 'medium';
             } else {
@@ -551,6 +447,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             requestBody: req.body
         });
 
+        // If we can't assess capability, default to server-side
         return sendSuccess(res, 'Device capability check failed, defaulting to server-side processing', {
             capabilityScore: 0,
             recommendation: 'server',
@@ -573,9 +470,9 @@ router.get('/info', basicRateLimit, (req, res) => {
         version: '1.0.0',
         engine: '@imgly/background-removal-node',
         supportedModels: [
-            'small',
-            'medium',
-            'large'
+            'small',    // Fast, lower quality
+            'medium',   // Balanced (default)
+            'large'     // Slow, higher quality
         ],
         supportedFormats: {
             input: ['jpg', 'jpeg', 'png', 'webp'],
@@ -584,14 +481,12 @@ router.get('/info', basicRateLimit, (req, res) => {
         endpoints: {
             remove_background: 'POST /api/remove-background',
             check_device_capability: 'POST /api/check-device-capability',
-            health: 'GET /api/ai/health',
             info: 'GET /api/ai/info'
         },
         limits: {
             maxFileSize: '20MB',
             supportedImageTypes: ['image/jpeg', 'image/png', 'image/webp'],
-            outputQualityRange: '0.1-1.0',
-            concurrentProcessing: false
+            outputQualityRange: '0.1-1.0'
         },
         features: {
             aiBackgroundRemoval: true,
@@ -599,9 +494,35 @@ router.get('/info', basicRateLimit, (req, res) => {
             deviceCapabilityCheck: true,
             outputFormatControl: true,
             qualityControl: true,
-            performanceOptimization: true,
-            healthMonitoring: true,
-            memoryManagement: true
+            performanceOptimization: true
+        },
+        usage: {
+            remove_background: {
+                method: 'POST',
+                endpoint: '/api/remove-background',
+                contentType: 'multipart/form-data',
+                fields: {
+                    file: 'Image file (required)',
+                    model: 'Model size: small, medium, large (optional, default: medium)',
+                    outputFormat: 'Output format (optional, default: png)',
+                    outputQuality: 'Output quality 0.1-1.0 (optional, default: 1.0)'
+                },
+                response: 'Image file with background removed'
+            },
+            check_device_capability: {
+                method: 'POST',
+                endpoint: '/api/check-device-capability',
+                contentType: 'application/json',
+                fields: {
+                    userAgent: 'Browser user agent string',
+                    hardwareConcurrency: 'Number of CPU cores',
+                    deviceMemory: 'Device memory in GB',
+                    connection: 'Network connection info',
+                    webgl: 'WebGL support information',
+                    imageSize: 'Size of image to process'
+                },
+                response: 'Device capability assessment and recommendation'
+            }
         }
     };
 
