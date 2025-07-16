@@ -287,7 +287,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
         // Initialize capability score
         let capabilityScore = 0;
         const requirements = {
-            minimumScore: 60,
+            minimumScore: 95,
             factors: {}
         };
 
