@@ -37,12 +37,12 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const model = req.body.model || 'isnet'; // Default to balanced model
+    const model = req.body.model || 'medium'; // Updated to use size-based model
     const outputFormat = req.body.outputFormat || 'png';
     const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
 
-    // Validate model parameter
-    const validModels = ['isnet', 'u2net', 'u2netp', 'u2net_human_seg', 'u2net_cloth_seg', 'silueta'];
+    // Validate model parameter - Updated to use new enum values
+    const validModels = ['small', 'medium', 'large'];
     if (!validModels.includes(model)) {
       return sendError(res, `Invalid model. Must be one of: ${validModels.join(', ')}`, 400);
     }
@@ -80,24 +80,54 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
     
     let processedBuffer;
     try {
-      // Configure AI background removal options
+      // Configure AI background removal options - Updated config structure
       const config = {
-        model: model,
+        model: model, // Now uses 'small', 'medium', or 'large'
         output: {
           format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
           quality: outputQuality
         }
       };
 
+      logger.info('Processing with config:', config);
+
       // Process the image
-      const blob = await removeBackground(originalBuffer, config);
+      const result = await removeBackground(originalBuffer, config);
       
-      // Convert blob to buffer
-      if (blob instanceof ArrayBuffer) {
-        processedBuffer = Buffer.from(blob);
+      logger.info('AI processing result type:', {
+        type: typeof result,
+        constructor: result?.constructor?.name,
+        isBuffer: Buffer.isBuffer(result),
+        isArrayBuffer: result instanceof ArrayBuffer,
+        hasArrayBuffer: typeof result?.arrayBuffer === 'function',
+        length: result?.length || result?.byteLength || 'unknown'
+      });
+
+      // Convert result to buffer - Handle different result types
+      if (Buffer.isBuffer(result)) {
+        processedBuffer = result;
+      } else if (result instanceof ArrayBuffer) {
+        processedBuffer = Buffer.from(result);
+      } else if (result instanceof Uint8Array) {
+        processedBuffer = Buffer.from(result);
+      } else if (result && typeof result.arrayBuffer === 'function') {
+        const arrayBuffer = await result.arrayBuffer();
+        processedBuffer = Buffer.from(arrayBuffer);
+      } else if (result && result.buffer) {
+        // Handle typed arrays
+        processedBuffer = Buffer.from(result.buffer);
       } else {
-        // If it's already a buffer or other format, handle appropriately
-        processedBuffer = Buffer.from(await blob.arrayBuffer());
+        // Last resort - try to convert to string then buffer
+        try {
+          processedBuffer = Buffer.from(result);
+        } catch (conversionError) {
+          logger.error('Failed to convert result to buffer:', {
+            error: conversionError.message,
+            resultType: typeof result,
+            resultConstructor: result?.constructor?.name
+          });
+          throw new Error('Unable to process AI result - unexpected format');
+        }
       }
 
     } catch (aiError) {
@@ -106,18 +136,28 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         stack: aiError.stack,
         originalName: req.file.originalname,
         model,
-        outputFormat
+        outputFormat,
+        errorName: aiError.name,
+        errorCode: aiError.code
       });
 
       // Provide helpful error messages based on common issues
-      if (aiError.message.includes('model')) {
-        return sendError(res, 'AI model loading failed. Please try again later.', 500);
-      } else if (aiError.message.includes('memory') || aiError.message.includes('allocation')) {
+      if (aiError.message.includes('Invalid enum value') || aiError.message.includes('Expected')) {
+        return sendError(res, `Invalid model parameter. Use 'small', 'medium', or 'large'.`, 400);
+      } else if (aiError.message.includes('model') || aiError.message.includes('Model')) {
+        return sendError(res, 'AI model could not be loaded. The service may be temporarily unavailable.', 503);
+      } else if (aiError.message.includes('memory') || aiError.message.includes('allocation') || aiError.message.includes('Memory')) {
         return sendError(res, 'Image too large for AI processing. Please try with a smaller image.', 413);
-      } else if (aiError.message.includes('format') || aiError.message.includes('decode')) {
-        return sendError(res, 'Invalid image format. Please ensure the image is not corrupted.', 400);
+      } else if (aiError.message.includes('format') || aiError.message.includes('decode') || aiError.message.includes('unsupported')) {
+        return sendError(res, 'Invalid or unsupported image format. Please ensure the image is not corrupted.', 400);
+      } else if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
+        return sendError(res, 'Processing timeout. Please try with a smaller image or try again later.', 504);
+      } else if (aiError.message.includes('network') || aiError.message.includes('fetch')) {
+        return sendError(res, 'Network error while processing. Please try again later.', 503);
       } else {
-        return sendError(res, 'AI background removal failed. Please try again.', 500);
+        return sendError(res, 'AI background removal failed. Please try again with a different image.', 500, {
+          details: process.env.NODE_ENV === 'development' ? aiError.message : undefined
+        });
       }
     }
 
@@ -125,7 +165,16 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
     // Verify the processed buffer is valid
     if (!processedBuffer || processedBuffer.length === 0) {
-      throw new Error('AI processing resulted in empty buffer');
+      logger.error('AI processing resulted in empty buffer');
+      return sendError(res, 'AI processing failed to generate output. The image may be too complex or corrupted.', 500);
+    }
+
+    // Basic validation of the processed buffer
+    if (processedBuffer.length < 100) {
+      logger.error('AI processing resulted in suspiciously small buffer', {
+        size: processedBuffer.length
+      });
+      return sendError(res, 'AI processing may have failed. Please try again with a different image.', 500);
     }
 
     // Generate appropriate filename and mime type
@@ -418,12 +467,9 @@ router.get('/info', basicRateLimit, (req, res) => {
     version: '1.0.0',
     engine: '@imgly/background-removal-node',
     supportedModels: [
-      'isnet',
-      'u2net', 
-      'u2netp',
-      'u2net_human_seg',
-      'u2net_cloth_seg',
-      'silueta'
+      'small',    // Fast, lower quality
+      'medium',   // Balanced (default)
+      'large'     // Slow, higher quality
     ],
     supportedFormats: {
       input: ['jpg', 'jpeg', 'png', 'webp'],
@@ -441,7 +487,7 @@ router.get('/info', basicRateLimit, (req, res) => {
     },
     features: {
       aiBackgroundRemoval: true,
-      multipleModels: true,
+      multipleModelSizes: true,
       deviceCapabilityCheck: true,
       outputFormatControl: true,
       qualityControl: true,
@@ -454,7 +500,7 @@ router.get('/info', basicRateLimit, (req, res) => {
         contentType: 'multipart/form-data',
         fields: {
           file: 'Image file (required)',
-          model: 'AI model to use (optional, default: isnet)',
+          model: 'Model size: small, medium, large (optional, default: medium)',
           outputFormat: 'Output format (optional, default: png)',
           outputQuality: 'Output quality 0.1-1.0 (optional, default: 1.0)'
         },
@@ -482,7 +528,3 @@ router.get('/info', basicRateLimit, (req, res) => {
 });
 
 module.exports = router;
-
-// Add to index.js routes registration:
-// const aiRoutes = require('./ai');
-// router.use('/ai', aiRoutes);
