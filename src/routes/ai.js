@@ -40,7 +40,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
 
-        fs.writeFileSync('/uploads/debug-image.png', originalBuffer);
+        fs.writeFileSync('../../uploads/debug-image.png', originalBuffer);
 
         // Validate model parameter - Updated to use new enum values
         const validModels = ['small', 'medium', 'large'];
