@@ -97,7 +97,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             logger.info('Processing with config:', config);
 
             try {
-                const result = await removeBackground(imageBuffer, config);
+                const result = await removeBackground(originalBuffer, config);
                 res.json({ success: true, file: result });
             } catch (err) {
                 console.error('❌ Error removing background:', err);
