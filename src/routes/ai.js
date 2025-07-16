@@ -55,7 +55,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         return sendError(res, 'Another image is currently being processed. Please wait and try again.', 429);
     }
 
-    let tempFilePath = null;
+    let tempFilePath = null; // Keep for potential debugging, but won't be used
     
     try {
         // Check if file was uploaded
@@ -106,17 +106,13 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             });
         }
 
-        // Create temporary file (CRITICAL FIX: IMG.LY needs file path, not Blob in Node.js)
-        const tempDir = path.join(__dirname, '..', '..', 'temp');
-        fs.mkdirSync(tempDir, { recursive: true });
+        // Use buffer directly - IMG.LY accepts Uint8Array in Node.js
+        const uint8Array = new Uint8Array(originalBuffer);
         
-        const fileExtension = path.extname(req.file.originalname) || '.jpg';
-        tempFilePath = path.join(tempDir, `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}${fileExtension}`);
-        
-        // Write buffer to temporary file
-        fs.writeFileSync(tempFilePath, originalBuffer);
-
-        logger.info('Temporary file created', { tempFilePath });
+        logger.info('Prepared Uint8Array for processing', { 
+            originalBufferLength: originalBuffer.length,
+            uint8ArrayLength: uint8Array.length 
+        });
 
         // Log memory usage before processing
         const memBefore = process.memoryUsage();
@@ -154,7 +150,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             });
 
             // Race between processing and timeout
-            const processingPromise = removeBackground(tempFilePath, config);
+            const processingPromise = removeBackground(uint8Array, config);
             
             const result = await Promise.race([processingPromise, timeoutPromise]);
 
@@ -209,15 +205,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 processingTime: Date.now() - startTime
             });
 
-            // Clean up temp file immediately on error
-            if (tempFilePath && fs.existsSync(tempFilePath)) {
-                try {
-                    fs.unlinkSync(tempFilePath);
-                    logger.info('Temporary file cleaned up after error');
-                } catch (cleanupError) {
-                    logger.error('Failed to clean up temp file:', cleanupError.message);
-                }
-            }
+            // Clean up is not needed since we're not using temp files
+            logger.info('Processing failed, no cleanup needed');
 
             // Provide helpful error messages based on common issues
             if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
@@ -350,18 +339,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         isProcessing = false;
         processingStartTime = null;
         
-        // Clean up temporary file
-        if (tempFilePath && fs.existsSync(tempFilePath)) {
-            try {
-                fs.unlinkSync(tempFilePath);
-                logger.info('Temporary file cleaned up successfully', { tempFilePath });
-            } catch (cleanupError) {
-                logger.error('Failed to clean up temporary file:', {
-                    error: cleanupError.message,
-                    tempFilePath
-                });
-            }
-        }
+        // No temp files to clean up since we use Uint8Array directly
+        logger.info('Processing completed, state reset');
 
         // Force garbage collection if available
         if (global.gc) {
