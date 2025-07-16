@@ -93,8 +93,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             logger.info('Processing with config:', config);
 
             const processedBuffer = await sharp(originalBuffer)
-                .jpeg({ quality: 90 })
+                .png() // Convert everything to PNG (more compatible)
                 .toColorspace('srgb')
+                .rotate() // Handle EXIF rotation
+                .removeMetadata() // Strip problematic metadata
                 .toBuffer();
 
             // Process the image
