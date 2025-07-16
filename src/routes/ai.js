@@ -5,6 +5,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
+const fs = require('fs');
 
 const router = express.Router();
 
@@ -38,6 +39,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         const model = req.body.model || 'medium'; // Updated to use size-based model
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
+
+        fs.writeFileSync('/uploads/debug-image.png', originalBuffer);
 
         // Validate model parameter - Updated to use new enum values
         const validModels = ['small', 'medium', 'large'];
@@ -88,13 +91,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             };
 
             logger.info('Processing with config:', config);
-
-console.log("Type checks for originalBuffer:");
-console.log("Is Buffer: ", Buffer.isBuffer(originalBuffer));
-console.log("Is ArrayBuffer: ", originalBuffer instanceof ArrayBuffer);
-console.log("Is Uint8Array: ", originalBuffer instanceof Uint8Array);
-console.log("Is Blob: ", typeof Blob !== 'undefined' && originalBuffer instanceof Blob);
-console.log("Is URL (string): ", typeof originalBuffer === 'string' && /^https?:\/\//.test(originalBuffer));
 
             /* const blob = new Blob([originalBuffer], { type: req.file.mimetype }); */
 
