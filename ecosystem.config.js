@@ -54,9 +54,8 @@ module.exports = {
       ref: 'origin/main',
       repo: 'git@github.com:lvegh/api.toolzyhub.app.git',
       path: '/var/www/toolzyhub-api',
-      'pre-deploy-local': '',
-      'post-deploy': 'npm install && pm2 reload ecosystem.config.js --env production',
-      'pre-setup': ''
+      'ssh_options': 'StrictHostKeyChecking=no',
+      'post-deploy': 'cd current && npm install && pm2 reload ecosystem.config.js --env production'
     }
   }
 };
