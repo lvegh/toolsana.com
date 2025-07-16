@@ -44,7 +44,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         const debugPath = path.join(__dirname, '..', '..', 'uploads', 'debug-image.png');
         fs.mkdirSync(path.dirname(debugPath), { recursive: true });
         fs.writeFileSync(debugPath, originalBuffer);
-        console.log('Image written to:', debugPath);
 
         // Validate model parameter - Updated to use new enum values
         const validModels = ['small', 'medium', 'large'];
@@ -97,9 +96,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             logger.info('Processing with config:', config);
 
             /* const blob = new Blob([originalBuffer], { type: req.file.mimetype }); */
-
+            const bufferFromDisk = fs.readFileSync(debugPath);
             // Process the image
-            const result = await removeBackground(originalBuffer, config);
+            const result = await removeBackground(bufferFromDisk, config);
 
             logger.info('AI processing result type:', {
                 type: typeof result,
