@@ -7,7 +7,6 @@ const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurit
 const logger = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
-const { Blob } = require('buffer');
 
 const router = express.Router();
 
@@ -96,18 +95,12 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
             logger.info('Processing with config:', config);
 
-            try {
-                const result = await removeBackground(originalBuffer, config);
-                res.json({ success: true, file: result });
-            } catch (err) {
-                console.error('❌ Error removing background:', err);
-                if (!res.headersSent) {
-                    res.status(400).json({ success: false, message: 'Background removal failed' });
-                }
-            }
+            const blob = new Blob([originalBuffer], { type: req.file.mimetype });
 
             // Process the image
-            const result = await removeBackground(blob, config);
+            const result = await removeBackground(blob);
+
+            console.log(result);
 
             logger.info('AI processing result type:', {
                 type: typeof result,
