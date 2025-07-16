@@ -5,7 +5,6 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
-const sharp = require('sharp');
 
 const router = express.Router();
 
