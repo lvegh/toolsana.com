@@ -11,9 +11,6 @@ const { connectRedis } = require('./config/redis');
 const { sendSuccess, sendError } = require('./middleware/errorHandler');
 const { createUploadsDir } = require('./utils/fileSystem');
 
-// Import CORS middleware
-const { getCorsMiddleware } = require('./middleware/cors');
-
 // Initialize Express app
 const app = express();
 
@@ -24,9 +21,6 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Trust proxy (important for rate limiting behind reverse proxy)
 app.set('trust proxy', 1);
-
-// CORS middleware - ADD THIS BEFORE OTHER MIDDLEWARE
-app.use(getCorsMiddleware());
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));

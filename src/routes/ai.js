@@ -268,7 +268,6 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             hardwareConcurrency,
             deviceMemory,
             connection,
-            platform,
             maxTouchPoints,
             webgl,
             canvas,
@@ -280,7 +279,6 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             hardwareConcurrency,
             deviceMemory,
             connection: connection?.effectiveType,
-            platform,
             maxTouchPoints,
             hasWebGL: !!webgl,
             hasCanvas: !!canvas,
@@ -336,7 +334,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             requirements.factors.memory = 'unknown';
         }
 
-        // Check platform and browser (worth 20 points)
+        // Check browser (worth 20 points)
         if (userAgent) {
             const ua = userAgent.toLowerCase();
             if (ua.includes('chrome') && !ua.includes('mobile')) {
@@ -516,7 +514,6 @@ router.get('/info', basicRateLimit, (req, res) => {
                     hardwareConcurrency: 'Number of CPU cores',
                     deviceMemory: 'Device memory in GB',
                     connection: 'Network connection info',
-                    platform: 'Operating system platform',
                     webgl: 'WebGL support information',
                     imageSize: 'Size of image to process'
                 },
