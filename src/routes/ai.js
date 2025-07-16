@@ -89,6 +89,13 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
             logger.info('Processing with config:', config);
 
+console.log("Type checks for originalBuffer:");
+console.log("Is Buffer: ", Buffer.isBuffer(originalBuffer));
+console.log("Is ArrayBuffer: ", originalBuffer instanceof ArrayBuffer);
+console.log("Is Uint8Array: ", originalBuffer instanceof Uint8Array);
+console.log("Is Blob: ", typeof Blob !== 'undefined' && originalBuffer instanceof Blob);
+console.log("Is URL (string): ", typeof originalBuffer === 'string' && /^https?:\/\//.test(originalBuffer));
+
             /* const blob = new Blob([originalBuffer], { type: req.file.mimetype }); */
 
             // Process the image
