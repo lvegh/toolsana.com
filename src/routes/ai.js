@@ -96,7 +96,16 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
             logger.info('Processing with config:', config);
 
-            const blob = new Blob([originalBuffer], { type: req.file.mimetype });
+            try {
+                const bufferFromDisk = fs.readFileSync(debugPath); // safe load
+                console.log('Read image from disk. Buffer size:', bufferFromDisk.length);
+
+                const result = await removeBackground(bufferFromDisk, config);
+                console.log('Background removed. Result size:', result.length);
+            } catch (err) {
+                console.error('❌ Error removing background:', err);
+                res.status(500).json({ success: false, message: 'Background removal failed.' });
+            }
 
             // Process the image
             const result = await removeBackground(blob, config);
