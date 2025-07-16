@@ -95,10 +95,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
             logger.info('Processing with config:', config);
 
-            /* const blob = new Blob([originalBuffer], { type: req.file.mimetype }); */
+            const blob = new Blob([originalBuffer], { type: req.file.mimetype });
 
             // Process the image
-            const result = await removeBackground(debugPath, config);
+            const result = await removeBackground(blob);
 
             logger.info('AI processing result type:', {
                 type: typeof result,
