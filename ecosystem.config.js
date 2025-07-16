@@ -22,7 +22,6 @@ module.exports = {
       // Auto restart settings
       watch: false, // Set to true in development if needed
       ignore_watch: ['node_modules', 'logs'],
-      max_memory_restart: '1G',
       
       // Advanced PM2 features
       min_uptime: '10s',
@@ -50,10 +49,10 @@ module.exports = {
   // Deployment configuration (optional)
   deploy: {
     production: {
-      user: 'node',
-      host: 'your-server.com',
+      user: 'root',
+      host: 'api.toolzyhub.app',
       ref: 'origin/main',
-      repo: 'git@github.com:your-username/toolzyhub-api.git',
+      repo: 'git@github.com:lvegh/api.toolzyhub.app.git',
       path: '/var/www/toolzyhub-api',
       'pre-deploy-local': '',
       'post-deploy': 'npm install && pm2 reload ecosystem.config.js --env production',
