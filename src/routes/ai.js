@@ -7,6 +7,7 @@ const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurit
 const logger = require('../utils/logger');
 const fs = require('fs');
 const path = require('path');
+const { Blob } = require('buffer');
 
 const router = express.Router();
 
