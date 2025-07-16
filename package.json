@@ -30,6 +30,7 @@
   "author": "ToolzyHub",
   "license": "MIT",
   "dependencies": {
+    "@imgly/background-removal-node": "^1.4.5",
     "@noble/hashes": "^1.8.0",
     "argon2": "^0.43.0",
     "bcrypt": "^6.0.0",
