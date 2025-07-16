@@ -23,6 +23,7 @@ router.get('/', basicRateLimit, (req, res) => {
       convert: '/api/convert',
       format: '/api/format',
       hash: '/api/hash',
+      ai: '/api/ai',
       contact: '/api/contact',
       subscribe: '/api/subscribe'
       // Add more endpoints as they are created
@@ -79,8 +80,15 @@ router.get('/info', basicRateLimit, (req, res) => {
       },
       file_handling: {
         image_processing: true,
+        ai_background_removal: true,
         file_uploads: true,
         sharp_integration: true
+      },
+      ai_capabilities: {
+        background_removal: true,
+        device_capability_detection: true,
+        intelligent_processing: true,
+        client_server_fallback: true
       },
       monitoring: {
         health_checks: true,
@@ -93,6 +101,7 @@ router.get('/info', basicRateLimit, (req, res) => {
     },
     limits: {
       max_file_size: process.env.MAX_FILE_SIZE || '10MB',
+      max_ai_file_size: '20MB',
       rate_limit: {
         window: process.env.RATE_LIMIT_WINDOW_MS || '15 minutes',
         max_requests: process.env.RATE_LIMIT_MAX_REQUESTS || 100
@@ -124,6 +133,11 @@ router.get('/docs', basicRateLimit, (req, res) => {
         process_image: 'POST /api/v1/upload/process',
         delete: 'DELETE /api/v1/upload/:id'
       },
+      ai_processing: {
+        remove_background: 'POST /api/ai/remove-background',
+        check_device_capability: 'POST /api/ai/check-device-capability',
+        ai_info: 'GET /api/ai/info'
+      },
       image_compression: {
         compress_jpg: 'POST /api/compress/jpg',
         compress_png: 'POST /api/compress/png',
@@ -144,6 +158,8 @@ router.get('/docs', basicRateLimit, (req, res) => {
         avif_to_png: 'POST /api/convert/avif_to_png',
         avif_to_jpg: 'POST /api/convert/avif_to_jpg',
         avif_to_webp: 'POST /api/convert/avif_to_webp',
+        image_to_base64: 'POST /api/convert/image-to-base64',
+        base64_to_image: 'POST /api/convert/base64-to-image',
         conversion_info: 'GET /api/convert/info'
       },
       health_monitoring: {
@@ -175,6 +191,7 @@ router.get('/docs', basicRateLimit, (req, res) => {
         401: 'Unauthorized',
         403: 'Forbidden',
         404: 'Not Found',
+        413: 'Payload Too Large',
         429: 'Too Many Requests',
         500: 'Internal Server Error'
       }
@@ -189,6 +206,7 @@ const compressRoutes = require('./compress');
 const convertRoutes = require('./convert');
 const hashRoutes = require('./hash');
 const formatRoutes = require('./format');
+const aiRoutes = require('./ai');
 const contactRoutes = require('./contact');
 const subscribeRoutes = require('./subscribe');
 const healthRoutes = require('./health');
@@ -197,6 +215,7 @@ const healthRoutes = require('./health');
 router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);
 router.use('/format', formatRoutes);
+router.use('/ai', aiRoutes);
 router.use('/contact', contactRoutes);
 router.use('/hash', hashRoutes);
 router.use('/health', healthRoutes);
