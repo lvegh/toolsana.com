@@ -6,6 +6,7 @@ const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
 const fs = require('fs');
+const path = require('path');
 
 const router = express.Router();
 
@@ -40,7 +41,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
 
-        fs.writeFileSync('../../uploads/debug-image.png', originalBuffer);
+        const debugPath = path.join(__dirname, '..', '..', 'uploads', 'debug-image.png');
+        fs.mkdirSync(path.dirname(debugPath), { recursive: true });
+        fs.writeFileSync(debugPath, originalBuffer);
+        console.log('Image written to:', debugPath);
 
         // Validate model parameter - Updated to use new enum values
         const validModels = ['small', 'medium', 'large'];
