@@ -430,8 +430,8 @@ router.get('/info', basicRateLimit, (req, res) => {
       output: ['png', 'jpg', 'jpeg', 'webp']
     },
     endpoints: {
-      remove_background: 'POST /api/ai/remove-background',
-      check_device_capability: 'POST /api/ai/check-device-capability',
+      remove_background: 'POST /api/remove-background',
+      check_device_capability: 'POST /api/check-device-capability',
       info: 'GET /api/ai/info'
     },
     limits: {
@@ -450,7 +450,7 @@ router.get('/info', basicRateLimit, (req, res) => {
     usage: {
       remove_background: {
         method: 'POST',
-        endpoint: '/api/ai/remove-background',
+        endpoint: '/api/remove-background',
         contentType: 'multipart/form-data',
         fields: {
           file: 'Image file (required)',
@@ -462,7 +462,7 @@ router.get('/info', basicRateLimit, (req, res) => {
       },
       check_device_capability: {
         method: 'POST',
-        endpoint: '/api/ai/check-device-capability',
+        endpoint: '/api/check-device-capability',
         contentType: 'application/json',
         fields: {
           userAgent: 'Browser user agent string',

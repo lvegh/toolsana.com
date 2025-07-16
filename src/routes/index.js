@@ -134,8 +134,8 @@ router.get('/docs', basicRateLimit, (req, res) => {
         delete: 'DELETE /api/v1/upload/:id'
       },
       ai_processing: {
-        remove_background: 'POST /api/ai/remove-background',
-        check_device_capability: 'POST /api/ai/check-device-capability',
+        remove_background: 'POST /api/remove-background',
+        check_device_capability: 'POST /api/check-device-capability',
         ai_info: 'GET /api/ai/info'
       },
       image_compression: {
