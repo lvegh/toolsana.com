@@ -46,7 +46,7 @@ const uploadImage = multer({
 // Processing state
 let processingStartTime = null;
 
-router.post('/remove-background', enhancedSecurityAi, basicRateLimit, uploadImage.single('file'), async (req, res) => {
+router.post('/remove-background', basicRateLimit, uploadImage.single('file'), async (req, res) => {
     console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (SERVER-SIDE)');
 
     try {
