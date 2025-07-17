@@ -71,7 +71,7 @@ app.get('/health', (req, res) => {
 try {
   const aiRoutes = require('./routes/ai-standalone'); // We'll create this
   app.use('/api/ai', aiRoutes);
-  
+
   console.log('✅ AI routes loaded successfully');
 } catch (error) {
   console.error('❌ Error loading AI routes:', error);
@@ -156,11 +156,11 @@ app.use('*', (req, res) => {
 // Error handler - SIMPLE
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
-  
+
   if (res.headersSent) {
     return next(err);
   }
-  
+
   res.status(500).json({
     success: false,
     message: 'Internal server error'
@@ -171,6 +171,10 @@ app.use((err, req, res, next) => {
 const startServer = async () => {
   try {
     console.log('Starting STRIPPED server...');
+
+    // Create uploads directory if it doesn't exist
+    await createUploadsDir();
+    console.log('Uploads directory ready');
 
     // Start HTTP server
     const server = app.listen(PORT, HOST, () => {
