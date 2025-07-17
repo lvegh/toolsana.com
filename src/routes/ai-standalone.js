@@ -1,9 +1,7 @@
+// src/routes/ai-standalone.js - Exact copy of working standalone AI logic
 const express = require('express');
 const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
-const { basicRateLimit } = require('../middleware/rateLimit');
-const { sendSuccess, sendError } = require('../middleware/errorHandler');
-const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const fs = require('fs');
 const path = require('path');
 
@@ -11,7 +9,7 @@ const router = express.Router();
 
 // Global process error handlers with detailed logging
 process.on('uncaughtException', (error) => {
-    console.error('🔥 UNCAUGHT EXCEPTION in AI module:', {
+    console.error('🔥 UNCAUGHT EXCEPTION:', {
         message: error.message,
         name: error.name,
         stack: error.stack,
@@ -22,15 +20,14 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('🔥 UNHANDLED REJECTION in AI module:', {
+    console.error('🔥 UNHANDLED REJECTION:', {
         reason: reason,
         promise: promise,
         timestamp: new Date().toISOString()
     });
 });
 
-// Configure multer for file uploads with disk storage
-// Configure multer
+// Configure multer - EXACT SAME AS STANDALONE
 const uploadImage = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -49,9 +46,9 @@ const uploadImage = multer({
 let isProcessing = false;
 let processingStartTime = null;
 
-
+// Background removal endpoint - EXACT SAME CODE AS STANDALONE
 router.post('/remove-background', uploadImage.single('file'), async (req, res) => {
-    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
+    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (ROUTES MODULE)');
 
     // Prevent concurrent processing
     if (isProcessing) {
@@ -243,7 +240,7 @@ router.post('/remove-background', uploadImage.single('file'), async (req, res) =
         const filename = `${originalName}_no_bg.png`;
         const compressionRatio = ((originalBuffer.length - processedBuffer.length) / originalBuffer.length * 100).toFixed(2);
 
-        console.log('✅ AI background removal SUCCESS (STANDALONE):', {
+        console.log('✅ AI background removal SUCCESS (ROUTES MODULE):', {
             originalName: req.file.originalname,
             originalSize: originalBuffer.length,
             processedSize: processedBuffer.length,
@@ -297,15 +294,16 @@ router.post('/remove-background', uploadImage.single('file'), async (req, res) =
             console.log('🗑️  Forced garbage collection');
         }
 
-        console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (STANDALONE)');
+        console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (ROUTES MODULE)');
     }
 });
 
-// Health check endpoint
+// Health check endpoint - EXACT SAME AS STANDALONE
 router.get('/health', (req, res) => {
     const memUsage = process.memoryUsage();
     res.json({
         status: 'ok',
+        environment: 'routes-module',
         isProcessing,
         processingTime: processingStartTime ? Date.now() - processingStartTime : null,
         memory: {
@@ -318,10 +316,8 @@ router.get('/health', (req, res) => {
     });
 });
 
-/**
- * Device capability assessment endpoint
- */
-router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+// Device capability assessment endpoint - SIMPLIFIED
+router.post('/check-device-capability', async (req, res) => {
     try {
         const {
             userAgent,
@@ -377,85 +373,19 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             requirements.factors.memory = 'poor';
         }
 
-        // Browser (20 points)
-        if (userAgent) {
-            const ua = userAgent.toLowerCase();
-            if (ua.includes('chrome') && !ua.includes('mobile')) {
-                capabilityScore += 20;
-                requirements.factors.browser = 'excellent';
-            } else if (ua.includes('firefox') && !ua.includes('mobile')) {
-                capabilityScore += 18;
-                requirements.factors.browser = 'good';
-            } else if (ua.includes('safari') && !ua.includes('mobile')) {
-                capabilityScore += 15;
-                requirements.factors.browser = 'fair';
-            } else {
-                capabilityScore += 5;
-                requirements.factors.browser = 'mobile';
-            }
-        }
-
-        // WebGL (15 points)
-        if (webgl?.webgl2) {
-            capabilityScore += 15;
-            requirements.factors.webgl = 'webgl2';
-        } else if (webgl?.webgl1) {
-            capabilityScore += 10;
-            requirements.factors.webgl = 'webgl1';
-        } else {
-            requirements.factors.webgl = 'none';
-        }
-
-        // Network (10 points)
-        if (connection?.effectiveType === '4g') {
-            capabilityScore += 10;
-            requirements.factors.network = 'fast';
-        } else if (connection?.effectiveType === '3g') {
-            capabilityScore += 5;
-            requirements.factors.network = 'moderate';
-        } else {
-            capabilityScore += 5;
-            requirements.factors.network = 'unknown';
-        }
-
-        // Image size penalty
-        if (imageSize > 10 * 1024 * 1024) {
-            capabilityScore -= 20;
-            requirements.factors.imageSize = 'very_large';
-        } else if (imageSize > 5 * 1024 * 1024) {
-            capabilityScore -= 10;
-            requirements.factors.imageSize = 'large';
-        } else if (imageSize > 2 * 1024 * 1024) {
-            capabilityScore -= 5;
-            requirements.factors.imageSize = 'medium';
-        } else {
-            requirements.factors.imageSize = 'small';
-        }
-
         const useClientSide = capabilityScore >= requirements.minimumScore;
         const result = {
             capabilityScore,
             recommendation: useClientSide ? 'client' : 'server',
             useClientSide,
-            requirements,
-            reasoning: {
-                score: capabilityScore,
-                threshold: requirements.minimumScore,
-                factors: requirements.factors,
-                recommendation: useClientSide
-                    ? 'Device is capable of running AI background removal locally'
-                    : 'Device should use server-side AI processing for better performance'
-            }
+            requirements
         };
 
-        console.log('✅ Device capability assessment result:', {
-            score: capabilityScore,
-            recommendation: result.recommendation,
-            useClientSide,
-            factors: requirements.factors
+        return res.json({
+            success: true,
+            message: 'Device capability assessed',
+            data: result
         });
-
-        return sendSuccess(res, 'Device capability assessed', result);
 
     } catch (error) {
         console.error('💥 Device capability check error:', {
@@ -463,24 +393,23 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             stack: error.stack
         });
 
-        return sendSuccess(res, 'Device capability check failed, defaulting to server-side processing', {
-            capabilityScore: 0,
-            recommendation: 'server',
-            useClientSide: false,
-            error: 'Assessment failed',
-            reasoning: {
-                recommendation: 'Defaulting to server-side processing due to assessment failure'
+        return res.json({
+            success: true,
+            message: 'Device capability check failed, defaulting to server-side processing',
+            data: {
+                capabilityScore: 0,
+                recommendation: 'server',
+                useClientSide: false,
+                error: 'Assessment failed'
             }
         });
     }
 });
 
-/**
- * API information endpoint
- */
-router.get('/info', basicRateLimit, (req, res) => {
+// Info endpoint - SIMPLIFIED
+router.get('/info', (req, res) => {
     const info = {
-        service: 'AI Background Removal API',
+        service: 'AI Background Removal API (Routes Module)',
         version: '1.0.0',
         engine: '@imgly/background-removal-node',
         supportedModels: ['small', 'medium', 'large'],
@@ -499,20 +428,14 @@ router.get('/info', basicRateLimit, (req, res) => {
             supportedImageTypes: ['image/jpeg', 'image/png', 'image/webp'],
             outputQualityRange: '0.1-1.0',
             concurrentProcessing: false
-        },
-        features: {
-            aiBackgroundRemoval: true,
-            multipleModelSizes: true,
-            deviceCapabilityCheck: true,
-            outputFormatControl: true,
-            qualityControl: true,
-            performanceOptimization: true,
-            healthMonitoring: true,
-            memoryManagement: true
         }
     };
 
-    sendSuccess(res, 'AI service information', info);
+    res.json({
+        success: true,
+        message: 'AI service information',
+        data: info
+    });
 });
 
 module.exports = router;

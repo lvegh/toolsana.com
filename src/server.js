@@ -1,15 +1,10 @@
+// src/server-stripped.js - Stripped to standalone level for debugging
 const express = require('express');
 const dotenv = require('dotenv');
-const path = require('path');
+const cors = require('cors');
 
 // Load environment variables
 dotenv.config();
-
-// Import core modules
-const logger = require('./utils/logger');
-const { connectRedis } = require('./config/redis');
-const { sendSuccess, sendError } = require('./middleware/errorHandler');
-const { createUploadsDir } = require('./utils/fileSystem');
 
 // Initialize Express app
 const app = express();
@@ -22,173 +17,169 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 // Trust proxy (important for rate limiting behind reverse proxy)
 app.set('trust proxy', 1);
 
-// Body parsing middleware
+// ===== MINIMAL MIDDLEWARE (SAME AS STANDALONE) =====
+
+// Body parsing middleware - BASIC ONLY
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Compression middleware
-const compression = require('compression');
-app.use(compression());
+// Basic CORS - SIMPLE VERSION
+app.use(cors());
 
-// Static files middleware for uploads
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-
-// Request logging middleware
-app.use((req, res, next) => {
-  logger.info(`${req.method} ${req.originalUrl}`, {
-    ip: req.ip,
-    userAgent: req.get('User-Agent'),
-    timestamp: new Date().toISOString()
+// Basic test route (same as standalone)
+app.get('/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Server is working!',
+    data: {
+      timestamp: new Date().toISOString(),
+      environment: NODE_ENV
+    }
   });
-  next();
 });
 
-// Basic test route
-app.get('/test', (req, res) => {
-  sendSuccess(res, 'Server is working!', {
+// Health check route (same as standalone)
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
-    redis: global.redisClient ? 'connected' : 'not connected',
+    uptime: process.uptime(),
     environment: NODE_ENV
   });
 });
 
-// Health check route
-app.get('/health', (req, res) => {
-  sendSuccess(res, 'Server is healthy', {
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: NODE_ENV,
-    redis: global.redisClient ? 'connected' : 'not connected'
+// ===== STEP 1: ADD AI ROUTES ONLY =====
+// Import ONLY the AI routes first to test if they work
+try {
+  const aiRoutes = require('./routes/ai-standalone'); // We'll create this
+  app.use('/api/ai', aiRoutes);
+  
+  console.log('✅ AI routes loaded successfully');
+} catch (error) {
+  console.error('❌ Error loading AI routes:', error);
+}
+
+// ===== STEP 2: UNCOMMENT TO TEST OTHER ROUTES GRADUALLY =====
+/*
+// Add other routes one by one to find the culprit
+try {
+  // Test compress routes first
+  const compressRoutes = require('./routes/compress');
+  app.use('/api/compress', compressRoutes);
+  console.log('✅ Compress routes loaded');
+} catch (error) {
+  console.error('❌ Error loading compress routes:', error);
+}
+
+try {
+  // Test convert routes
+  const convertRoutes = require('./routes/convert');
+  app.use('/api/convert', convertRoutes);
+  console.log('✅ Convert routes loaded');
+} catch (error) {
+  console.error('❌ Error loading convert routes:', error);
+}
+
+try {
+  // Test hash routes
+  const hashRoutes = require('./routes/hash');
+  app.use('/api/hash', hashRoutes);
+  console.log('✅ Hash routes loaded');
+} catch (error) {
+  console.error('❌ Error loading hash routes:', error);
+}
+
+try {
+  // Test format routes
+  const formatRoutes = require('./routes/format');
+  app.use('/api/format', formatRoutes);
+  console.log('✅ Format routes loaded');
+} catch (error) {
+  console.error('❌ Error loading format routes:', error);
+}
+
+try {
+  // Test contact routes
+  const contactRoutes = require('./routes/contact');
+  app.use('/api/contact', contactRoutes);
+  console.log('✅ Contact routes loaded');
+} catch (error) {
+  console.error('❌ Error loading contact routes:', error);
+}
+
+try {
+  // Test subscribe routes
+  const subscribeRoutes = require('./routes/subscribe');
+  app.use('/api/subscribe', subscribeRoutes);
+  console.log('✅ Subscribe routes loaded');
+} catch (error) {
+  console.error('❌ Error loading subscribe routes:', error);
+}
+
+try {
+  // Test health routes
+  const healthRoutes = require('./routes/health');
+  app.use('/health', healthRoutes);
+  console.log('✅ Health routes loaded');
+} catch (error) {
+  console.error('❌ Error loading health routes:', error);
+}
+*/
+
+// 404 handler - SIMPLE
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Route not found',
+    path: req.originalUrl
   });
 });
 
-// Import and use routes
-try {
-  const healthRoutes = require('./routes/health');
-  const apiRoutes = require('./routes');
-  
-  // Health check routes
-  app.use(healthRoutes);
-  
-  // API routes
-  const API_PREFIX = process.env.API_PREFIX || '/api';
-  app.use(API_PREFIX, apiRoutes);
-  
-  logger.info('Routes loaded successfully');
-} catch (error) {
-  logger.error('Error loading routes:', error);
-}
-
-// 404 handler
-app.use('*', (req, res) => {
-  sendError(res, 'Route not found', 404, { path: req.originalUrl });
-});
-
-// Basic error handler
+// Error handler - SIMPLE
 app.use((err, req, res, next) => {
-  logger.error('Server error:', err);
+  console.error('Server error:', err);
   
   if (res.headersSent) {
     return next(err);
   }
   
-  sendError(res, 'Internal server error', 500);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error'
+  });
 });
 
-// Graceful shutdown handler
-const gracefulShutdown = (server) => (signal) => {
-  logger.info(`Received ${signal}. Starting graceful shutdown...`);
-
-  server.close(() => {
-    logger.info('HTTP server closed.');
-
-    // Close Redis connection if exists
-    if (global.redisClient) {
-      global.redisClient.quit(() => {
-        logger.info('Redis connection closed.');
-        process.exit(0);
-      });
-    } else {
-      process.exit(0);
-    }
-  });
-
-  // Force close after 30 seconds
-  setTimeout(() => {
-    logger.error('Could not close connections in time, forcefully shutting down');
-    process.exit(1);
-  }, 30000);
-};
-
-// Initialize server
+// Initialize server - SIMPLE
 const startServer = async () => {
   try {
-    logger.info('Starting server initialization...');
-
-    // Create uploads directory if it doesn't exist
-    await createUploadsDir();
-    logger.info('Uploads directory ready');
-
-    // Connect to Redis (optional)
-    if (process.env.REDIS_HOST) {
-      try {
-        logger.info('Attempting Redis connection...');
-        await connectRedis();
-        logger.info('Redis connected successfully');
-      } catch (error) {
-        logger.warn('Redis connection failed, continuing without Redis', { error: error.message });
-      }
-    } else {
-      logger.info('Redis not configured, skipping connection');
-    }
+    console.log('Starting STRIPPED server...');
 
     // Start HTTP server
     const server = app.listen(PORT, HOST, () => {
-      logger.info(`🚀 Server running on ${HOST}:${PORT}`, {
-        environment: NODE_ENV,
-        pid: process.pid,
-        timestamp: new Date().toISOString()
-      });
+      console.log(`🚀 STRIPPED Server running on ${HOST}:${PORT}`);
+      console.log(`Environment: ${NODE_ENV}`);
+      console.log(`PID: ${process.pid}`);
+      console.log('Middleware: MINIMAL (standalone level)');
     });
 
     // Set server timeout
     server.timeout = 30000;
 
-    // Handle graceful shutdown
-    process.on('SIGTERM', gracefulShutdown(server));
-    process.on('SIGINT', gracefulShutdown(server));
-
-    // Handle uncaught exceptions
-    process.on('uncaughtException', (error) => {
-      logger.error('Uncaught Exception:', error);
-      gracefulShutdown(server)('UNCAUGHT_EXCEPTION');
-    });
-
-    // Handle unhandled promise rejections
-    process.on('unhandledRejection', (reason, promise) => {
-      logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
-      gracefulShutdown(server)('UNHANDLED_REJECTION');
-    });
-
     return server;
 
   } catch (error) {
-    logger.error('Failed to start server:', error);
+    console.error('Failed to start server:', error);
     process.exit(1);
   }
 };
 
-console.log('=== TOOLZYHUB API SERVER ===');
-console.log('Environment variables:', {
-  NODE_ENV: NODE_ENV,
-  PORT: PORT,
-  HOST: HOST,
-  REDIS_HOST: process.env.REDIS_HOST || 'not configured',
-  REDIS_PORT: process.env.REDIS_PORT || 'not configured',
-  API_PREFIX: process.env.API_PREFIX || '/api'
-});
-console.log('============================');
+console.log('=== TOOLZYHUB STRIPPED SERVER (DEBUG) ===');
+console.log('Purpose: Find what causes ONNX crashes');
+console.log('Level: Standalone equivalent');
+console.log('AI Routes: Enabled');
+console.log('Other Routes: Commented out');
+console.log('Middleware: Minimal only');
+console.log('=======================================');
 
 // Start the server
 startServer();
