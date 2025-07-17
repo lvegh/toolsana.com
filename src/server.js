@@ -20,11 +20,11 @@ const HOST = process.env.HOST || '0.0.0.0';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Trust proxy (important for rate limiting behind reverse proxy)
-app.set('trust proxy', 1);
+/* app.set('trust proxy', 1); */
 
 // Body parsing middleware
-app.use(express.json());
-app.use(express.urlencoded());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Compression middleware
 const compression = require('compression');
