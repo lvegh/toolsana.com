@@ -105,7 +105,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 filename: req.file.originalname
             });
         }
-        
+
         // Create a proper Blob for the IMG.LY library using Node.js Blob polyfill
         // Use the legacy require approach for broader compatibility
         let blob;
@@ -171,7 +171,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             const config = {
                 publicPath: publicPathUri,
                 debug: true,
-                proxyToWorker: true, // Use worker thread to prevent blocking
+                proxyToWorker: false, // Disable worker threads to prevent worker crashes
                 model: model,
                 output: {
                     format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
@@ -193,6 +193,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             const processingPromise = removeBackground(inputForProcessing, config);
             
             const result = await Promise.race([processingPromise, timeoutPromise]);
+            console.log('🎉 Processing completed! Result received');
 
             console.log('📋 AI processing result info:', {
                 type: typeof result,
