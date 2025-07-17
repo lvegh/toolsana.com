@@ -3,6 +3,7 @@ const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const { createUploadsDir } = require('./utils/fileSystem');
+const { connectRedis } = require('./config/redis');
 
 // Load environment variables
 dotenv.config();
@@ -78,73 +79,6 @@ try {
   console.error('❌ Error loading AI routes:', error);
 }
 
-// ===== STEP 2: UNCOMMENT TO TEST OTHER ROUTES GRADUALLY =====
-/*
-// Add other routes one by one to find the culprit
-try {
-  // Test compress routes first
-  const compressRoutes = require('./routes/compress');
-  app.use('/api/compress', compressRoutes);
-  console.log('✅ Compress routes loaded');
-} catch (error) {
-  console.error('❌ Error loading compress routes:', error);
-}
-
-try {
-  // Test convert routes
-  const convertRoutes = require('./routes/convert');
-  app.use('/api/convert', convertRoutes);
-  console.log('✅ Convert routes loaded');
-} catch (error) {
-  console.error('❌ Error loading convert routes:', error);
-}
-
-try {
-  // Test hash routes
-  const hashRoutes = require('./routes/hash');
-  app.use('/api/hash', hashRoutes);
-  console.log('✅ Hash routes loaded');
-} catch (error) {
-  console.error('❌ Error loading hash routes:', error);
-}
-
-try {
-  // Test format routes
-  const formatRoutes = require('./routes/format');
-  app.use('/api/format', formatRoutes);
-  console.log('✅ Format routes loaded');
-} catch (error) {
-  console.error('❌ Error loading format routes:', error);
-}
-
-try {
-  // Test contact routes
-  const contactRoutes = require('./routes/contact');
-  app.use('/api/contact', contactRoutes);
-  console.log('✅ Contact routes loaded');
-} catch (error) {
-  console.error('❌ Error loading contact routes:', error);
-}
-
-try {
-  // Test subscribe routes
-  const subscribeRoutes = require('./routes/subscribe');
-  app.use('/api/subscribe', subscribeRoutes);
-  console.log('✅ Subscribe routes loaded');
-} catch (error) {
-  console.error('❌ Error loading subscribe routes:', error);
-}
-
-try {
-  // Test health routes
-  const healthRoutes = require('./routes/health');
-  app.use('/health', healthRoutes);
-  console.log('✅ Health routes loaded');
-} catch (error) {
-  console.error('❌ Error loading health routes:', error);
-}
-*/
-
 // 404 handler - SIMPLE
 app.use('*', (req, res) => {
   res.status(404).json({
@@ -176,6 +110,19 @@ const startServer = async () => {
     // Create uploads directory if it doesn't exist
     await createUploadsDir();
     console.log('Uploads directory ready');
+
+    // Connect to Redis (optional)
+    if (process.env.REDIS_HOST) {
+      try {
+        console.log('Attempting Redis connection...');
+        await connectRedis();
+        console.log('Redis connected successfully');
+      } catch (error) {
+        console.warn('Redis connection failed, continuing without Redis', { error: error.message });
+      }
+    } else {
+      console.log('Redis not configured, skipping connection');
+    }
 
     // Start HTTP server
     const server = app.listen(PORT, HOST, () => {
