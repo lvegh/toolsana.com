@@ -46,7 +46,7 @@ const uploadImage = multer({
 let isProcessing = false;
 let processingStartTime = null;
 
-router.post('/remove-background', uploadImage.single('file'), async (req, res) => {
+router.post('/remove-background', basicRateLimit, uploadImage.single('file'), async (req, res) => {
     console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
 
     // Prevent concurrent processing
