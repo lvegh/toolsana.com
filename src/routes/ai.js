@@ -241,7 +241,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 model,
                 outputFormat,
                 processingTime: Date.now() - startTime,
-                usingFilePath
+                processingMethod: 'Blob'
             });
 
             // Clean up - no temp files in this approach
