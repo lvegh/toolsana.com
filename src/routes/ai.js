@@ -54,8 +54,8 @@ let processingStartTime = null;
  * POST /api/ai/remove-background
  * Remove background from image using AI
  */
-router.post('/remove-background', uploadImage.single('file'), async (req, res) => {
-      console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
+app.post('/api/ai/remove-background', uploadImage.single('file'), async (req, res) => {
+    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
 
     // Prevent concurrent processing
     if (isProcessing) {
@@ -303,7 +303,6 @@ router.post('/remove-background', uploadImage.single('file'), async (req, res) =
 
         console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (STANDALONE)');
     }
-
 });
 
 // Health check endpoint
