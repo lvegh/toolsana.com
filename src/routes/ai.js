@@ -50,7 +50,7 @@ let isProcessing = false;
 let processingStartTime = null;
 
 
-app.post('/api/ai/remove-background', uploadImage.single('file'), async (req, res) => {
+app.post('/remove-background', uploadImage.single('file'), async (req, res) => {
     console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
 
     // Prevent concurrent processing
