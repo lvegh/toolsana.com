@@ -65,345 +65,94 @@ let processingStartTime = null;
  * Remove background from image using AI
  */
 router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit), uploadImage.single('file'), async (req, res) => {
-    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED');
-    
-    // Prevent concurrent processing
-    if (isProcessing) {
-        console.log('⏸️  Request blocked - another image is being processed');
-        return sendError(res, 'Another image is currently being processed. Please wait and try again.', 429);
-    }
-
-    let uploadedFilePath = null;
-    
-    try {
-        // Check if file was uploaded
-        if (!req.file) {
-            console.log('❌ No file provided in request');
-            return sendError(res, 'No file provided', 400);
+     try {
+        const imagePath = req.file.path; // Replace with actual test image
+        if (!fs.existsSync(imagePath)) {
+            console.error('❌ Test image not found. Please provide a test image at:', imagePath);
+            return sendError(res, 'Test image not found.', 400);
         }
 
-        // Set processing state
-        isProcessing = true;
-        processingStartTime = Date.now();
+        const imageBuffer = fs.readFileSync(imagePath);
 
-        // Extract request parameters
-        const uploadedFilePath = req.file.path; // File is already saved to disk
-        const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-        const model = req.body.model || 'medium';
-        const outputFormat = req.body.outputFormat || 'png';
-        const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
-
-        console.log('📋 Request details:', {
-            originalName: req.file.originalname,
-            uploadedFilePath: uploadedFilePath,
-            originalSize: req.file.size,
-            mimetype: req.file.mimetype,
-            model,
-            outputFormat,
-            outputQuality,
-            timestamp: new Date().toISOString()
-        });
-
-        // Validate parameters
-        const validModels = ['small', 'medium', 'large'];
-        if (!validModels.includes(model)) {
-            console.log('❌ Invalid model specified:', model);
-            return sendError(res, `Invalid model. Must be one of: ${validModels.join(', ')}`, 400);
-        }
-
-        const validFormats = ['png', 'jpg', 'jpeg', 'webp'];
-        if (!validFormats.includes(outputFormat.toLowerCase())) {
-            console.log('❌ Invalid output format specified:', outputFormat);
-            return sendError(res, `Invalid output format. Must be one of: ${validFormats.join(', ')}`, 400);
-        }
-
-        if (outputQuality < 0.1 || outputQuality > 1.0) {
-            console.log('❌ Invalid output quality specified:', outputQuality);
-            return sendError(res, 'Output quality must be between 0.1 and 1.0', 400);
-        }
-
-        // Log memory usage before processing
-        const memBefore = process.memoryUsage();
-        console.log('📊 Memory before processing:', {
-            rss: Math.round(memBefore.rss / 1024 / 1024) + 'MB',
-            heapUsed: Math.round(memBefore.heapUsed / 1024 / 1024) + 'MB',
-            heapTotal: Math.round(memBefore.heapTotal / 1024 / 1024) + 'MB',
-            external: Math.round(memBefore.external / 1024 / 1024) + 'MB'
-        });
-
-        // Use the uploaded file directly (already saved to disk)
-        console.log('✅ Using uploaded file directly:', {
-            path: uploadedFilePath,
-            size: req.file.size,
-            exists: fs.existsSync(uploadedFilePath),
-            mimeType: req.file.mimetype
-        });
-
-        // Configure IMG.LY background removal (minimal config)
-        const config = {
-            debug: false,
-            proxyToWorker: false,
-            model: model,
-            output: {
-                format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
-                quality: outputQuality
+        const getMimeType = (filePath) => {
+            const ext = filePath.toLowerCase().split('.').pop();
+            switch (ext) {
+                case 'jpg':
+                case 'jpeg':
+                    return 'image/jpeg';
+                case 'png':
+                    return 'image/png';
+                case 'webp':
+                    return 'image/webp';
+                default:
+                    return 'image/jpeg';
             }
         };
 
-        console.log('⚙️  IMG.LY Configuration (minimal):', JSON.stringify(config, null, 2));
+        const mimeType = getMimeType(imagePath);
 
-        // Process the image
-        const startTime = Date.now();
-        let processedBuffer;
+        const { Blob } = require('buffer');
+        const blob = new Blob([imageBuffer], { type: mimeType });
 
-        try {
-            console.log('🚀 Starting background removal with uploaded file:', {
-                filePath: uploadedFilePath,
-                fileExists: fs.existsSync(uploadedFilePath)
-            });
-
-            // Add delay for model stabilization and force GC
-            console.log('⏳ Adding 2 second delay for model stabilization...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            // Force garbage collection before processing
-            if (global.gc) {
-                global.gc();
-                console.log('🗑️  Forced garbage collection before processing');
-            }
-
-            // Set up timeout
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error('Processing timeout - operation took longer than 5 minutes'));
-                }, 5 * 60 * 1000);
-            });
-
-            const processingPromise = removeBackground(uploadedFilePath);
-            console.log('🎬 removeBackground function called, waiting for result...');
-
-            const result = await Promise.race([processingPromise, timeoutPromise]);
-            console.log('🎉 Processing completed! Result received');
-
-            // Analyze the result
-            console.log('📋 AI processing result analysis:', {
-                type: typeof result,
-                constructor: result?.constructor?.name,
-                isBlob: result instanceof Blob,
-                blobSize: result instanceof Blob ? result.size : 'N/A',
-                blobType: result instanceof Blob ? result.type : 'N/A',
-                isBuffer: Buffer.isBuffer(result),
-                isArrayBuffer: result instanceof ArrayBuffer,
-                isUint8Array: result instanceof Uint8Array,
-                hasArrayBuffer: typeof result?.arrayBuffer === 'function',
-                length: result?.length || result?.byteLength || 'unknown'
-            });
-
-            // Convert result to buffer
-            console.log('🔄 Converting result to buffer...');
-            if (result instanceof Blob) {
-                console.log('✅ Result is Blob, converting with arrayBuffer()');
-                const arrayBuffer = await result.arrayBuffer();
-                processedBuffer = Buffer.from(arrayBuffer);
-            } else if (Buffer.isBuffer(result)) {
-                console.log('✅ Result is already Buffer');
-                processedBuffer = result;
-            } else if (result instanceof ArrayBuffer) {
-                console.log('✅ Result is ArrayBuffer, converting to Buffer');
-                processedBuffer = Buffer.from(result);
-            } else if (result instanceof Uint8Array) {
-                console.log('✅ Result is Uint8Array, converting to Buffer');
-                processedBuffer = Buffer.from(result);
-            } else if (result && typeof result.arrayBuffer === 'function') {
-                console.log('✅ Result has arrayBuffer method, converting');
-                const arrayBuffer = await result.arrayBuffer();
-                processedBuffer = Buffer.from(arrayBuffer);
-            } else if (result && result.buffer && result.buffer instanceof ArrayBuffer) {
-                console.log('✅ Result has buffer property, converting');
-                processedBuffer = Buffer.from(result.buffer, result.byteOffset, result.byteLength);
-            } else {
-                console.log('❌ Unknown result format, attempting direct conversion');
-                try {
-                    processedBuffer = Buffer.from(result);
-                } catch (conversionError) {
-                    console.error('💥 Failed to convert result to buffer:', {
-                        error: conversionError.message,
-                        resultType: typeof result,
-                        resultConstructor: result?.constructor?.name,
-                        resultKeys: result ? Object.keys(result) : []
-                    });
-                    throw new Error(`Unable to process AI result - unexpected format: ${typeof result}`);
-                }
-            }
-
-            console.log('✅ Buffer conversion successful:', {
-                bufferLength: processedBuffer.length,
-                bufferType: typeof processedBuffer
-            });
-
-        } catch (aiError) {
-            console.error('❌ AI background removal failed:', {
-                error: aiError.message,
-                name: aiError.name,
-                stack: aiError.stack,
-                code: aiError.code,
-                originalName: req.file.originalname,
-                model,
-                outputFormat,
-                processingTime: Date.now() - startTime,
-                processingMethod: 'DiskStorage'
-            });
-
-            // No cleanup needed here - will be handled in finally block
-            console.log('🧹 Processing failed, will clean up in finally block');
-
-            // Return appropriate error based on error type
-            if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
-                return sendError(res, 'Processing timeout. Please try with a smaller image or try again later.', 504);
-            } else if (aiError.message.includes('memory') || aiError.message.includes('allocation')) {
-                return sendError(res, 'Image too large for AI processing. Please try with a smaller image.', 413);
-            } else if (aiError.message.includes('model') || aiError.message.includes('Model')) {
-                return sendError(res, 'AI model could not be loaded. The service may be temporarily unavailable.', 503);
-            } else if (aiError.message.includes('format') || aiError.message.includes('decode')) {
-                return sendError(res, 'Invalid or unsupported image format. Please ensure the image is not corrupted.', 400);
-            } else if (aiError.message.includes('worker') || aiError.message.includes('Worker')) {
-                return sendError(res, 'AI processing worker failed. Please try again.', 500);
-            } else {
-                return sendError(res, 'AI background removal failed. Please try again with a different image.', 500, {
-                    details: process.env.NODE_ENV === 'development' ? aiError.message : undefined
-                });
-            }
-        }
-
-        const processingTime = Date.now() - startTime;
-
-        // Log memory usage after processing
-        const memAfter = process.memoryUsage();
-        console.log('📊 Memory after processing:', {
-            rss: Math.round(memAfter.rss / 1024 / 1024) + 'MB',
-            heapUsed: Math.round(memAfter.heapUsed / 1024 / 1024) + 'MB',
-            heapTotal: Math.round(memAfter.heapTotal / 1024 / 1024) + 'MB',
-            external: Math.round(memAfter.external / 1024 / 1024) + 'MB'
+        console.log('📁 Image loaded:', {
+            size: imageBuffer.length,
+            mimeType: mimeType,
+            blobSize: blob.size
         });
 
-        // Validate processed buffer
-        if (!processedBuffer || processedBuffer.length === 0) {
-            console.error('❌ AI processing resulted in empty buffer');
-            return sendError(res, 'AI processing failed to generate output. The image may be too complex or corrupted.', 500);
-        }
+        console.log('🔧 Testing with minimal config...');
 
-        if (processedBuffer.length < 100) {
-            console.error('❌ AI processing resulted in suspiciously small buffer:', {
-                size: processedBuffer.length
-            });
-            return sendError(res, 'AI processing may have failed. Please try again with a different image.', 500);
-        }
-
-        // Generate response filename and content type
-        let filename, mimeType;
-        switch (outputFormat.toLowerCase()) {
-            case 'jpg':
-            case 'jpeg':
-                filename = `${originalName}_no_bg.jpg`;
-                mimeType = 'image/jpeg';
-                break;
-            case 'webp':
-                filename = `${originalName}_no_bg.webp`;
-                mimeType = 'image/webp';
-                break;
-            default:
-                filename = `${originalName}_no_bg.png`;
-                mimeType = 'image/png';
-        }
-
-        const compressionRatio = ((req.file.size - processedBuffer.length) / req.file.size * 100).toFixed(2);
-
-        console.log('✅ AI background removal SUCCESS:', {
-            originalName: req.file.originalname,
-            originalSize: req.file.size,
-            processedSize: processedBuffer.length,
-            compressionRatio: compressionRatio + '%',
-            processingTime: processingTime + 'ms',
-            model,
-            outputFormat,
-            outputQuality,
-            filename,
-            // Always using file path approach now
-            processingMethod: 'DiskStorage'
+        const result = await removeBackground(blob, {
+            model: 'small',
+            debug: true,
+            output: {
+                format: 'image/png',
+                quality: 1.0
+            }
         });
 
-        // Set response headers
+        console.log('✅ Success! Result:', {
+            type: typeof result,
+            length: result?.length || result?.byteLength,
+            constructor: result?.constructor?.name
+        });
+
+        let outputBuffer;
+        if (Buffer.isBuffer(result)) {
+            outputBuffer = result;
+        } else if (result instanceof Uint8Array) {
+            outputBuffer = Buffer.from(result);
+        } else if (result instanceof ArrayBuffer) {
+            outputBuffer = Buffer.from(result);
+        } else {
+            outputBuffer = Buffer.from(await result.arrayBuffer());
+        }
+
+        const filename = 'test-output.png';
+
+        // === ✅ KEEPING THE ORIGINAL RESPONSE LOGIC HERE ===
         res.set({
-            'Content-Type': mimeType,
+            'Content-Type': 'image/png',
             'Content-Disposition': `attachment; filename="${filename}"`,
-            'Content-Length': processedBuffer.length.toString(),
-            'X-Original-Filename': req.file.originalname,
-            'X-Original-Size': req.file.size.toString(),
-            'X-Processed-Size': processedBuffer.length.toString(),
-            'X-Compression-Ratio': compressionRatio + '%',
-            'X-Processing-Time': processingTime.toString(),
-            'X-AI-Model': model,
-            'X-Output-Format': outputFormat,
-            'X-Output-Quality': outputQuality.toString(),
+            'Content-Length': outputBuffer.length.toString(),
+            'X-Original-Filename': 'test-image.jpg',
+            'X-Original-Size': imageBuffer.length.toString(),
+            'X-Processed-Size': outputBuffer.length.toString(),
+            'X-Compression-Ratio': ((imageBuffer.length - outputBuffer.length) / imageBuffer.length * 100).toFixed(2) + '%',
+            'X-Processing-Time': 'test-mode',
+            'X-AI-Model': 'small',
+            'X-Output-Format': 'png',
+            'X-Output-Quality': '1.0',
             'X-Engine': 'imgly-background-removal-node'
         });
 
-        // Send the processed image
-        res.send(processedBuffer);
+        res.send(outputBuffer);
 
     } catch (error) {
-        console.error('💥 OUTER ERROR in background removal:', {
-            error: error.message,
-            name: error.name,
-            stack: error.stack,
-            originalName: req.file?.originalname,
-            fileSize: req.file?.size,
-            model: req.body?.model,
-            outputFormat: req.body?.outputFormat,
-            outputQuality: req.body?.outputQuality,
-            processingTime: processingStartTime ? Date.now() - processingStartTime : 'unknown'
-        });
-
-        // Handle specific error types
-        if (error.message.includes('File must be an image')) {
-            return sendError(res, 'File must be an image', 400);
-        }
-        if (error.message.includes('File too large')) {
-            return sendError(res, 'File too large for processing', 413);
-        }
-        if (error.message.includes('Another image is currently being processed')) {
-            return sendError(res, 'Server is busy processing another image. Please try again in a moment.', 429);
-        }
-
-        return sendError(res, 'Failed to process image with AI background removal', 500, {
+        console.error('💥 Error during background removal test:', error);
+        return sendError(res, 'Internal Server Error', 500, {
             details: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
-    } finally {
-        // Always clean up state
-        console.log('🧹 Cleaning up processing state...');
-        isProcessing = false;
-        processingStartTime = null;
-        
-        // Clean up uploaded file
-        if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-            try {
-                fs.unlinkSync(uploadedFilePath);
-                console.log('✅ Uploaded file cleaned up successfully:', uploadedFilePath);
-            } catch (cleanupError) {
-                console.error('💥 Failed to clean up uploaded file:', {
-                    error: cleanupError.message,
-                    uploadedFilePath
-                });
-            }
-        }
-
-        // Force garbage collection if available
-        if (global.gc) {
-            global.gc();
-            console.log('🗑️  Forced garbage collection');
-        }
-
-        console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED');
     }
 });
 
