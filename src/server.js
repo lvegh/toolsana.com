@@ -7,7 +7,7 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
-const PORT = 3002; // Different port to avoid conflicts
+const PORT = 3001; // Different port to avoid conflicts
 
 // Middleware
 app.use(express.json());
