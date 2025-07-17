@@ -66,7 +66,6 @@ let processingStartTime = null;
  */
 router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit), uploadImage.single('file'), async (req, res) => {
      try {
-        console.log(req.file.path);
         const imagePath = req.file.path; // Replace with actual test image
         if (!fs.existsSync(imagePath)) {
             console.error('❌ Test image not found. Please provide a test image at:', imagePath);
@@ -90,20 +89,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             }
         };
 
-        const mimeType = getMimeType(imagePath);
-
-        const { Blob } = require('buffer');
-        const blob = new Blob([imageBuffer], { type: mimeType });
-
-        console.log('📁 Image loaded:', {
-            size: imageBuffer.length,
-            mimeType: mimeType,
-            blobSize: blob.size
-        });
-
         console.log('🔧 Testing with minimal config...');
 
-        const result = await removeBackground(blob, {
+        const result = await removeBackground(imagePath, {
             model: 'small',
             debug: true,
             output: {
