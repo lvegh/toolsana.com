@@ -176,7 +176,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         const config = {
             publicPath: publicPathUri,
             debug: true,
-            proxyToWorker: false, // Disable worker threads to prevent crashes
+            proxyToWorker: true, // Disable worker threads to prevent crashes
             model: model,
             output: {
                 format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
