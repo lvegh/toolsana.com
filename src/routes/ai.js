@@ -29,9 +29,21 @@ process.on('unhandledRejection', (reason, promise) => {
     });
 });
 
-// Configure multer for file uploads
+// Configure multer for file uploads with disk storage
 const uploadImage = multer({
-    storage: multer.memoryStorage(),
+    storage: multer.diskStorage({
+        destination: function (req, file, cb) {
+            const uploadDir = path.join(__dirname, '..', '..', 'upload');
+            fs.mkdirSync(uploadDir, { recursive: true });
+            cb(null, uploadDir);
+        },
+        filename: function (req, file, cb) {
+            // Generate unique filename with proper extension
+            const ext = path.extname(file.originalname);
+            const filename = `upload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}${ext}`;
+            cb(null, filename);
+        }
+    }),
     limits: {
         fileSize: 20 * 1024 * 1024, // 20MB limit
     },
@@ -61,7 +73,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         return sendError(res, 'Another image is currently being processed. Please wait and try again.', 429);
     }
 
-    let tempFilePath = null;
+    let uploadedFilePath = null;
     
     try {
         // Check if file was uploaded
@@ -75,7 +87,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         processingStartTime = Date.now();
 
         // Extract request parameters
-        const originalBuffer = req.file.buffer;
+        const uploadedFilePath = req.file.path; // File is already saved to disk
         const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
         const model = req.body.model || 'medium';
         const outputFormat = req.body.outputFormat || 'png';
@@ -83,7 +95,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
         console.log('📋 Request details:', {
             originalName: req.file.originalname,
-            originalSize: originalBuffer.length,
+            uploadedFilePath: uploadedFilePath,
+            originalSize: req.file.size,
             mimetype: req.file.mimetype,
             model,
             outputFormat,
@@ -118,21 +131,18 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             external: Math.round(memBefore.external / 1024 / 1024) + 'MB'
         });
 
-        // Prepare input for IMG.LY library (use the working approach)
-        let inputForProcessing;
-        
-        console.log('🔧 Creating Blob with MIME type (working approach)...');
-        const { Blob } = require('buffer');
-        inputForProcessing = new Blob([originalBuffer], { type: req.file.mimetype });
-        console.log('✅ Successfully created Blob:', {
-            size: inputForProcessing.size,
-            type: inputForProcessing.type
+        // Use the uploaded file directly (already saved to disk)
+        console.log('✅ Using uploaded file directly:', {
+            path: uploadedFilePath,
+            size: req.file.size,
+            exists: fs.existsSync(uploadedFilePath),
+            mimeType: req.file.mimetype
         });
 
-        // Configure IMG.LY background removal (use minimal config like working test)
+        // Configure IMG.LY background removal (minimal config)
         const config = {
-            debug: true,
-            proxyToWorker: true, // Disable worker threads to prevent crashes
+            debug: false,
+            proxyToWorker: false,
             model: model,
             output: {
                 format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
@@ -147,14 +157,20 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         let processedBuffer;
 
         try {
-            console.log('🚀 Starting background removal with Blob input:', {
-                blobSize: inputForProcessing.size,
-                blobType: inputForProcessing.type
+            console.log('🚀 Starting background removal with uploaded file:', {
+                filePath: uploadedFilePath,
+                fileExists: fs.existsSync(uploadedFilePath)
             });
 
-            // Add a small delay to let the model stabilize
-            console.log('⏳ Adding 1 second delay for model stabilization...');
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Add delay for model stabilization and force GC
+            console.log('⏳ Adding 2 second delay for model stabilization...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Force garbage collection before processing
+            if (global.gc) {
+                global.gc();
+                console.log('🗑️  Forced garbage collection before processing');
+            }
 
             console.log('📥 About to call removeBackground with Blob:', {
                 inputType: typeof inputForProcessing,
@@ -244,8 +260,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 processingMethod: 'Blob'
             });
 
-            // Clean up - no temp files in this approach
-            console.log('🧹 No temp files to clean up (using Blob approach)');
+            // No cleanup needed here - will be handled in finally block
+            console.log('🧹 Processing failed, will clean up in finally block');
 
             // Return appropriate error based on error type
             if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
@@ -306,11 +322,11 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 mimeType = 'image/png';
         }
 
-        const compressionRatio = ((originalBuffer.length - processedBuffer.length) / originalBuffer.length * 100).toFixed(2);
+        const compressionRatio = ((req.file.size - processedBuffer.length) / req.file.size * 100).toFixed(2);
 
         console.log('✅ AI background removal SUCCESS:', {
             originalName: req.file.originalname,
-            originalSize: originalBuffer.length,
+            originalSize: req.file.size,
             processedSize: processedBuffer.length,
             compressionRatio: compressionRatio + '%',
             processingTime: processingTime + 'ms',
@@ -318,8 +334,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             outputFormat,
             outputQuality,
             filename,
-            // Always using Blob approach now
-            processingMethod: 'Blob'
+            // Always using file path approach now
+            processingMethod: 'DiskStorage'
         });
 
         // Set response headers
@@ -328,7 +344,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             'Content-Disposition': `attachment; filename="${filename}"`,
             'Content-Length': processedBuffer.length.toString(),
             'X-Original-Filename': req.file.originalname,
-            'X-Original-Size': originalBuffer.length.toString(),
+            'X-Original-Size': req.file.size.toString(),
             'X-Processed-Size': processedBuffer.length.toString(),
             'X-Compression-Ratio': compressionRatio + '%',
             'X-Processing-Time': processingTime.toString(),
@@ -374,8 +390,18 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         isProcessing = false;
         processingStartTime = null;
         
-        // Clean up - no temporary files in Blob approach
-        console.log('🧹 No temporary files to clean up (using Blob approach)');
+        // Clean up uploaded file
+        if (fs.existsSync(uploadedFilePath)) {
+            try {
+                fs.unlinkSync(uploadedFilePath);
+                console.log('✅ Uploaded file cleaned up successfully:', uploadedFilePath);
+            } catch (cleanupError) {
+                console.error('💥 Failed to clean up uploaded file:', {
+                    error: cleanupError.message,
+                    uploadedFilePath
+                });
+            }
+        }
 
         // Force garbage collection if available
         if (global.gc) {
@@ -433,7 +459,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
 
         // Calculate capability score
         let capabilityScore = 0;
-        const requirements = { minimumScore: 100, factors: {} };
+        const requirements = { minimumScore: 95, factors: {} };
 
         // CPU cores (25 points)
         if (hardwareConcurrency >= 8) {
