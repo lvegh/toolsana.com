@@ -179,7 +179,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 }, 5 * 60 * 1000);
             });
 
-            const processingPromise = removeBackground(uploadedFilePath, config);
+            const processingPromise = removeBackground(uploadedFilePath);
             console.log('🎬 removeBackground function called, waiting for result...');
 
             const result = await Promise.race([processingPromise, timeoutPromise]);
