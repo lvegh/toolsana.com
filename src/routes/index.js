@@ -206,7 +206,7 @@ const compressRoutes = require('./compress');
 const convertRoutes = require('./convert');
 const hashRoutes = require('./hash');
 const formatRoutes = require('./format');
-const aiRoutes = require('./ai');
+/* const aiRoutes = require('./ai'); */
 const contactRoutes = require('./contact');
 const subscribeRoutes = require('./subscribe');
 const healthRoutes = require('./health');
@@ -215,7 +215,7 @@ const healthRoutes = require('./health');
 router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);
 router.use('/format', formatRoutes);
-router.use('/ai', aiRoutes);
+/* router.use('/ai', aiRoutes); */
 router.use('/contact', contactRoutes);
 router.use('/hash', hashRoutes);
 router.use('/health', healthRoutes);
