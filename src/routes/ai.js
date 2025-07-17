@@ -105,6 +105,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 filename: req.file.originalname
             });
         }
+
+        // Handle the uploaded file buffer directly
+        // The multer middleware gives us the file buffer, not a Blob
+        const originalBuffer = req.file.buffer;
         
         // Create a proper Blob for the IMG.LY library using Node.js Blob polyfill
         // Use the legacy require approach for broader compatibility
@@ -157,8 +161,19 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
         try {
             // Configure AI background removal options
+            const distPath = path.join(__dirname, '..', '..', 'node_modules', '@imgly', 'background-removal-node', 'dist');
+            const publicPathUri = `file://${distPath}/`;
+            
+            // Debug: Check if the path exists
+            console.log('🔍 Checking paths:', {
+                distPath: distPath,
+                publicPathUri: publicPathUri,
+                pathExists: fs.existsSync(distPath),
+                distContents: fs.existsSync(distPath) ? fs.readdirSync(distPath).slice(0, 5) : 'path not found'
+            });
+            
             const config = {
-                publicPath: path.join(__dirname, '..', '..', 'node_modules', '@imgly', 'background-removal-node', 'dist') + path.sep,
+                publicPath: publicPathUri,
                 debug: true,
                 proxyToWorker: true, // Use worker thread to prevent blocking
                 model: model,
