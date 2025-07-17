@@ -459,7 +459,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
 
         // Calculate capability score
         let capabilityScore = 0;
-        const requirements = { minimumScore: 95, factors: {} };
+        const requirements = { minimumScore: 100, factors: {} };
 
         // CPU cores (25 points)
         if (hardwareConcurrency >= 8) {
