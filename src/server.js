@@ -40,6 +40,10 @@ app.use((req, res, next) => {
   next();
 });
 
+// Static files middleware for uploads
+const path = require('path');
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
 // Basic test route (same as standalone)
 app.get('/test', (req, res) => {
   res.json({
