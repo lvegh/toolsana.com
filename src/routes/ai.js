@@ -172,12 +172,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 console.log('🗑️  Forced garbage collection before processing');
             }
 
-            console.log('📥 About to call removeBackground with Blob:', {
-                inputType: typeof inputForProcessing,
-                isBlob: inputForProcessing instanceof Blob,
-                inputConstructor: inputForProcessing?.constructor?.name
-            });
-
             // Set up timeout
             const timeoutPromise = new Promise((_, reject) => {
                 setTimeout(() => {
@@ -185,7 +179,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 }, 5 * 60 * 1000);
             });
 
-            const processingPromise = removeBackground(inputForProcessing, config);
+            const processingPromise = removeBackground(uploadedFilePath, config);
             console.log('🎬 removeBackground function called, waiting for result...');
 
             const result = await Promise.race([processingPromise, timeoutPromise]);
@@ -257,7 +251,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 model,
                 outputFormat,
                 processingTime: Date.now() - startTime,
-                processingMethod: 'Blob'
+                processingMethod: 'DiskStorage'
             });
 
             // No cleanup needed here - will be handled in finally block
@@ -391,7 +385,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         processingStartTime = null;
         
         // Clean up uploaded file
-        if (fs.existsSync(uploadedFilePath)) {
+        if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
             try {
                 fs.unlinkSync(uploadedFilePath);
                 console.log('✅ Uploaded file cleaned up successfully:', uploadedFilePath);
@@ -459,7 +453,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
 
         // Calculate capability score
         let capabilityScore = 0;
-        const requirements = { minimumScore: 100, factors: {} };
+        const requirements = { minimumScore: 95, factors: {} };
 
         // CPU cores (25 points)
         if (hardwareConcurrency >= 8) {
