@@ -23,6 +23,10 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Compression middleware
+const compression = require('compression');
+app.use(compression());
+
 // Basic CORS - SIMPLE VERSION
 app.use(cors());
 
