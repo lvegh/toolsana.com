@@ -287,10 +287,18 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
         isProcessing = false;
         processingStartTime = null;
 
-        // Force garbage collection if available
+        // Clear any large variables explicitly
+        processedBuffer = null;
+        originalBuffer = null;
+        inputForProcessing = null;
+
+        // Force multiple garbage collection cycles
         if (global.gc) {
-            global.gc();
-            console.log('🗑️  Forced garbage collection');
+            // Force full GC multiple times
+            global.gc(); // Scavenge + Mark-Sweep
+            global.gc(); // Second pass
+            setTimeout(() => global.gc(), 100); // Delayed GC
+            console.log('🗑️  Forced aggressive garbage collection');
         }
 
         console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (STANDALONE)');

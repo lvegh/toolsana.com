@@ -5,6 +5,7 @@ module.exports = {
       script: './src/server.js',
       instances: 'max', // Use all available CPU cores
       exec_mode: 'cluster',
+      node_args: '--expose-gc --max-old-space-size=4096',
       env: {
         NODE_ENV: 'development',
         PORT: 3001
