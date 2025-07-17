@@ -33,7 +33,7 @@ process.on('unhandledRejection', (reason, promise) => {
 const uploadImage = multer({
     storage: multer.diskStorage({
         destination: function (req, file, cb) {
-            const uploadDir = path.join(__dirname, '..', '..', 'upload');
+            const uploadDir = path.join(__dirname, '..', '..', 'uploads');
             fs.mkdirSync(uploadDir, { recursive: true });
             cb(null, uploadDir);
         },
