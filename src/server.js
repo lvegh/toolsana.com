@@ -6,6 +6,7 @@ const { createUploadsDir } = require('./utils/fileSystem');
 const { connectRedis } = require('./config/redis');
 const { basicRateLimit } = require('./middleware/rateLimit');
 const securityMiddleware = require('./middleware/security');
+const { enhancedSecurity } = require('./middleware/enhancedSecurity');
 
 // Load environment variables
 dotenv.config();
@@ -53,6 +54,9 @@ app.use(basicRateLimit);
 
 // Security middleware
 app.use(securityMiddleware);
+
+// Enhanced security (for non-AI routes)
+app.use(enhancedSecurity);
 
 // Basic test route (same as standalone)
 app.get('/test', (req, res) => {
