@@ -2,6 +2,7 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
+const { createUploadsDir } = require('./utils/fileSystem');
 
 // Load environment variables
 dotenv.config();
