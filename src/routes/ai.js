@@ -1,7 +1,4 @@
-console.log('🚀 Starting background removal with input:', {
-                inputType: blob ? 'Blob' : 'FilePath',
-                inputValue: blob ? `Blob(${blob.size} bytes, ${blob.type})` : tempFilePath
-            });const express = require('express');
+const express = require('express');
 const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
 const { basicRateLimit } = require('../middleware/rateLimit');
