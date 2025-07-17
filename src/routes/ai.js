@@ -50,10 +50,6 @@ let isProcessing = false;
 let processingStartTime = null;
 
 
-/**
- * POST /api/ai/remove-background
- * Remove background from image using AI
- */
 app.post('/api/ai/remove-background', uploadImage.single('file'), async (req, res) => {
     console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
 
