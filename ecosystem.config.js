@@ -3,12 +3,8 @@ module.exports = {
     {
       name: 'toolzyhub-api',
       script: './src/server.js',
-      instances: 1, // CHANGED: Single instance for AI processing
-      exec_mode: 'fork', // CHANGED: Use fork mode instead of cluster
-
-      // Node.js flags for better compatibility
-      node_args: '--no-warnings --expose-gc --max-old-space-size=4096 --max-semi-space-size=128',
-
+      instances: 'max', // Use all available CPU cores
+      exec_mode: 'cluster',
       env: {
         NODE_ENV: 'development',
         PORT: 3001
@@ -17,37 +13,41 @@ module.exports = {
         NODE_ENV: 'production',
         PORT: 3001
       },
-
-      // Memory management
-      max_memory_restart: '2G',
-
       // Logging
       log_file: './logs/combined.log',
       out_file: './logs/out.log',
       error_file: './logs/error.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
 
-      // More conservative settings for AI workloads
-      watch: false,
+      // Auto restart settings
+      watch: false, // Set to true in development if needed
       ignore_watch: ['node_modules', 'logs'],
-      min_uptime: '10s',
-      max_restarts: 3, // Fewer restarts
+
+      // Advanced PM2 features
+      min_uptime: '10s', // Increased from 10s
+      max_restarts: 5,   // Reduced from 10
       autorestart: true,
 
       // Environment variables
       env_file: '.env',
 
-      // Longer timeouts for AI processing
-      kill_timeout: 30000,
-      listen_timeout: 10000,
+      // Graceful shutdown
+      kill_timeout: 5000,     // 30 seconds (increased from 5s)
+      listen_timeout: 3000,   // 10 seconds (increased from 3s)
+
+
+      // Health monitoring
       health_check_grace_period: 10000,
 
-      // Merge logs
+      // Merge logs from all instances
       merge_logs: true,
+
+      // Time zone
       time: true
     }
   ],
 
+  // Deployment configuration (optional)
   deploy: {
     production: {
       user: 'root',

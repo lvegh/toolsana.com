@@ -75,7 +75,7 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
         // Extract request parameters
         const originalBuffer = req.file.buffer;
         const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-        const model = req.body.model || 'small';
+        const model = req.body.model || 'medium';
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
 
