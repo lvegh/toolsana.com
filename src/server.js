@@ -67,14 +67,17 @@ app.get('/health', (req, res) => {
 try {
   const healthRoutes = require('./routes/health');
   const apiRoutes = require('./routes');
-  
+
   // Health check routes
   app.use(healthRoutes);
-  
+
   // API routes
   const API_PREFIX = process.env.API_PREFIX || '/api';
+  const aiRoutes = require('./routes/ai');
+  app.use('/api/ai', aiRoutes);  // Direct loading
+
   app.use(API_PREFIX, apiRoutes);
-  
+
   logger.info('Routes loaded successfully');
 } catch (error) {
   logger.error('Error loading routes:', error);
@@ -88,11 +91,11 @@ app.use('*', (req, res) => {
 // Basic error handler
 app.use((err, req, res, next) => {
   logger.error('Server error:', err);
-  
+
   if (res.headersSent) {
     return next(err);
   }
-  
+
   sendError(res, 'Internal server error', 500);
 });
 
