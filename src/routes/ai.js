@@ -105,10 +105,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 filename: req.file.originalname
             });
         }
-
-        // Handle the uploaded file buffer directly
-        // The multer middleware gives us the file buffer, not a Blob
-        const originalBuffer = req.file.buffer;
         
         // Create a proper Blob for the IMG.LY library using Node.js Blob polyfill
         // Use the legacy require approach for broader compatibility
