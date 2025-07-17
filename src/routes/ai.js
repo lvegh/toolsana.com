@@ -43,20 +43,10 @@ const uploadImage = multer({
 });
 
 // Processing state
-let isProcessing = false;
 let processingStartTime = null;
 
 router.post('/remove-background', basicRateLimit, uploadImage.single('file'), async (req, res) => {
-    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (STANDALONE)');
-
-    // Prevent concurrent processing
-    if (isProcessing) {
-        console.log('⏸️  Request blocked - another image is being processed');
-        return res.status(429).json({
-            success: false,
-            message: 'Another image is currently being processed. Please wait and try again.'
-        });
-    }
+    console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (SERVER-SIDE)');
 
     try {
         // Check if file was uploaded
@@ -69,7 +59,6 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
         }
 
         // Set processing state
-        isProcessing = true;
         processingStartTime = Date.now();
 
         // Extract request parameters
@@ -239,7 +228,7 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
         const filename = `${originalName}_no_bg.png`;
         const compressionRatio = ((originalBuffer.length - processedBuffer.length) / originalBuffer.length * 100).toFixed(2);
 
-        console.log('✅ AI background removal SUCCESS (STANDALONE):', {
+        console.log('✅ AI background removal SUCCESS (SERVER-SIDE):', {
             originalName: req.file.originalname,
             originalSize: originalBuffer.length,
             processedSize: processedBuffer.length,
@@ -284,7 +273,6 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
     } finally {
         // Always clean up state
         console.log('🧹 Cleaning up processing state...');
-        isProcessing = false;
         processingStartTime = null;
 
         // Clear any large variables explicitly
@@ -301,7 +289,7 @@ router.post('/remove-background', basicRateLimit, uploadImage.single('file'), as
             console.log('🗑️  Forced aggressive garbage collection');
         }
 
-        console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (STANDALONE)');
+        console.log('🎯 <== BACKGROUND REMOVAL REQUEST COMPLETED (SERVER-SIDE)');
     }
 });
 
@@ -310,7 +298,6 @@ router.get('/health', (req, res) => {
     const memUsage = process.memoryUsage();
     res.json({
         status: 'ok',
-        isProcessing,
         processingTime: processingStartTime ? Date.now() - processingStartTime : null,
         memory: {
             rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
@@ -320,163 +307,6 @@ router.get('/health', (req, res) => {
         },
         uptime: process.uptime()
     });
-});
-
-/**
- * Device capability assessment endpoint
- */
-router.post('/check-device-capability', basicRateLimit, async (req, res) => {
-    try {
-        const {
-            userAgent,
-            hardwareConcurrency,
-            deviceMemory,
-            connection,
-            maxTouchPoints,
-            webgl,
-            canvas,
-            imageSize
-        } = req.body;
-
-        console.log('📋 Device capability check:', {
-            userAgent: userAgent?.substring(0, 100),
-            hardwareConcurrency,
-            deviceMemory,
-            connection: connection?.effectiveType,
-            maxTouchPoints,
-            hasWebGL: !!webgl,
-            hasCanvas: !!canvas,
-            imageSize
-        });
-
-        // Calculate capability score
-        let capabilityScore = 0;
-        const requirements = { minimumScore: 100, factors: {} };
-
-        // CPU cores (25 points)
-        if (hardwareConcurrency >= 8) {
-            capabilityScore += 25;
-            requirements.factors.cpu = 'excellent';
-        } else if (hardwareConcurrency >= 4) {
-            capabilityScore += 20;
-            requirements.factors.cpu = 'good';
-        } else if (hardwareConcurrency >= 2) {
-            capabilityScore += 10;
-            requirements.factors.cpu = 'fair';
-        } else {
-            requirements.factors.cpu = 'poor';
-        }
-
-        // Device memory (30 points)
-        if (deviceMemory >= 8) {
-            capabilityScore += 30;
-            requirements.factors.memory = 'excellent';
-        } else if (deviceMemory >= 4) {
-            capabilityScore += 25;
-            requirements.factors.memory = 'good';
-        } else if (deviceMemory >= 2) {
-            capabilityScore += 15;
-            requirements.factors.memory = 'fair';
-        } else {
-            requirements.factors.memory = 'poor';
-        }
-
-        // Browser (20 points)
-        if (userAgent) {
-            const ua = userAgent.toLowerCase();
-            if (ua.includes('chrome') && !ua.includes('mobile')) {
-                capabilityScore += 20;
-                requirements.factors.browser = 'excellent';
-            } else if (ua.includes('firefox') && !ua.includes('mobile')) {
-                capabilityScore += 18;
-                requirements.factors.browser = 'good';
-            } else if (ua.includes('safari') && !ua.includes('mobile')) {
-                capabilityScore += 15;
-                requirements.factors.browser = 'fair';
-            } else {
-                capabilityScore += 5;
-                requirements.factors.browser = 'mobile';
-            }
-        }
-
-        // WebGL (15 points)
-        if (webgl?.webgl2) {
-            capabilityScore += 15;
-            requirements.factors.webgl = 'webgl2';
-        } else if (webgl?.webgl1) {
-            capabilityScore += 10;
-            requirements.factors.webgl = 'webgl1';
-        } else {
-            requirements.factors.webgl = 'none';
-        }
-
-        // Network (10 points)
-        if (connection?.effectiveType === '4g') {
-            capabilityScore += 10;
-            requirements.factors.network = 'fast';
-        } else if (connection?.effectiveType === '3g') {
-            capabilityScore += 5;
-            requirements.factors.network = 'moderate';
-        } else {
-            capabilityScore += 5;
-            requirements.factors.network = 'unknown';
-        }
-
-        // Image size penalty
-        if (imageSize > 10 * 1024 * 1024) {
-            capabilityScore -= 20;
-            requirements.factors.imageSize = 'very_large';
-        } else if (imageSize > 5 * 1024 * 1024) {
-            capabilityScore -= 10;
-            requirements.factors.imageSize = 'large';
-        } else if (imageSize > 2 * 1024 * 1024) {
-            capabilityScore -= 5;
-            requirements.factors.imageSize = 'medium';
-        } else {
-            requirements.factors.imageSize = 'small';
-        }
-
-        const useClientSide = capabilityScore >= requirements.minimumScore;
-        const result = {
-            capabilityScore,
-            recommendation: useClientSide ? 'client' : 'server',
-            useClientSide,
-            requirements,
-            reasoning: {
-                score: capabilityScore,
-                threshold: requirements.minimumScore,
-                factors: requirements.factors,
-                recommendation: useClientSide
-                    ? 'Device is capable of running AI background removal locally'
-                    : 'Device should use server-side AI processing for better performance'
-            }
-        };
-
-        console.log('✅ Device capability assessment result:', {
-            score: capabilityScore,
-            recommendation: result.recommendation,
-            useClientSide,
-            factors: requirements.factors
-        });
-
-        return sendSuccess(res, 'Device capability assessed', result);
-
-    } catch (error) {
-        console.error('💥 Device capability check error:', {
-            error: error.message,
-            stack: error.stack
-        });
-
-        return sendSuccess(res, 'Device capability check failed, defaulting to server-side processing', {
-            capabilityScore: 0,
-            recommendation: 'server',
-            useClientSide: false,
-            error: 'Assessment failed',
-            reasoning: {
-                recommendation: 'Defaulting to server-side processing due to assessment failure'
-            }
-        });
-    }
 });
 
 /**
@@ -494,7 +324,6 @@ router.get('/info', basicRateLimit, (req, res) => {
         },
         endpoints: {
             remove_background: 'POST /api/ai/remove-background',
-            check_device_capability: 'POST /api/ai/check-device-capability',
             health: 'GET /api/ai/health',
             info: 'GET /api/ai/info'
         },
@@ -507,12 +336,12 @@ router.get('/info', basicRateLimit, (req, res) => {
         features: {
             aiBackgroundRemoval: true,
             multipleModelSizes: true,
-            deviceCapabilityCheck: true,
             outputFormatControl: true,
             qualityControl: true,
             performanceOptimization: true,
             healthMonitoring: true,
-            memoryManagement: true
+            memoryManagement: true,
+            serverSideProcessingOnly: true
         }
     };
 
