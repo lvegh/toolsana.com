@@ -118,65 +118,21 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             external: Math.round(memBefore.external / 1024 / 1024) + 'MB'
         });
 
-        // Prepare input for IMG.LY library
+        // Prepare input for IMG.LY library (use the working approach)
         let inputForProcessing;
-        let usingFilePath = false;
-
-        try {
-            // Try to create a Blob with MIME type (Node.js 18+)
-            console.log('🔧 Attempting to create Blob with MIME type...');
-            const { Blob } = require('buffer');
-            inputForProcessing = new Blob([originalBuffer], { type: req.file.mimetype });
-            console.log('✅ Successfully created Blob:', {
-                size: inputForProcessing.size,
-                type: inputForProcessing.type
-            });
-        } catch (blobError) {
-            // Fallback to file path approach
-            console.log('⚠️  Blob creation failed, falling back to file path:', blobError.message);
-            
-            const tempDir = path.join(__dirname, '..', '..', 'temp');
-            fs.mkdirSync(tempDir, { recursive: true });
-            
-            const getFileExtension = (mimeType) => {
-                switch(mimeType) {
-                    case 'image/jpeg': return '.jpg';
-                    case 'image/png': return '.png';
-                    case 'image/webp': return '.webp';
-                    default: return '.jpg';
-                }
-            };
-            
-            const fileExtension = getFileExtension(req.file.mimetype);
-            tempFilePath = path.join(tempDir, `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}${fileExtension}`);
-            
-            fs.writeFileSync(tempFilePath, originalBuffer);
-            inputForProcessing = tempFilePath;
-            usingFilePath = true;
-            
-            console.log('✅ Created temporary file:', {
-                path: tempFilePath,
-                size: originalBuffer.length,
-                mimeType: req.file.mimetype
-            });
-        }
-
-        // Configure IMG.LY background removal
-        const distPath = path.join(__dirname, '..', '..', 'node_modules', '@imgly', 'background-removal-node', 'dist');
-        const publicPathUri = `file://${distPath}/`;
-
-        // Verify paths exist
-        console.log('🔍 Verifying IMG.LY paths:', {
-            distPath: distPath,
-            publicPathUri: publicPathUri,
-            pathExists: fs.existsSync(distPath),
-            distContents: fs.existsSync(distPath) ? fs.readdirSync(distPath).slice(0, 5) : 'path not found'
+        
+        console.log('🔧 Creating Blob with MIME type (working approach)...');
+        const { Blob } = require('buffer');
+        inputForProcessing = new Blob([originalBuffer], { type: req.file.mimetype });
+        console.log('✅ Successfully created Blob:', {
+            size: inputForProcessing.size,
+            type: inputForProcessing.type
         });
 
+        // Configure IMG.LY background removal (use minimal config like working test)
         const config = {
-            publicPath: publicPathUri,
             debug: true,
-            proxyToWorker: true, // Disable worker threads to prevent crashes
+            proxyToWorker: false, // Disable worker threads to prevent crashes
             model: model,
             output: {
                 format: outputFormat === 'jpg' ? 'image/jpeg' : `image/${outputFormat}`,
@@ -184,23 +140,23 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             }
         };
 
-        console.log('⚙️  IMG.LY Configuration:', JSON.stringify(config, null, 2));
+        console.log('⚙️  IMG.LY Configuration (minimal):', JSON.stringify(config, null, 2));
 
         // Process the image
         const startTime = Date.now();
         let processedBuffer;
 
         try {
-            console.log('🚀 Starting background removal with:', {
-                inputType: usingFilePath ? 'FilePath' : 'Blob',
-                inputValue: usingFilePath ? tempFilePath : `Blob(${inputForProcessing.size} bytes, ${inputForProcessing.type})`
+            console.log('🚀 Starting background removal with Blob input:', {
+                blobSize: inputForProcessing.size,
+                blobType: inputForProcessing.type
             });
 
             // Add a small delay to let the model stabilize
             console.log('⏳ Adding 1 second delay for model stabilization...');
             await new Promise(resolve => setTimeout(resolve, 1000));
 
-            console.log('📥 About to call removeBackground with:', {
+            console.log('📥 About to call removeBackground with Blob:', {
                 inputType: typeof inputForProcessing,
                 isBlob: inputForProcessing instanceof Blob,
                 inputConstructor: inputForProcessing?.constructor?.name
@@ -288,15 +244,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 usingFilePath
             });
 
-            // Clean up temp file on error
-            if (tempFilePath && fs.existsSync(tempFilePath)) {
-                try {
-                    fs.unlinkSync(tempFilePath);
-                    console.log('🧹 Temporary file cleaned up after error');
-                } catch (cleanupError) {
-                    console.error('💥 Failed to clean up temp file:', cleanupError.message);
-                }
-            }
+            // Clean up - no temp files in this approach
+            console.log('🧹 No temp files to clean up (using Blob approach)');
 
             // Return appropriate error based on error type
             if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
@@ -369,7 +318,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             outputFormat,
             outputQuality,
             filename,
-            usingFilePath
+            // Always using Blob approach now
+            processingMethod: 'Blob'
         });
 
         // Set response headers
@@ -424,18 +374,8 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         isProcessing = false;
         processingStartTime = null;
         
-        // Clean up temporary file if created
-        if (tempFilePath && fs.existsSync(tempFilePath)) {
-            try {
-                fs.unlinkSync(tempFilePath);
-                console.log('✅ Temporary file cleaned up:', tempFilePath);
-            } catch (cleanupError) {
-                console.error('💥 Failed to clean up temporary file:', {
-                    error: cleanupError.message,
-                    tempFilePath
-                });
-            }
-        }
+        // Clean up - no temporary files in Blob approach
+        console.log('🧹 No temporary files to clean up (using Blob approach)');
 
         // Force garbage collection if available
         if (global.gc) {
@@ -493,7 +433,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
 
         // Calculate capability score
         let capabilityScore = 0;
-        const requirements = { minimumScore: 100, factors: {} };
+        const requirements = { minimumScore: 95, factors: {} };
 
         // CPU cores (25 points)
         if (hardwareConcurrency >= 8) {
