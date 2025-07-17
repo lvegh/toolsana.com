@@ -3,6 +3,7 @@ const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
+const enhancedSecurityAi = require('../middleware/enhancedSecurityAi');
 
 const router = express.Router();
 
@@ -45,7 +46,7 @@ const uploadImage = multer({
 // Processing state
 let processingStartTime = null;
 
-router.post('/remove-background', basicRateLimit, uploadImage.single('file'), async (req, res) => {
+router.post('/remove-background', enhancedSecurityAi, basicRateLimit, uploadImage.single('file'), async (req, res) => {
     console.log('🎯 ==> BACKGROUND REMOVAL REQUEST STARTED (SERVER-SIDE)');
 
     try {
