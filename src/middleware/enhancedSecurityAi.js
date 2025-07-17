@@ -510,10 +510,10 @@ const enhancedSecurityAi = new EnhancedSecurityAi();
 
 module.exports = {
   enhancedSecurityAi: enhancedSecurityAi.middleware(),
-  enhancedSecurityWithRateLimit: (rateLimitMiddleware) => enhancedSecurityAi.withRateLimit(rateLimitMiddleware),
-  optionalSecurity: enhancedSecurityAi.optional(),
-  getSecurityStats: () => enhancedSecurityAi.getSecurityStats(),
+  enhancedSecurityWithRateLimitAi: (rateLimitMiddleware) => enhancedSecurityAi.withRateLimit(rateLimitMiddleware),
+  optionalSecurityAi: enhancedSecurityAi.optional(),
+  getSecurityStatsAi: () => enhancedSecurityAi.getSecurityStats(),
   // New ONNX-compatible utility
-  getRequestSecurity: (requestId) => enhancedSecurityAi.getRequestSecurity(requestId),
+  getRequestSecurityAi: (requestId) => enhancedSecurityAi.getRequestSecurity(requestId),
   securityInstance: enhancedSecurityAi // Export instance for advanced usage
 };
