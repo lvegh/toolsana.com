@@ -1,11 +1,9 @@
-const express = require('express');
 const dotenv = require('dotenv');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
 const fs = require('fs');
-const path = require('path');
 const cors = require('cors');
 
 // Load environment variables
