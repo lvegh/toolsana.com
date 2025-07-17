@@ -105,15 +105,41 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 filename: req.file.originalname
             });
         }
-
-        // Create a Blob with proper MIME type - this preserves format information
-        const { Blob } = require('buffer'); // Use Node.js built-in Blob polyfill
-        const blob = new Blob([originalBuffer], { type: req.file.mimetype });
         
-        logger.info('Created Blob for processing', { 
+        // Create a proper Blob for the IMG.LY library using Node.js Blob polyfill
+        // Use the legacy require approach for broader compatibility
+        let blob;
+        try {
+            // Try modern approach first (Node.js 18+)
+            const { Blob } = require('buffer');
+            blob = new Blob([originalBuffer], { type: req.file.mimetype });
+        } catch (err) {
+            // Fallback for older Node.js versions - use file path approach
+            const tempDir = path.join(__dirname, '..', '..', 'temp');
+            fs.mkdirSync(tempDir, { recursive: true });
+            
+            const getFileExtension = (mimeType) => {
+                switch(mimeType) {
+                    case 'image/jpeg': return '.jpg';
+                    case 'image/png': return '.png';
+                    case 'image/webp': return '.webp';
+                    default: return '.jpg';
+                }
+            };
+            
+            const fileExtension = getFileExtension(req.file.mimetype);
+            tempFilePath = path.join(tempDir, `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}${fileExtension}`);
+            
+            // Write buffer to temporary file
+            fs.writeFileSync(tempFilePath, originalBuffer);
+            logger.info('Using fallback file-based approach', { tempFilePath, mimeType: req.file.mimetype });
+        }
+        
+        logger.info('Prepared input for processing', { 
             originalBufferLength: originalBuffer.length,
             mimeType: req.file.mimetype,
-            blobSize: blob.size
+            blobSize: blob?.size || 'using file path',
+            usingFilePath: !blob
         });
 
         // Log memory usage before processing
@@ -151,8 +177,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 }, 5 * 60 * 1000); // 5 minutes timeout
             });
 
-            // Race between processing and timeout
-            const processingPromise = removeBackground(blob, config);
+            // Use either blob or file path depending on what's available
+            const inputForProcessing = blob || tempFilePath;
+            const processingPromise = removeBackground(inputForProcessing, config);
             
             const result = await Promise.race([processingPromise, timeoutPromise]);
 
@@ -214,8 +241,15 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 processingTime: Date.now() - startTime
             });
 
-            // Clean up is not needed since we're not using temp files
-            logger.info('Processing failed, no cleanup needed');
+            // Clean up temp file if it was used
+            if (tempFilePath && fs.existsSync(tempFilePath)) {
+                try {
+                    fs.unlinkSync(tempFilePath);
+                    logger.info('Temporary file cleaned up after error');
+                } catch (cleanupError) {
+                    logger.error('Failed to clean up temp file:', cleanupError.message);
+                }
+            }
 
             // Provide helpful error messages based on common issues
             if (aiError.message.includes('timeout') || aiError.message.includes('Timeout')) {
@@ -348,8 +382,18 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         isProcessing = false;
         processingStartTime = null;
         
-        // No temp files to clean up since we use Uint8Array directly
-        logger.info('Processing completed, state reset');
+        // Clean up temporary file if it was created
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+            try {
+                fs.unlinkSync(tempFilePath);
+                logger.info('Temporary file cleaned up successfully', { tempFilePath });
+            } catch (cleanupError) {
+                logger.error('Failed to clean up temporary file:', {
+                    error: cleanupError.message,
+                    tempFilePath
+                });
+            }
+        }
 
         // Force garbage collection if available
         if (global.gc) {
