@@ -56,7 +56,7 @@ app.use(basicRateLimit);
 app.use(securityMiddleware);
 
 // Enhanced security (for non-AI routes)
-app.use(enhancedSecurity);
+//app.use(enhancedSecurity);
 
 // Basic test route (same as standalone)
 app.get('/test', (req, res) => {
