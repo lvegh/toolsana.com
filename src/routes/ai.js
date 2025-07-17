@@ -321,7 +321,7 @@ router.get('/health', (req, res) => {
 /**
  * Device capability assessment endpoint
  */
-router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
+router.post('/check-device-capability', basicRateLimit, async (req, res) => {
     try {
         const {
             userAgent,
