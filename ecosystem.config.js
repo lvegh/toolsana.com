@@ -5,10 +5,10 @@ module.exports = {
       script: './src/server.js',
       instances: 1, // CHANGED: Single instance for AI processing
       exec_mode: 'fork', // CHANGED: Use fork mode instead of cluster
-      
+
       // Node.js flags for better compatibility
-      node_args: '--no-warnings --expose-gc',
-      
+      node_args: '--no-warnings --expose-gc --max-old-space-size=4096 --max-semi-space-size=128',
+
       env: {
         NODE_ENV: 'development',
         PORT: 3001
@@ -17,10 +17,10 @@ module.exports = {
         NODE_ENV: 'production',
         PORT: 3001
       },
-      
+
       // Memory management
       max_memory_restart: '2G',
-      
+
       // Logging
       log_file: './logs/combined.log',
       out_file: './logs/out.log',
