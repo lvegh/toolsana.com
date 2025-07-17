@@ -66,6 +66,7 @@ let processingStartTime = null;
  */
 router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit), uploadImage.single('file'), async (req, res) => {
      try {
+        console.log(req.file.path);
         const imagePath = req.file.path; // Replace with actual test image
         if (!fs.existsSync(imagePath)) {
             console.error('❌ Test image not found. Please provide a test image at:', imagePath);
