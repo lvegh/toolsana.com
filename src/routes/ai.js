@@ -1,4 +1,7 @@
-const express = require('express');
+console.log('🚀 Starting background removal with input:', {
+                inputType: blob ? 'Blob' : 'FilePath',
+                inputValue: blob ? `Blob(${blob.size} bytes, ${blob.type})` : tempFilePath
+            });const express = require('express');
 const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
 const { basicRateLimit } = require('../middleware/rateLimit');
@@ -12,7 +15,7 @@ const router = express.Router();
 
 // Global process error handlers
 process.on('uncaughtException', (error) => {
-    logger.error('🔥 Uncaught Exception in AI module:', {
+    console.error('🔥 Uncaught Exception in AI module:', {
         error: error.message,
         stack: error.stack,
         name: error.name
@@ -21,7 +24,7 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    logger.error('🔥 Unhandled Rejection in AI module:', {
+    console.error('🔥 Unhandled Rejection in AI module:', {
         reason: reason,
         promise: promise
     });
@@ -89,7 +92,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             return sendError(res, 'Output quality must be between 0.1 and 1.0', 400);
         }
 
-        logger.info('Starting AI background removal', {
+        console.log('🎯 Starting AI background removal:', {
             originalName: req.file.originalname,
             originalSize: originalBuffer.length,
             mimetype: req.file.mimetype,
@@ -132,10 +135,10 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             
             // Write buffer to temporary file
             fs.writeFileSync(tempFilePath, originalBuffer);
-            logger.info('Using fallback file-based approach', { tempFilePath, mimeType: req.file.mimetype });
+            console.log('📁 Using fallback file-based approach:', { tempFilePath, mimeType: req.file.mimetype });
         }
         
-        logger.info('Prepared input for processing', { 
+        console.log('🔧 Prepared input for processing:', { 
             originalBufferLength: originalBuffer.length,
             mimeType: req.file.mimetype,
             blobSize: blob?.size || 'using file path',
@@ -144,7 +147,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
         // Log memory usage before processing
         const memBefore = process.memoryUsage();
-        logger.info('Memory before processing:', {
+        console.log('📊 Memory before processing:', {
             rss: Math.round(memBefore.rss / 1024 / 1024) + 'MB',
             heapUsed: Math.round(memBefore.heapUsed / 1024 / 1024) + 'MB',
             heapTotal: Math.round(memBefore.heapTotal / 1024 / 1024) + 'MB',
@@ -168,7 +171,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
                 }
             };
 
-            logger.info('Processing with config:', config);
+            console.log('⚙️  Processing with config:', JSON.stringify(config, null, 2));
 
             // Set up timeout to prevent hanging
             const timeoutPromise = new Promise((_, reject) => {
@@ -183,7 +186,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             
             const result = await Promise.race([processingPromise, timeoutPromise]);
 
-            logger.info('AI processing result info:', {
+            console.log('📋 AI processing result info:', {
                 type: typeof result,
                 constructor: result?.constructor?.name,
                 isBlob: result instanceof Blob,
@@ -230,7 +233,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             }
 
         } catch (aiError) {
-            logger.error('AI background removal failed', {
+            console.error('❌ AI background removal failed:', {
                 error: aiError.message,
                 stack: aiError.stack,
                 originalName: req.file.originalname,
@@ -245,9 +248,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
             if (tempFilePath && fs.existsSync(tempFilePath)) {
                 try {
                     fs.unlinkSync(tempFilePath);
-                    logger.info('Temporary file cleaned up after error');
+                    console.log('🧹 Temporary file cleaned up after error');
                 } catch (cleanupError) {
-                    logger.error('Failed to clean up temp file:', cleanupError.message);
+                    console.error('💥 Failed to clean up temp file:', cleanupError.message);
                 }
             }
 
@@ -275,22 +278,21 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
         // Log memory usage after processing
         const memAfter = process.memoryUsage();
-        logger.info('Memory after processing:', {
+        console.log('📊 Memory after processing:', {
             rss: Math.round(memAfter.rss / 1024 / 1024) + 'MB',
             heapUsed: Math.round(memAfter.heapUsed / 1024 / 1024) + 'MB',
             heapTotal: Math.round(memAfter.heapTotal / 1024 / 1024) + 'MB',
             external: Math.round(memAfter.external / 1024 / 1024) + 'MB'
         });
 
-        // Verify the processed buffer is valid
         if (!processedBuffer || processedBuffer.length === 0) {
-            logger.error('AI processing resulted in empty buffer');
+            console.error('❌ AI processing resulted in empty buffer');
             return sendError(res, 'AI processing failed to generate output. The image may be too complex or corrupted.', 500);
         }
 
         // Basic validation of the processed buffer
         if (processedBuffer.length < 100) {
-            logger.error('AI processing resulted in suspiciously small buffer', {
+            console.error('❌ AI processing resulted in suspiciously small buffer:', {
                 size: processedBuffer.length
             });
             return sendError(res, 'AI processing may have failed. Please try again with a different image.', 500);
@@ -315,7 +317,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
 
         const compressionRatio = ((originalBuffer.length - processedBuffer.length) / originalBuffer.length * 100).toFixed(2);
 
-        logger.info('AI background removal completed', {
+        console.log('✅ AI background removal completed:', {
             originalName: req.file.originalname,
             originalSize: originalBuffer.length,
             processedSize: processedBuffer.length,
@@ -347,7 +349,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         res.send(processedBuffer);
 
     } catch (error) {
-        logger.error('AI background removal error:', {
+        console.error('💥 AI background removal error:', {
             error: error.message,
             stack: error.stack,
             originalName: req.file?.originalname,
@@ -386,9 +388,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         if (tempFilePath && fs.existsSync(tempFilePath)) {
             try {
                 fs.unlinkSync(tempFilePath);
-                logger.info('Temporary file cleaned up successfully', { tempFilePath });
+                console.log('🧹 Temporary file cleaned up successfully:', { tempFilePath });
             } catch (cleanupError) {
-                logger.error('Failed to clean up temporary file:', {
+                console.error('💥 Failed to clean up temporary file:', {
                     error: cleanupError.message,
                     tempFilePath
                 });
@@ -398,7 +400,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimit(basicRateLimit),
         // Force garbage collection if available
         if (global.gc) {
             global.gc();
-            logger.info('Forced garbage collection');
+            console.log('🗑️  Forced garbage collection');
         }
     }
 });
@@ -437,7 +439,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             imageSize
         } = req.body;
 
-        logger.info('Device capability check requested', {
+        console.log('📋 Device capability check requested:', {
             userAgent: userAgent?.substring(0, 100),
             hardwareConcurrency,
             deviceMemory,
@@ -588,7 +590,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
             }
         };
 
-        logger.info('Device capability assessment completed', {
+        console.log('✅ Device capability assessment completed:', {
             score: capabilityScore,
             recommendation,
             useClientSide,
@@ -598,7 +600,7 @@ router.post('/check-device-capability', enhancedSecurityWithRateLimit(basicRateL
         return sendSuccess(res, 'Device capability assessed', result);
 
     } catch (error) {
-        logger.error('Device capability check error:', {
+        console.error('💥 Device capability check error:', {
             error: error.message,
             stack: error.stack,
             requestBody: req.body
