@@ -26,6 +26,16 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Basic CORS - SIMPLE VERSION
 app.use(cors());
 
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.originalUrl}`, {
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+    timestamp: new Date().toISOString()
+  });
+  next();
+});
+
 // Basic test route (same as standalone)
 app.get('/test', (req, res) => {
   res.json({
