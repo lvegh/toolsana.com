@@ -4,6 +4,8 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const { createUploadsDir } = require('./utils/fileSystem');
 const { connectRedis } = require('./config/redis');
+const { basicRateLimit } = require('./middleware/rateLimit');
+const securityMiddleware = require('./middleware/security');
 
 // Load environment variables
 dotenv.config();
@@ -45,6 +47,12 @@ app.use((req, res, next) => {
 // Static files middleware for uploads
 const path = require('path');
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
+// Rate limiting
+app.use(basicRateLimit);
+
+// Security middleware
+app.use(securityMiddleware);
 
 // Basic test route (same as standalone)
 app.get('/test', (req, res) => {
