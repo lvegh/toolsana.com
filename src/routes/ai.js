@@ -318,7 +318,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
 
         // Step 3: Configure IMG.LY background removal
         const config = {
-            debug: false, // Disable debug for better performance
+            debug: true, // Disable debug for better performance
             proxyToWorker: false, // Disable worker threads
             model: model,
             output: {
