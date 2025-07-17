@@ -313,16 +313,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
         try {
             console.log(`🤖 Starting AI background removal with ${model} model...`);
             
-            // Set up timeout (adjust based on model size)
-            const timeoutDuration = model === 'large' ? 10 * 60 * 1000 : 
-                                  model === 'medium' ? 5 * 60 * 1000 : 
-                                  3 * 60 * 1000; // 3 min for small, 5 min for medium, 10 min for large
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error(`Processing timeout - ${model} model took longer than ${timeoutDuration / 60000} minutes`));
-                }, timeoutDuration);
-            });
-
             const processingPromise = removeBackground(inputForProcessing, config);
             const result = await Promise.race([processingPromise, timeoutPromise]);
 
