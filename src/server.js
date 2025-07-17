@@ -79,6 +79,15 @@ try {
   console.error('❌ Error loading AI routes:', error);
 }
 
+try {
+  // Test hash routes first (they don't use complex middleware)
+  const hashRoutes = require('./routes/hash');
+  app.use('/api/hash', hashRoutes);
+  console.log('✅ Hash routes loaded');
+} catch (error) {
+  console.error('❌ Error loading hash routes:', error);
+}
+
 // 404 handler - SIMPLE
 app.use('*', (req, res) => {
   res.status(404).json({
