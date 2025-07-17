@@ -3,9 +3,6 @@ const multer = require('multer');
 const { removeBackground } = require('@imgly/background-removal-node');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
-const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
-const fs = require('fs');
-const path = require('path');
 
 const router = express.Router();
 
