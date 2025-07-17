@@ -313,8 +313,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
         try {
             console.log(`🤖 Starting AI background removal with ${model} model...`);
             
-            const processingPromise = removeBackground(inputForProcessing, config);
-            const result = await Promise.race([processingPromise, timeoutPromise]);
+            const result = removeBackground(inputForProcessing, config);
 
             // Convert result to buffer
             if (result instanceof Blob) {
