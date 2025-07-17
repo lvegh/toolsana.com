@@ -250,7 +250,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
         // Extract request parameters
         originalBuffer = req.file.buffer;
         const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-        const model = req.body.model || 'medium';
+        let model = req.body.model || 'medium'; // Changed to let instead of const
         const outputFormat = req.body.outputFormat || 'png';
         const outputQuality = parseFloat(req.body.outputQuality) || 1.0;
         const skipOptimization = req.body.skipOptimization === 'true';
