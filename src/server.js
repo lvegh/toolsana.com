@@ -23,37 +23,37 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 app.set('trust proxy', 1);
 
 // Body parsing middleware
-/* app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' })); */
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Compression middleware
-/* const compression = require('compression');
-app.use(compression()); */
+const compression = require('compression');
+app.use(compression());
 
 // Static files middleware for uploads
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // Request logging middleware
-/* app.use((req, res, next) => {
+app.use((req, res, next) => {
   logger.info(`${req.method} ${req.originalUrl}`, {
     ip: req.ip,
     userAgent: req.get('User-Agent'),
     timestamp: new Date().toISOString()
   });
   next();
-}); */
+});
 
 // Basic test route
-/* app.get('/test', (req, res) => {
+app.get('/test', (req, res) => {
   sendSuccess(res, 'Server is working!', {
     timestamp: new Date().toISOString(),
     redis: global.redisClient ? 'connected' : 'not connected',
     environment: NODE_ENV
   });
-}); */
+});
 
 // Health check route
-/* app.get('/health', (req, res) => {
+app.get('/health', (req, res) => {
   sendSuccess(res, 'Server is healthy', {
     status: 'OK',
     timestamp: new Date().toISOString(),
@@ -61,7 +61,7 @@ app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
     environment: NODE_ENV,
     redis: global.redisClient ? 'connected' : 'not connected'
   });
-}); */
+});
 
 // Import and use routes
 try {
@@ -69,7 +69,7 @@ try {
   const apiRoutes = require('./routes');
   
   // Health check routes
-/*   app.use(healthRoutes); */
+  app.use(healthRoutes);
   
   // API routes
   const API_PREFIX = process.env.API_PREFIX || '/api';
@@ -131,7 +131,7 @@ const startServer = async () => {
     logger.info('Uploads directory ready');
 
     // Connect to Redis (optional)
-/*     if (process.env.REDIS_HOST) {
+    if (process.env.REDIS_HOST) {
       try {
         logger.info('Attempting Redis connection...');
         await connectRedis();
@@ -141,7 +141,7 @@ const startServer = async () => {
       }
     } else {
       logger.info('Redis not configured, skipping connection');
-    } */
+    }
 
     // Start HTTP server
     const server = app.listen(PORT, HOST, () => {
