@@ -24,7 +24,7 @@ const isValidDomain = (hostname) => {
 };
 
 // Analyze CORS headers for security and compliance
-const analyzeCorsHeaders = (headers, targetOrigin) => {
+const analyzeCorsHeaders = (headers, originUrl, targetUrl) => {
   const corsHeaders = {
     'access-control-allow-origin': headers['access-control-allow-origin'],
     'access-control-allow-methods': headers['access-control-allow-methods'],
@@ -37,11 +37,13 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
   const issues = [];
   const recommendations = [];
   let score = 100;
+  let crossOriginAllowed = false;
 
   // Check if CORS is enabled
   if (!corsHeaders['access-control-allow-origin']) {
     return {
       corsEnabled: false,
+      crossOriginAllowed: false,
       headers: [
         { name: 'Access-Control-Allow-Origin', value: '', required: true, status: 'missing' },
         { name: 'Access-Control-Allow-Methods', value: '', required: false, status: 'missing' },
@@ -50,7 +52,7 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
         { name: 'Access-Control-Max-Age', value: '', required: false, status: 'missing' },
         { name: 'Access-Control-Expose-Headers', value: '', required: false, status: 'missing' }
       ],
-      issues: ['No CORS headers found - Cross-origin requests will be blocked'],
+      issues: [`Cross-origin request from ${originUrl} to ${targetUrl} would be BLOCKED - No CORS headers found`],
       recommendations: ['Add Access-Control-Allow-Origin header to enable CORS'],
       score: 0
     };
@@ -96,11 +98,13 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
     }
   ];
 
-  // Analyze Access-Control-Allow-Origin
+  // Analyze Access-Control-Allow-Origin against the specific origin
   const allowOrigin = corsHeaders['access-control-allow-origin'];
   const allowCredentials = corsHeaders['access-control-allow-credentials'];
 
+  // Check if the specific origin would be allowed
   if (allowOrigin === '*') {
+    crossOriginAllowed = true;
     if (allowCredentials === 'true') {
       issues.push('Security Risk: Cannot use wildcard (*) for Access-Control-Allow-Origin when credentials are allowed');
       recommendations.push('Specify exact origins instead of using wildcard when allowing credentials');
@@ -112,8 +116,22 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
       score -= 15;
     }
   } else if (allowOrigin && allowOrigin !== 'null') {
-    // Check if origin is properly formatted
+    // Check if the specific origin matches
     try {
+      const originUrlObj = new URL(originUrl);
+      const originFormatted = `${originUrlObj.protocol}//${originUrlObj.host}`;
+      
+      if (allowOrigin === originFormatted) {
+        crossOriginAllowed = true;
+        issues.push(`✅ Cross-origin request ALLOWED: Origin ${originUrl} matches allowed origin`);
+      } else {
+        crossOriginAllowed = false;
+        issues.push(`❌ Cross-origin request BLOCKED: Origin ${originUrl} does not match allowed origin ${allowOrigin}`);
+        recommendations.push(`Add ${originFormatted} to Access-Control-Allow-Origin or use a wildcard (*) if appropriate`);
+        score -= 25;
+      }
+      
+      // Validate the allowed origin format
       new URL(allowOrigin);
     } catch {
       issues.push('Invalid Access-Control-Allow-Origin format');
@@ -121,6 +139,10 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
       headerAnalysis[0].status = 'invalid';
       score -= 20;
     }
+  } else {
+    crossOriginAllowed = false;
+    issues.push(`❌ Cross-origin request BLOCKED: No valid origin specified`);
+    score -= 30;
   }
 
   // Analyze Access-Control-Allow-Methods
@@ -182,6 +204,7 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
 
   return {
     corsEnabled: true,
+    crossOriginAllowed,
     headers: headerAnalysis,
     issues,
     recommendations,
@@ -190,10 +213,10 @@ const analyzeCorsHeaders = (headers, targetOrigin) => {
 };
 
 // Make CORS preflight request to check headers
-const checkCorsHeaders = (url) => {
+const checkCorsHeaders = (targetUrl, originUrl) => {
   return new Promise((resolve, reject) => {
     try {
-      const urlObj = new URL(url);
+      const urlObj = new URL(targetUrl);
       
       // Validate domain
       if (!isValidDomain(urlObj.hostname)) {
@@ -207,7 +230,7 @@ const checkCorsHeaders = (url) => {
         path: urlObj.pathname + urlObj.search,
         method: 'OPTIONS',
         headers: {
-          'Origin': 'https://toolzyhub.app',
+          'Origin': originUrl,
           'Access-Control-Request-Method': 'POST',
           'Access-Control-Request-Headers': 'Content-Type, Authorization',
           'User-Agent': 'ToolzyHub-CorsChecker/1.0 (+https://toolzyhub.app)',
@@ -258,37 +281,50 @@ const checkCorsHeaders = (url) => {
 // POST /api/cors/check
 router.post('/check', basicRateLimit, async (req, res) => {
   try {
-    const { url } = req.body;
+    const { originUrl, targetUrl } = req.body;
     
-    if (!url) {
+    if (!originUrl || !targetUrl) {
       return res.status(400).json({
         success: false,
-        message: 'URL is required'
+        message: 'Both originUrl and targetUrl are required'
       });
     }
     
-    // Validate URL format
-    let validatedUrl;
+    // Validate URL formats
+    let validatedOriginUrl, validatedTargetUrl;
     try {
-      validatedUrl = new URL(url);
-      if (!['http:', 'https:'].includes(validatedUrl.protocol)) {
-        throw new Error('Invalid protocol');
+      validatedOriginUrl = new URL(originUrl);
+      if (!['http:', 'https:'].includes(validatedOriginUrl.protocol)) {
+        throw new Error('Invalid origin URL protocol');
       }
     } catch (error) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid URL format'
+        message: 'Invalid origin URL format'
+      });
+    }
+    
+    try {
+      validatedTargetUrl = new URL(targetUrl);
+      if (!['http:', 'https:'].includes(validatedTargetUrl.protocol)) {
+        throw new Error('Invalid target URL protocol');
+      }
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid target URL format'
       });
     }
     
     // Make CORS preflight request
-    const corsResponse = await checkCorsHeaders(validatedUrl.toString());
+    const corsResponse = await checkCorsHeaders(validatedTargetUrl.toString(), validatedOriginUrl.toString());
     
     // Analyze CORS headers
-    const analysis = analyzeCorsHeaders(corsResponse.headers, 'https://toolzyhub.app');
+    const analysis = analyzeCorsHeaders(corsResponse.headers, validatedOriginUrl.toString(), validatedTargetUrl.toString());
     
     const result = {
-      url: validatedUrl.toString(),
+      originUrl: validatedOriginUrl.toString(),
+      targetUrl: validatedTargetUrl.toString(),
       statusCode: corsResponse.statusCode,
       ...analysis,
       timestamp: new Date().toISOString()
