@@ -24,6 +24,7 @@ router.get('/', basicRateLimit, (req, res) => {
       format: '/api/format',
       hash: '/api/hash',
       ai: '/api/ai',
+      ssl: '/api/ssl',
       contact: '/api/contact',
       subscribe: '/api/subscribe'
       // Add more endpoints as they are created
@@ -210,6 +211,7 @@ const formatRoutes = require('./format');
 const contactRoutes = require('./contact');
 const subscribeRoutes = require('./subscribe');
 const healthRoutes = require('./health');
+const sslRoutes = require('./ssl');
 
 // Register routes
 router.use('/ai', aiRoutes);
@@ -219,6 +221,7 @@ router.use('/format', formatRoutes);
 router.use('/contact', contactRoutes);
 router.use('/hash', hashRoutes);
 router.use('/health', healthRoutes);
+router.use('/ssl', sslRoutes);
 router.use('/subscribe', subscribeRoutes);
 
 // Example for future routes:
