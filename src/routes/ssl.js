@@ -2,7 +2,6 @@ const express = require('express');
 const tls = require('tls');
 const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
-const { auth } = require('../middleware/auth');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 
 const router = express.Router();
