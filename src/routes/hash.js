@@ -656,10 +656,8 @@ router.post('/blakegenerate', async (req, res) => {
     const normalizedKey = key && key.trim().length > 0 ? key.trim() : null;
     const selectedAlgorithm = algorithm.toLowerCase();
     const defaultLengths = { blake2b: 64, blake2s: 32, blake3: 32 };
-    const maxLengths = defaultLengths;
-    const hashLength = selectedAlgorithm === 'blake3'
-      ? 32
-      : parseInt(keyLength) || defaultLengths[selectedAlgorithm];
+    const maxLengths = { blake2b: 64, blake2s: 32, blake3: 1024 };
+    const hashLength = parseInt(keyLength) || defaultLengths[selectedAlgorithm];
 
     if (!['blake2b', 'blake2s', 'blake3'].includes(selectedAlgorithm)) {
       return sendError(res, 'Unsupported algorithm');
@@ -687,7 +685,8 @@ router.post('/blakegenerate', async (req, res) => {
     } else if (selectedAlgorithm === 'blake2s') {
       digest = Buffer.from(blake2s(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
     } else {
-      digest = Buffer.from(blake3(inputBuffer, keyBuffer ? { key: keyBuffer } : undefined)).toString('hex').substring(0, hashLength * 2);
+      const blake3Options = keyBuffer ? { key: keyBuffer, dkLen: hashLength } : { dkLen: hashLength };
+      digest = Buffer.from(blake3(inputBuffer, blake3Options)).toString('hex');
     }
 
     return sendSuccess(res, 'Hash generated', {
@@ -715,10 +714,8 @@ router.post('/blakeverify', async (req, res) => {
     const normalizedKey = key && key.trim().length > 0 ? key.trim() : null;
     const selectedAlgorithm = algorithm.toLowerCase();
     const defaultLengths = { blake2b: 64, blake2s: 32, blake3: 32 };
-    const maxLengths = defaultLengths;
-    const hashLength = selectedAlgorithm === 'blake3'
-      ? 32
-      : parseInt(keyLength) || (hash.length / 2);
+    const maxLengths = { blake2b: 64, blake2s: 32, blake3: 1024 };
+    const hashLength = parseInt(keyLength) || (hash.length / 2);
 
     if (!['blake2b', 'blake2s', 'blake3'].includes(selectedAlgorithm)) {
       return sendError(res, 'Unsupported algorithm');
@@ -750,7 +747,8 @@ router.post('/blakeverify', async (req, res) => {
     } else if (selectedAlgorithm === 'blake2s') {
       computedDigest = Buffer.from(blake2s(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
     } else {
-      computedDigest = Buffer.from(blake3(inputBuffer, keyBuffer ? { key: keyBuffer } : undefined)).toString('hex').substring(0, hashLength * 2);
+      const blake3Options = keyBuffer ? { key: keyBuffer, dkLen: hashLength } : { dkLen: hashLength };
+      computedDigest = Buffer.from(blake3(inputBuffer, blake3Options)).toString('hex');
     }
 
     const expectedBuffer = Buffer.from(hash.toLowerCase(), 'hex');
@@ -828,9 +826,9 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
           description: 'Up to 32 bytes (64 hex chars)'
         },
         blake3: {
-          maxLength: 32,
+          maxLength: 1024,
           defaultLength: 32,
-          description: 'Up to 32 bytes (64 hex chars)'
+          description: 'Up to 1024 bytes (2048 hex chars)'
         }
       },
       input: {
