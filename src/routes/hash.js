@@ -671,13 +671,24 @@ router.post('/blakegenerate', async (req, res) => {
       return sendError(res, `Key cannot exceed ${maxLengths[selectedAlgorithm]} bytes`);
     }
 
-    if (selectedAlgorithm === 'blake3' && normalizedKey) {
-      const keyLengthBytes = Buffer.byteLength(normalizedKey, 'utf8');
-      if (keyLengthBytes !== 32) return sendError(res, 'BLAKE3 secret key must be exactly 32 bytes');
-    }
+    // BLAKE3 key validation is handled during key processing
 
     const inputBuffer = Buffer.from(input, 'utf8');
-    const keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
+    let keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
+    
+    // For BLAKE3, ensure key is exactly 32 bytes by padding or hashing
+    if (selectedAlgorithm === 'blake3' && keyBuffer) {
+      if (keyBuffer.length < 32) {
+        // Pad shorter keys to 32 bytes with zeros
+        const paddedKey = Buffer.alloc(32);
+        keyBuffer.copy(paddedKey);
+        keyBuffer = paddedKey;
+      } else if (keyBuffer.length > 32) {
+        // Hash longer keys to get exactly 32 bytes
+        const crypto = require('crypto');
+        keyBuffer = crypto.createHash('sha256').update(keyBuffer).digest();
+      }
+    }
     let digest;
 
     if (selectedAlgorithm === 'blake2b') {
@@ -733,13 +744,24 @@ router.post('/blakeverify', async (req, res) => {
       return sendError(res, `Key cannot exceed ${maxLengths[selectedAlgorithm]} bytes`);
     }
 
-    if (selectedAlgorithm === 'blake3' && normalizedKey) {
-      const keyLengthBytes = Buffer.byteLength(normalizedKey, 'utf8');
-      if (keyLengthBytes !== 32) return sendError(res, 'BLAKE3 secret key must be exactly 32 bytes');
-    }
+    // BLAKE3 key validation is handled during key processing
 
     const inputBuffer = Buffer.from(input, 'utf8');
-    const keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
+    let keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
+    
+    // For BLAKE3, ensure key is exactly 32 bytes by padding or hashing
+    if (selectedAlgorithm === 'blake3' && keyBuffer) {
+      if (keyBuffer.length < 32) {
+        // Pad shorter keys to 32 bytes with zeros
+        const paddedKey = Buffer.alloc(32);
+        keyBuffer.copy(paddedKey);
+        keyBuffer = paddedKey;
+      } else if (keyBuffer.length > 32) {
+        // Hash longer keys to get exactly 32 bytes
+        const crypto = require('crypto');
+        keyBuffer = crypto.createHash('sha256').update(keyBuffer).digest();
+      }
+    }
     let computedDigest;
 
     if (selectedAlgorithm === 'blake2b') {
