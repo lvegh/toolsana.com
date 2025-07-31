@@ -650,10 +650,9 @@ router.post('/scryptverify', enhancedSecurityWithRateLimit(basicRateLimit), asyn
  */
 router.post('/blakegenerate', async (req, res) => {
   try {
-    const { input, algorithm = 'blake2b', keyLength, key } = req.body;
+    const { input, algorithm = 'blake2b', keyLength } = req.body;
     if (!input || typeof input !== 'string') return sendError(res, 'Input is required');
 
-    const normalizedKey = key && key.trim().length > 0 ? key.trim() : null;
     const selectedAlgorithm = algorithm.toLowerCase();
     const defaultLengths = { blake2b: 64, blake2s: 32, blake3: 32 };
     const maxLengths = { blake2b: 64, blake2s: 32, blake3: 1024 };
@@ -667,44 +666,21 @@ router.post('/blakegenerate', async (req, res) => {
       return sendError(res, `Hash length must be between 1 and ${maxLengths[selectedAlgorithm]} bytes`);
     }
 
-    if (normalizedKey && Buffer.byteLength(normalizedKey, 'utf8') > maxLengths[selectedAlgorithm]) {
-      return sendError(res, `Key cannot exceed ${maxLengths[selectedAlgorithm]} bytes`);
-    }
-
-    // BLAKE3 key validation is handled during key processing
-
     const inputBuffer = Buffer.from(input, 'utf8');
-    let keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
-    
-    // For BLAKE3, ensure key is exactly 32 bytes by padding or hashing
-    if (selectedAlgorithm === 'blake3' && keyBuffer) {
-      if (keyBuffer.length < 32) {
-        // Pad shorter keys to 32 bytes with zeros
-        const paddedKey = Buffer.alloc(32);
-        keyBuffer.copy(paddedKey);
-        keyBuffer = paddedKey;
-      } else if (keyBuffer.length > 32) {
-        // Hash longer keys to get exactly 32 bytes
-        const crypto = require('crypto');
-        keyBuffer = crypto.createHash('sha256').update(keyBuffer).digest();
-      }
-    }
     let digest;
 
     if (selectedAlgorithm === 'blake2b') {
-      digest = Buffer.from(blake2b(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
+      digest = Buffer.from(blake2b(inputBuffer, { dkLen: hashLength })).toString('hex');
     } else if (selectedAlgorithm === 'blake2s') {
-      digest = Buffer.from(blake2s(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
+      digest = Buffer.from(blake2s(inputBuffer, { dkLen: hashLength })).toString('hex');
     } else {
-      const blake3Options = keyBuffer ? { key: keyBuffer, dkLen: hashLength } : { dkLen: hashLength };
-      digest = Buffer.from(blake3(inputBuffer, blake3Options)).toString('hex');
+      digest = Buffer.from(blake3(inputBuffer, { dkLen: hashLength })).toString('hex');
     }
 
     return sendSuccess(res, 'Hash generated', {
       hash: digest,
       algorithm: selectedAlgorithm.toUpperCase(),
-      keyLength: hashLength,
-      hasSecretKey: !!normalizedKey
+      keyLength: hashLength
     });
   } catch (err) {
     return sendError(res, 'Internal error during hash generation', 500);
@@ -718,11 +694,10 @@ router.post('/blakegenerate', async (req, res) => {
  */
 router.post('/blakeverify', async (req, res) => {
   try {
-    const { input, hash, algorithm = 'blake2b', keyLength, key } = req.body;
+    const { input, hash, algorithm = 'blake2b', keyLength } = req.body;
     if (!input || typeof input !== 'string') return sendError(res, 'Input is required');
     if (!hash || typeof hash !== 'string' || !/^[a-fA-F0-9]+$/.test(hash)) return sendError(res, 'Valid hex hash required');
 
-    const normalizedKey = key && key.trim().length > 0 ? key.trim() : null;
     const selectedAlgorithm = algorithm.toLowerCase();
     const defaultLengths = { blake2b: 64, blake2s: 32, blake3: 32 };
     const maxLengths = { blake2b: 64, blake2s: 32, blake3: 1024 };
@@ -740,37 +715,15 @@ router.post('/blakeverify', async (req, res) => {
       return sendError(res, 'Hash length mismatch with provided value');
     }
 
-    if (normalizedKey && Buffer.byteLength(normalizedKey, 'utf8') > maxLengths[selectedAlgorithm]) {
-      return sendError(res, `Key cannot exceed ${maxLengths[selectedAlgorithm]} bytes`);
-    }
-
-    // BLAKE3 key validation is handled during key processing
-
     const inputBuffer = Buffer.from(input, 'utf8');
-    let keyBuffer = normalizedKey ? Buffer.from(normalizedKey, 'utf8') : undefined;
-    
-    // For BLAKE3, ensure key is exactly 32 bytes by padding or hashing
-    if (selectedAlgorithm === 'blake3' && keyBuffer) {
-      if (keyBuffer.length < 32) {
-        // Pad shorter keys to 32 bytes with zeros
-        const paddedKey = Buffer.alloc(32);
-        keyBuffer.copy(paddedKey);
-        keyBuffer = paddedKey;
-      } else if (keyBuffer.length > 32) {
-        // Hash longer keys to get exactly 32 bytes
-        const crypto = require('crypto');
-        keyBuffer = crypto.createHash('sha256').update(keyBuffer).digest();
-      }
-    }
     let computedDigest;
 
     if (selectedAlgorithm === 'blake2b') {
-      computedDigest = Buffer.from(blake2b(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
+      computedDigest = Buffer.from(blake2b(inputBuffer, { dkLen: hashLength })).toString('hex');
     } else if (selectedAlgorithm === 'blake2s') {
-      computedDigest = Buffer.from(blake2s(inputBuffer, { key: keyBuffer, dkLen: hashLength })).toString('hex');
+      computedDigest = Buffer.from(blake2s(inputBuffer, { dkLen: hashLength })).toString('hex');
     } else {
-      const blake3Options = keyBuffer ? { key: keyBuffer, dkLen: hashLength } : { dkLen: hashLength };
-      computedDigest = Buffer.from(blake3(inputBuffer, blake3Options)).toString('hex');
+      computedDigest = Buffer.from(blake3(inputBuffer, { dkLen: hashLength })).toString('hex');
     }
 
     const expectedBuffer = Buffer.from(hash.toLowerCase(), 'hex');
@@ -782,8 +735,7 @@ router.post('/blakeverify', async (req, res) => {
     return sendSuccess(res, 'Hash verification complete', {
       isValid,
       algorithm: selectedAlgorithm.toUpperCase(),
-      keyLength: hashLength,
-      hasSecretKey: !!normalizedKey
+      keyLength: hashLength
     });
   } catch (err) {
     return sendError(res, 'Internal error during hash verification', 500);
@@ -863,7 +815,7 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
       standardFormats: true,
       memoryEstimation: true,
       performanceLogging: true,
-      keyedHashing: true, // For BLAKE algorithms
+      standardHashing: true, // BLAKE algorithms without keys
       modernCrypto: true
     },
     usage: {
@@ -874,8 +826,7 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
         body: {
           input: 'Data to hash (required)',
           algorithm: 'blake2b, blake2s, or blake3 (optional, default: blake2b)',
-          keyLength: 'Hash length in bytes (optional, uses algorithm default)',
-          key: 'Secret key for keyed hashing (optional)'
+          keyLength: 'Hash length in bytes (optional, uses algorithm default)'
         },
         response: {
           hash: 'Generated BLAKE hash in hex format',
@@ -891,8 +842,7 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
           input: 'Data to verify (required)',
           hash: 'BLAKE hash to verify against (required)',
           algorithm: 'blake2b, blake2s, or blake3 (required)',
-          keyLength: 'Hash length in bytes (optional, auto-detected)',
-          key: 'Secret key if hash was keyed (optional)'
+          keyLength: 'Hash length in bytes (optional, auto-detected)'
         },
         response: {
           isValid: 'Boolean indicating if input matches hash',
