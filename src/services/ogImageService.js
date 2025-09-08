@@ -8,6 +8,14 @@ const crypto = require('crypto');
 let fontsCache = null;
 
 /**
+ * Reset fonts cache (useful for development)
+ */
+function resetFontsCache() {
+  fontsCache = null;
+  console.log('Fonts cache reset');
+}
+
+/**
  * Load fonts for Satori
  */
 async function loadFonts() {
@@ -37,12 +45,13 @@ async function loadFonts() {
       }
     }
 
-    // If no local fonts found, download from Google Fonts
+    // If no local fonts found, download from Google Fonts (TTF format)
     if (fonts.length === 0) {
-      console.log('Downloading fonts from Google Fonts...');
+      console.log('Downloading fonts from CDN...');
       try {
-        const interRegular = await downloadGoogleFont('https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2');
-        const interBold = await downloadGoogleFont('https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuDyfAZ9hiA.woff2');
+        // Use TTF fonts instead of WOFF2 for better compatibility with Satori
+        const interRegular = await downloadGoogleFont('https://github.com/google/fonts/raw/main/ofl/inter/Inter-Regular.ttf');
+        const interBold = await downloadGoogleFont('https://github.com/google/fonts/raw/main/ofl/inter/Inter-Bold.ttf');
         
         if (interRegular) {
           fonts.push({
@@ -85,30 +94,66 @@ async function loadFonts() {
 }
 
 /**
- * Download font from Google Fonts
+ * Download font from CDN
  */
 async function downloadGoogleFont(url) {
   try {
     const https = require('https');
     const http = require('http');
     
+    console.log(`Downloading font from: ${url}`);
+    
     return new Promise((resolve, reject) => {
       const client = url.startsWith('https:') ? https : http;
       
-      client.get(url, {
+      const req = client.get(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       }, (res) => {
+        if (res.statusCode === 302 || res.statusCode === 301) {
+          // Follow redirects
+          console.log(`Following redirect to: ${res.headers.location}`);
+          downloadGoogleFont(res.headers.location).then(resolve).catch(reject);
+          return;
+        }
+        
         if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}`));
+          reject(new Error(`HTTP ${res.statusCode} for ${url}`));
           return;
         }
         
         const chunks = [];
         res.on('data', chunk => chunks.push(chunk));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-      }).on('error', reject);
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          console.log(`Downloaded font: ${buffer.length} bytes`);
+          
+          // Basic validation - check if it looks like a font file
+          if (buffer.length < 1000) {
+            reject(new Error('Downloaded file too small to be a valid font'));
+            return;
+          }
+          
+          // Check TTF signature (0x00010000 for TTF/OTF)
+          const signature = buffer.readUInt32BE(0);
+          if (signature === 0x00010000 || signature === 0x4F54544F) { // TTF or OTF
+            resolve(buffer);
+          } else {
+            reject(new Error(`Invalid font signature: 0x${signature.toString(16)}`));
+          }
+        });
+      });
+      
+      req.on('error', (err) => {
+        console.error('Font download request error:', err);
+        reject(err);
+      });
+      
+      req.setTimeout(30000, () => {
+        req.destroy();
+        reject(new Error('Font download timeout'));
+      });
     });
   } catch (error) {
     console.error('Font download error:', error);
@@ -574,4 +619,8 @@ module.exports = {
   generateOGImage,
   getTemplates,
   getCacheKey,
+  resetFontsCache,
 };
+
+// Reset fonts cache on startup to ensure fresh downloads
+resetFontsCache();
