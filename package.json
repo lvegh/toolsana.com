@@ -1,7 +1,7 @@
 {
   "name": "toolzyhub-api",
   "version": "1.0.0",
-  "description": "Secure Node.js API server for ToolzyHub with token protection and rate limiting",
+  "description": "Secure Node.js API server for Toolsana with token protection and rate limiting",
   "main": "src/server.js",
   "scripts": {
     "start": "NODE_ENV=production node src/server.js",
@@ -57,11 +57,13 @@
     "nodemailer": "^7.0.5",
     "potrace": "^2.1.1",
     "redis": "^4.6.12",
-    "sharp": "^0.33.1",
+    "satori": "^0.18.2",
+    "sharp": "^0.33.5",
     "uuid": "^9.0.1",
     "winston": "^3.11.0",
     "winston-daily-rotate-file": "^4.7.1",
-    "xss": "^1.0.14"
+    "xss": "^1.0.14",
+    "yoga-wasm-web": "^0.3.3"
   },
   "devDependencies": {
     "eslint": "^8.56.0",
