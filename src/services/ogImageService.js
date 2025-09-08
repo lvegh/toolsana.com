@@ -24,7 +24,7 @@ async function loadFonts() {
   try {
     const fonts = [];
     
-    // Try to load local font files first
+    // Load local font files (we now have guaranteed TTF files)
     const fontPaths = [
       { path: path.join(__dirname, '../fonts/inter-400.ttf'), weight: 400 },
       { path: path.join(__dirname, '../fonts/inter-700.ttf'), weight: 700 },
@@ -39,49 +39,34 @@ async function loadFonts() {
           weight: fontConfig.weight,
           style: 'normal',
         });
-        console.log(`Loaded font: Inter ${fontConfig.weight}`);
+        console.log(`Loaded font: Inter ${fontConfig.weight} (${fontData.length} bytes)`);
       } catch (err) {
         console.warn(`Could not load font ${fontConfig.path}:`, err.message);
       }
     }
 
-    // If no local fonts found, download from Google Fonts (TTF format)
+    // Only try system fonts if local fonts failed to load
     if (fonts.length === 0) {
-      console.log('Downloading fonts from CDN...');
+      console.warn('Local fonts not found, trying system fonts...');
       try {
-        // Use TTF fonts instead of WOFF2 for better compatibility with Satori
-        const interRegular = await downloadGoogleFont('https://github.com/google/fonts/raw/main/ofl/inter/Inter-Regular.ttf');
-        const interBold = await downloadGoogleFont('https://github.com/google/fonts/raw/main/ofl/inter/Inter-Bold.ttf');
-        
-        if (interRegular) {
+        const systemFontData = await createBasicFontBuffer();
+        if (systemFontData) {
           fonts.push({
-            name: 'Inter',
-            data: interRegular,
+            name: 'System',
+            data: systemFontData,
             weight: 400,
             style: 'normal',
           });
+          console.log('Using system fallback font');
         }
-        
-        if (interBold) {
-          fonts.push({
-            name: 'Inter',
-            data: interBold,
-            weight: 700,
-            style: 'normal',
-          });
-        }
-      } catch (downloadErr) {
-        console.error('Failed to download fonts:', downloadErr.message);
+      } catch (err) {
+        console.error('Failed to load system fonts:', err.message);
       }
     }
 
-    // Fallback to minimal font setup if everything fails
+    // Final fallback - this should not happen with our TTF files in place
     if (fonts.length === 0) {
-      console.warn('Using fallback font configuration');
-      // Don't add empty buffers - just return empty array
-      // Satori will try to use system fonts
-      fontsCache = [];
-      return fontsCache;
+      throw new Error('No fonts could be loaded. Please ensure font files are available.');
     }
 
     fontsCache = fonts;
@@ -90,6 +75,40 @@ async function loadFonts() {
   } catch (error) {
     console.error('Error loading fonts:', error);
     return [];
+  }
+}
+
+/**
+ * Create a basic font buffer for fallback
+ * Uses a simple system approach that should work with Satori
+ */
+async function createBasicFontBuffer() {
+  try {
+    // Try to use a system font file if available
+    const systemFontPaths = [
+      '/System/Library/Fonts/Arial.ttf', // macOS
+      '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', // Ubuntu/Debian
+      '/usr/share/fonts/TTF/arial.ttf', // Some Linux distributions
+      'C:\\Windows\\Fonts\\arial.ttf', // Windows
+    ];
+
+    for (const fontPath of systemFontPaths) {
+      try {
+        const fontData = await fs.readFile(fontPath);
+        console.log(`Found system font: ${fontPath}`);
+        return fontData;
+      } catch (err) {
+        // Continue to next path
+      }
+    }
+
+    // If no system fonts found, create a minimal font data structure
+    // This is a last resort and may not work perfectly
+    console.log('No system fonts found, using minimal font approach');
+    return null;
+  } catch (error) {
+    console.error('Error creating basic font:', error);
+    return null;
   }
 }
 
