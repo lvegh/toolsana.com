@@ -14,27 +14,105 @@ async function loadFonts() {
   if (fontsCache) return fontsCache;
 
   try {
-    // For now, we'll use a system font approach
-    // In production, you'd load actual font files
-    fontsCache = [
-      {
-        name: 'Inter',
-        data: Buffer.from(''), // Placeholder - will use default fonts
-        weight: 400,
-        style: 'normal',
-      },
-      {
-        name: 'Inter',
-        data: Buffer.from(''), // Placeholder
-        weight: 700,
-        style: 'normal',
-      }
+    const fonts = [];
+    
+    // Try to load local font files first
+    const fontPaths = [
+      { path: path.join(__dirname, '../fonts/inter-400.ttf'), weight: 400 },
+      { path: path.join(__dirname, '../fonts/inter-700.ttf'), weight: 700 },
     ];
 
+    for (const fontConfig of fontPaths) {
+      try {
+        const fontData = await fs.readFile(fontConfig.path);
+        fonts.push({
+          name: 'Inter',
+          data: fontData,
+          weight: fontConfig.weight,
+          style: 'normal',
+        });
+        console.log(`Loaded font: Inter ${fontConfig.weight}`);
+      } catch (err) {
+        console.warn(`Could not load font ${fontConfig.path}:`, err.message);
+      }
+    }
+
+    // If no local fonts found, download from Google Fonts
+    if (fonts.length === 0) {
+      console.log('Downloading fonts from Google Fonts...');
+      try {
+        const interRegular = await downloadGoogleFont('https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2');
+        const interBold = await downloadGoogleFont('https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuDyfAZ9hiA.woff2');
+        
+        if (interRegular) {
+          fonts.push({
+            name: 'Inter',
+            data: interRegular,
+            weight: 400,
+            style: 'normal',
+          });
+        }
+        
+        if (interBold) {
+          fonts.push({
+            name: 'Inter',
+            data: interBold,
+            weight: 700,
+            style: 'normal',
+          });
+        }
+      } catch (downloadErr) {
+        console.error('Failed to download fonts:', downloadErr.message);
+      }
+    }
+
+    // Fallback to minimal font setup if everything fails
+    if (fonts.length === 0) {
+      console.warn('Using fallback font configuration');
+      // Don't add empty buffers - just return empty array
+      // Satori will try to use system fonts
+      fontsCache = [];
+      return fontsCache;
+    }
+
+    fontsCache = fonts;
+    console.log(`Successfully loaded ${fonts.length} fonts`);
     return fontsCache;
   } catch (error) {
     console.error('Error loading fonts:', error);
     return [];
+  }
+}
+
+/**
+ * Download font from Google Fonts
+ */
+async function downloadGoogleFont(url) {
+  try {
+    const https = require('https');
+    const http = require('http');
+    
+    return new Promise((resolve, reject) => {
+      const client = url.startsWith('https:') ? https : http;
+      
+      client.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      }, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }).on('error', reject);
+    });
+  } catch (error) {
+    console.error('Font download error:', error);
+    return null;
   }
 }
 
@@ -423,13 +501,23 @@ async function generateOGImage(options) {
 
     // Load fonts
     const fonts = await loadFonts();
+    console.log(`Using ${fonts.length} fonts for rendering`);
 
-    // Generate SVG with Satori
-    const svg = await satori(element, {
+    // Satori configuration
+    const satoriConfig = {
       width: config.width,
       height: config.height,
-      fonts: fonts.length > 0 ? fonts : undefined,
-    });
+    };
+
+    // Only add fonts if we have valid ones
+    if (fonts.length > 0) {
+      satoriConfig.fonts = fonts;
+    }
+
+    console.log('Satori config:', { ...satoriConfig, fonts: satoriConfig.fonts ? `${satoriConfig.fonts.length} fonts` : 'no fonts' });
+
+    // Generate SVG with Satori
+    const svg = await satori(element, satoriConfig);
 
     // Convert SVG to image buffer using Sharp
     let imageBuffer = Buffer.from(svg);
