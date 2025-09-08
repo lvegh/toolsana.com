@@ -235,7 +235,7 @@ const templates = {
         justifyContent: 'center',
         backgroundColor: options.bgColor || '#ffffff',
         padding: options.padding || 60,
-        fontFamily: 'Inter, sans-serif',
+        fontFamily: 'Inter',
       },
       children: [
         options.title && {
@@ -283,7 +283,7 @@ const templates = {
         justifyContent: 'center',
         backgroundImage: createGradient(options.bgGradient) || 'linear-gradient(135deg, #667eea, #764ba2)',
         padding: options.padding || 60,
-        fontFamily: 'Inter, sans-serif',
+        fontFamily: 'Inter',
       },
       children: [
         options.title && {
@@ -331,7 +331,7 @@ const templates = {
         flexDirection: 'column',
         backgroundColor: options.bgColor || '#0f172a',
         padding: 0,
-        fontFamily: 'Inter, sans-serif',
+        fontFamily: 'Inter',
         position: 'relative',
       },
       children: [
@@ -410,7 +410,7 @@ const templates = {
         backgroundColor: '#000000',
         backgroundImage: 'radial-gradient(circle at 20% 50%, #1a1a2e 0%, #000000 50%)',
         padding: options.padding || 80,
-        fontFamily: 'monospace',
+        fontFamily: 'Inter',
         position: 'relative',
       },
       children: [
@@ -422,7 +422,7 @@ const templates = {
               fontSize: 24,
               color: '#22c55e',
               marginBottom: 20,
-              fontFamily: 'monospace',
+              fontFamily: 'Inter',
             },
             children: '> _',
           },
@@ -436,7 +436,7 @@ const templates = {
               color: '#ffffff',
               margin: 0,
               lineHeight: 1.2,
-              fontFamily: 'monospace',
+              fontFamily: 'Inter',
             },
             children: options.title,
           },
@@ -450,7 +450,7 @@ const templates = {
               marginTop: 20,
               margin: 0,
               lineHeight: 1.4,
-              fontFamily: 'monospace',
+              fontFamily: 'Inter',
             },
             children: options.subtitle,
           },
@@ -471,7 +471,7 @@ const templates = {
         justifyContent: 'center',
         backgroundColor: options.bgColor || '#dc2626',
         padding: options.padding || 60,
-        fontFamily: 'Inter, sans-serif',
+        fontFamily: 'Inter',
       },
       children: [
         options.title && {
@@ -479,7 +479,7 @@ const templates = {
           props: {
             style: {
               fontSize: options.fontSize?.title || 96,
-              fontWeight: 900,
+              fontWeight: 700,
               color: options.textColor || '#ffffff',
               margin: 0,
               lineHeight: 1,
@@ -495,7 +495,7 @@ const templates = {
           props: {
             style: {
               fontSize: options.fontSize?.subtitle || 32,
-              fontWeight: 600,
+              fontWeight: 700,
               color: options.textColor || '#ffffff',
               opacity: 0.9,
               marginTop: 24,
