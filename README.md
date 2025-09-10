@@ -1,4 +1,4 @@
-# ToolzyHub API
+# Toolsana API
 
 A secure, production-ready Node.js API server with token protection, rate limiting, and advanced security features. Built specifically to handle operations that can't run on Cloudflare Pages edge runtime, such as image processing with Sharp.
 
