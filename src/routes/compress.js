@@ -8,6 +8,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const pngOptimizer = require('../services/pngOptimizer');
 
 const router = express.Router();
 
@@ -151,7 +152,7 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
 
 /**
  * POST /api/compress/png
- * Compress PNG images
+ * Compress PNG images with intelligent optimization
  */
 router.post('/png', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.single('file'), async (req, res) => {
   try {
@@ -160,68 +161,47 @@ router.post('/png', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.sin
       return sendError(res, 'No file provided', 400);
     }
 
-    // Get compression level parameter (default to 6)
-    const compressionLevel = parseInt(req.body.compressionLevel) || 6;
-
-    // Validate compression level range (0-9 for PNG)
-    if (compressionLevel < 0 || compressionLevel > 9) {
-      return sendError(res, 'Compression level must be between 0 and 9', 400);
-    }
-
     const originalBuffer = req.file.buffer;
     const originalSize = originalBuffer.length;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
 
-    logger.info('Starting PNG compression', {
+    logger.info('Starting intelligent PNG compression', {
       originalName: req.file.originalname,
       originalSize,
-      compressionLevel,
       mimetype: req.file.mimetype
     });
 
-    // Compress PNG with Sharp
-    const compressedBuffer = await sharp(originalBuffer)
-      .png({
-        compressionLevel, // 0-9, where 9 is maximum compression
-        adaptiveFiltering: true,
-        palette: true,
-      })
-      .toBuffer();
-
-    // Calculate compression statistics
-    const compressedSize = compressedBuffer.length;
-    const compressionRatio = (
-      ((originalSize - compressedSize) / originalSize) * 100
-    ).toFixed(1);
+    // Use intelligent PNG optimization
+    const compressionResult = await pngOptimizer.compress(originalBuffer);
 
     // Generate filename
     const filename = `${originalName}_compressed.png`;
 
-    logger.info('PNG compression completed', {
+    logger.info('Intelligent PNG compression completed', {
       originalName: req.file.originalname,
       originalSize,
-      compressedSize,
-      compressionRatio: `${compressionRatio}%`,
-      compressionLevel
+      compressedSize: compressionResult.compressedSize,
+      compressionRatio: `${compressionResult.compressionRatio}%`,
+      strategy: compressionResult.strategy
     });
 
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
       'Content-Disposition': `attachment; filename="${filename}"`,
-      'Content-Length': compressedSize.toString(),
+      'Content-Length': compressionResult.compressedSize.toString(),
       'X-Original-Size': originalSize.toString(),
-      'X-Compressed-Size': compressedSize.toString(),
-      'X-Compression-Ratio': compressionRatio,
-      'X-Compression-Level': compressionLevel.toString(),
+      'X-Compressed-Size': compressionResult.compressedSize.toString(),
+      'X-Compression-Ratio': compressionResult.compressionRatio,
+      'X-Compression-Strategy': compressionResult.strategy,
       'X-Original-Filename': req.file.originalname
     });
 
     // Send the compressed image
-    res.send(compressedBuffer);
+    res.send(compressionResult.buffer);
 
   } catch (error) {
-    logger.error('PNG compression error:', {
+    logger.error('Intelligent PNG compression error:', {
       error: error.message,
       stack: error.stack,
       originalName: req.file?.originalname,
