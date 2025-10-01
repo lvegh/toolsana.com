@@ -30,7 +30,8 @@ router.get('/', basicRateLimit, (req, res) => {
       cors: '/api/cors',
       contact: '/api/contact',
       subscribe: '/api/subscribe',
-      ogImage: '/api/og-image'
+      ogImage: '/api/og-image',
+      httpHeaders: '/api/http-headers'
       // Add more endpoints as they are created
       // auth: '/api/v1/auth',
       // upload: '/api/v1/upload',
@@ -220,6 +221,7 @@ const fetchRoutes = require('./fetch');
 const canonicalRoutes = require('./canonical');
 const corsRoutes = require('./cors');
 const ogImageRoutes = require('./ogImageRoutes');
+const httpHeadersRoutes = require('./httpHeaders');
 
 // Register routes
 router.use('/ai', aiRoutes);
@@ -236,6 +238,7 @@ router.use('/cors', corsRoutes);
 router.use('/subscribe', subscribeRoutes);
 router.use('/og-image', ogImageRoutes);
 router.use('/og', ogImageRoutes); // Also handle /api/og/* routes
+router.use('/http-headers', httpHeadersRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
