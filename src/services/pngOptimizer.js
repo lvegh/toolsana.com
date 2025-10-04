@@ -166,33 +166,13 @@ class PngOptimizer {
     const originalSize = buffer.length;
 
     try {
-      logger.info('Starting compression', { originalSize: (originalSize / 1024).toFixed(2) + ' KB' });
-
-      // Strip metadata first
       let currentBuffer = await this.stripMetadata(buffer);
-
-      // Analyze the image
       const analysis = await this.analyzeImage(currentBuffer);
 
-      logger.info('Image analysis complete', {
-        hasGradients: analysis.hasGradients,
-        complexity: analysis.complexity,
-        avgStdDev: analysis.avgStdDev
-      });
-
-      // For gradients - preserve quality
       if (analysis.hasGradients) {
-        logger.info('Gradient detected - using quality-preserving compression');
-
+        // Gradient handling (unchanged)
         let gradientBuffer = await imagemin.buffer(currentBuffer, {
-          plugins: [
-            imageminPngquant({
-              quality: [0.90, 0.98],
-              speed: 1,
-              strip: true,
-              dithering: 0
-            })
-          ]
+          plugins: [imageminPngquant({ quality: [0.90, 0.98], speed: 1, strip: true, dithering: 0 })]
         }).catch(() => currentBuffer);
 
         gradientBuffer = await imagemin.buffer(gradientBuffer, {
@@ -203,219 +183,55 @@ class PngOptimizer {
           plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
         }).catch(() => gradientBuffer);
 
-        const compressionRatio = ((originalSize - gradientBuffer.length) / originalSize * 100).toFixed(1);
-
-        logger.info('Gradient compression complete', {
-          finalSize: (gradientBuffer.length / 1024).toFixed(2) + ' KB',
-          compressionRatio: compressionRatio + '%'
-        });
-
         return {
           buffer: gradientBuffer,
           originalSize,
           compressedSize: gradientBuffer.length,
-          compressionRatio,
+          compressionRatio: ((originalSize - gradientBuffer.length) / originalSize * 100).toFixed(1),
           strategy: 'gradient-safe',
           analysis
         };
       }
 
-      // For detailed images - TARGET 78% compression with quality control
-      logger.info('Detailed image - targeting 75-78% compression');
+      // SINGLE STRATEGY - CHANGE ONLY THIS LINE TO TEST:
+      const QUALITY_SETTING = [0.50, 0.70]; // ← CHANGE THIS LINE ONLY
 
-      let bestBuffer = currentBuffer;
-      let bestSize = currentBuffer.length;
-      let bestStrategy = 'original';
-      const attempts = [];
+      logger.info('Compressing with quality:', QUALITY_SETTING);
 
-      // Strategy 1: Conservative (75-76% compression, better quality)
-      logger.info('Strategy 1: Conservative [0.55, 0.75]');
-      try {
-        let conservative = await imagemin.buffer(currentBuffer, {
-          plugins: [
-            imageminPngquant({
-              quality: [0.40, 0.60],
-              speed: 1,
-              strip: true,
-              dithering: 1.0
-            })
-          ]
-        });
+      let compressed = await imagemin.buffer(currentBuffer, {
+        plugins: [imageminPngquant({ quality: QUALITY_SETTING, speed: 1, strip: true, dithering: 1.0 })]
+      }).catch(() => currentBuffer);
 
-        conservative = await imagemin.buffer(conservative, {
-          plugins: [imageminOptipng({ optimizationLevel: 2 })]
-        }).catch(() => conservative);
+      compressed = await imagemin.buffer(compressed, {
+        plugins: [imageminOptipng({ optimizationLevel: 2 })]
+      }).catch(() => compressed);
 
-        conservative = await imagemin.buffer(conservative, {
-          plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
-        }).catch(() => conservative);
+      compressed = await imagemin.buffer(compressed, {
+        plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
+      }).catch(() => compressed);
 
-        const ratio = ((originalSize - conservative.length) / originalSize * 100).toFixed(1);
-        attempts.push({
-          strategy: 'conservative',
-          buffer: conservative,
-          size: conservative.length,
-          ratio: parseFloat(ratio)
-        });
+      const compressionRatio = ((originalSize - compressed.length) / originalSize * 100).toFixed(1);
 
-        logger.info('Conservative result:', {
-          size: (conservative.length / 1024).toFixed(2) + ' KB',
-          ratio: ratio + '%'
-        });
-
-        if (conservative.length < bestSize) {
-          bestBuffer = conservative;
-          bestSize = conservative.length;
-          bestStrategy = 'conservative';
-        }
-      } catch (error) {
-        logger.warn('Conservative strategy failed:', error.message);
-      }
-
-      // Strategy 2: Balanced (77-78% compression, TinyPNG match)
-      logger.info('Strategy 2: Balanced [0.52, 0.72]');
-      try {
-        let balanced = await imagemin.buffer(currentBuffer, {
-          plugins: [
-            imageminPngquant({
-              quality: [0.52, 0.72],
-              speed: 1,
-              strip: true,
-              dithering: 1.0
-            })
-          ]
-        });
-
-        balanced = await imagemin.buffer(balanced, {
-          plugins: [imageminOptipng({ optimizationLevel: 2 })]
-        }).catch(() => balanced);
-
-        balanced = await imagemin.buffer(balanced, {
-          plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
-        }).catch(() => balanced);
-
-        const ratio = ((originalSize - balanced.length) / originalSize * 100).toFixed(1);
-        attempts.push({
-          strategy: 'balanced',
-          buffer: balanced,
-          size: balanced.length,
-          ratio: parseFloat(ratio)
-        });
-
-        logger.info('Balanced result:', {
-          size: (balanced.length / 1024).toFixed(2) + ' KB',
-          ratio: ratio + '%'
-        });
-
-        // Only use if it's better AND doesn't exceed 80% compression
-        if (balanced.length < bestSize && parseFloat(ratio) <= 80) {
-          bestBuffer = balanced;
-          bestSize = balanced.length;
-          bestStrategy = 'balanced';
-        }
-      } catch (error) {
-        logger.warn('Balanced strategy failed:', error.message);
-      }
-
-      // Strategy 3: Aggressive (only if we're still below 75%)
-      const currentRatio = ((originalSize - bestSize) / originalSize * 100);
-
-      if (currentRatio < 75) {
-        logger.info('Strategy 3: Aggressive [0.50, 0.70] - current ratio too low');
-        try {
-          let aggressive = await imagemin.buffer(currentBuffer, {
-            plugins: [
-              imageminPngquant({
-                quality: [0.50, 0.70],
-                speed: 1,
-                strip: true,
-                dithering: 1.0
-              })
-            ]
-          });
-
-          aggressive = await imagemin.buffer(aggressive, {
-            plugins: [imageminOptipng({ optimizationLevel: 2 })]
-          }).catch(() => aggressive);
-
-          aggressive = await imagemin.buffer(aggressive, {
-            plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
-          }).catch(() => aggressive);
-
-          const ratio = ((originalSize - aggressive.length) / originalSize * 100).toFixed(1);
-          attempts.push({
-            strategy: 'aggressive',
-            buffer: aggressive,
-            size: aggressive.length,
-            ratio: parseFloat(ratio)
-          });
-
-          logger.info('Aggressive result:', {
-            size: (aggressive.length / 1024).toFixed(2) + ' KB',
-            ratio: ratio + '%'
-          });
-
-          // Only use if it gets us 76-82% (quality gate)
-          if (aggressive.length < bestSize && parseFloat(ratio) >= 76 && parseFloat(ratio) <= 82) {
-            bestBuffer = aggressive;
-            bestSize = aggressive.length;
-            bestStrategy = 'aggressive';
-          }
-        } catch (error) {
-          logger.warn('Aggressive strategy failed:', error.message);
-        }
-      }
-
-      const finalSize = bestSize;
-      const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
-      const processingTime = Date.now() - startTime;
-
-      // Log all attempts
-      logger.info('All strategies tested:', attempts.map(a => ({
-        strategy: a.strategy,
-        size: (a.size / 1024).toFixed(2) + ' KB',
-        ratio: a.ratio + '%'
-      })));
-
-      logger.info('=== COMPRESSION COMPLETE ===', {
+      logger.info('Result:', {
         originalSize: (originalSize / 1024).toFixed(2) + ' KB',
-        finalSize: (finalSize / 1024).toFixed(2) + ' KB',
-        compressionRatio: `${compressionRatio}%`,
-        strategy: bestStrategy,
-        processingTime: `${processingTime}ms`,
-        tinypngTarget: '78% (475 KB)',
-        status: parseFloat(compressionRatio) >= 77 && parseFloat(compressionRatio) <= 80 ? '✓ MATCHED TINYPNG' :
-          parseFloat(compressionRatio) > 82 ? '⚠ TOO AGGRESSIVE (QUALITY GATE BLOCKED)' :
-            parseFloat(compressionRatio) >= 75 ? '≈ CLOSE TO TINYPNG' :
-              '✗ BELOW TARGET'
+        finalSize: (compressed.length / 1024).toFixed(2) + ' KB',
+        compressionRatio: compressionRatio + '%',
+        quality: QUALITY_SETTING
       });
 
       return {
-        buffer: bestBuffer,
+        buffer: compressed,
         originalSize,
-        compressedSize: finalSize,
+        compressedSize: compressed.length,
         compressionRatio,
-        strategy: bestStrategy,
-        analysis,
-        allAttempts: attempts
+        strategy: `quality-${QUALITY_SETTING.join('-')}`,
+        analysis
       };
 
     } catch (error) {
-      logger.error('PNG compression failed completely', {
-        error: error.message,
-        stack: error.stack
-      });
-
-      // Fallback
+      logger.error('Compression failed:', error);
       const fallbackBuffer = await sharp(buffer)
-        .png({
-          compressionLevel: 9,
-          adaptiveFiltering: true,
-          palette: true,
-          quality: 75,
-          effort: 10,
-          colors: 192
-        })
+        .png({ compressionLevel: 9, adaptiveFiltering: true, palette: true, quality: 75, effort: 10, colors: 192 })
         .toBuffer();
 
       return {
