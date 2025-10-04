@@ -224,31 +224,51 @@ class PngOptimizer {
             speed: options.speed,
             strip: options.strip,
             dithering: options.dithering,
-            posterize: options.posterize || 0
+            posterize: options.posterize > 0 ? options.posterize : undefined
           })
         ]
-      }).catch(() => null);
+      }).catch(err => {
+        logger.warn('Pngquant first attempt failed', { error: err.message });
+        return null;
+      });
 
-      // If failed or no improvement, try fallback quality
+      // If failed or no improvement, try with different settings
       if (!optimized || optimized.length >= buffer.length) {
-        const fallbackQuality = [
-          Math.max(options.quality[0] - 0.1, 0.3),
-          Math.max(options.quality[1] - 0.1, 0.6)
-        ];
+        logger.info('Trying alternative pngquant settings');
 
-        logger.info('Trying fallback quality settings', { fallbackQuality });
+        // Try without posterization
+        optimized = await imagemin.buffer(buffer, {
+          plugins: [
+            imageminPngquant({
+              quality: options.quality,
+              speed: options.speed,
+              strip: options.strip,
+              dithering: options.dithering
+            })
+          ]
+        }).catch(err => {
+          logger.warn('Pngquant second attempt failed', { error: err.message });
+          return null;
+        });
+      }
+
+      // If still no luck, try a more conservative approach
+      if (!optimized || optimized.length >= buffer.length) {
+        logger.info('Trying conservative pngquant settings');
 
         optimized = await imagemin.buffer(buffer, {
           plugins: [
             imageminPngquant({
-              quality: fallbackQuality,
-              speed: options.speed,
-              strip: options.strip,
-              dithering: options.dithering,
-              posterize: options.posterize || 0
+              quality: [0.65, 0.80],
+              speed: 4,
+              strip: true,
+              dithering: 1.0
             })
           ]
-        }).catch(() => buffer);
+        }).catch(err => {
+          logger.warn('Pngquant conservative attempt failed', { error: err.message });
+          return buffer;
+        });
       }
 
       const finalBuffer = optimized && optimized.length < buffer.length ? optimized : buffer;
@@ -257,13 +277,15 @@ class PngOptimizer {
       logger.info('Pngquant optimization complete', {
         originalSize: buffer.length,
         optimizedSize: finalBuffer.length,
-        reduction: `${reduction}%`
+        reduction: `${reduction}%`,
+        success: finalBuffer !== buffer
       });
 
       return finalBuffer;
     } catch (error) {
-      logger.warn('Pngquant optimization failed, returning original', {
-        error: error.message
+      logger.warn('Pngquant optimization failed completely, returning original', {
+        error: error.message,
+        stack: error.stack
       });
       return buffer;
     }
