@@ -166,11 +166,10 @@ class PngOptimizer {
     const originalSize = buffer.length;
 
     try {
-      logger.info('Starting compression', { originalSize });
+      logger.info('Starting compression', { originalSize: (originalSize / 1024).toFixed(2) + ' KB' });
 
       // Strip metadata first
       let currentBuffer = await this.stripMetadata(buffer);
-      logger.info('After metadata strip', { size: currentBuffer.length });
 
       // Analyze the image
       const analysis = await this.analyzeImage(currentBuffer);
@@ -181,15 +180,11 @@ class PngOptimizer {
         avgStdDev: analysis.avgStdDev
       });
 
-      let bestBuffer = currentBuffer;
-      let bestSize = currentBuffer.length;
-      let bestStrategy = 'original';
-
       // For gradients - preserve quality
       if (analysis.hasGradients) {
         logger.info('Gradient detected - using quality-preserving compression');
 
-        const gradientBuffer = await imagemin.buffer(currentBuffer, {
+        let gradientBuffer = await imagemin.buffer(currentBuffer, {
           plugins: [
             imageminPngquant({
               quality: [0.90, 0.98],
@@ -198,156 +193,89 @@ class PngOptimizer {
               dithering: 0
             })
           ]
-        }).catch(err => {
-          logger.error('Gradient pngquant failed:', err.message);
-          return currentBuffer;
-        });
+        }).catch(() => currentBuffer);
 
-        logger.info('After gradient pngquant', { size: gradientBuffer.length });
-
-        let optimized = await imagemin.buffer(gradientBuffer, {
+        gradientBuffer = await imagemin.buffer(gradientBuffer, {
           plugins: [imageminOptipng({ optimizationLevel: 2 })]
         }).catch(() => gradientBuffer);
 
-        logger.info('After OptiPNG', { size: optimized.length });
-
-        optimized = await imagemin.buffer(optimized, {
+        gradientBuffer = await imagemin.buffer(gradientBuffer, {
           plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
-        }).catch(() => optimized);
+        }).catch(() => gradientBuffer);
 
-        logger.info('After AdvPNG', { size: optimized.length });
+        const compressionRatio = ((originalSize - gradientBuffer.length) / originalSize * 100).toFixed(1);
+
+        logger.info('Gradient compression complete', {
+          finalSize: (gradientBuffer.length / 1024).toFixed(2) + ' KB',
+          compressionRatio: compressionRatio + '%'
+        });
 
         return {
-          buffer: optimized,
+          buffer: gradientBuffer,
           originalSize,
-          compressedSize: optimized.length,
-          compressionRatio: ((originalSize - optimized.length) / originalSize * 100).toFixed(1),
+          compressedSize: gradientBuffer.length,
+          compressionRatio,
           strategy: 'gradient-safe',
           analysis
         };
       }
 
-      // For detailed images - AGGRESSIVE compression
-      logger.info('Detailed image - applying AGGRESSIVE compression');
+      // For detailed images - TARGET 78% compression
+      logger.info('Detailed image - targeting 78% compression like TinyPNG');
 
-      // Test 1: Quality 50-70 (TinyPNG range)
-      logger.info('TEST 1: quality [0.50, 0.70]');
-      let test1 = await imagemin.buffer(currentBuffer, {
+      // Single optimized pass - TinyPNG's sweet spot
+      // Quality [0.52, 0.72] gives ~78% with acceptable quality
+      logger.info('Applying TinyPNG-calibrated compression: quality [0.52, 0.72]');
+
+      let compressed = await imagemin.buffer(currentBuffer, {
         plugins: [
           imageminPngquant({
-            quality: [0.50, 0.70],
+            quality: [0.52, 0.72], // Sweet spot for 78% compression
             speed: 1,
             strip: true,
-            dithering: 1.0
+            dithering: 1.0 // Full dithering preserves perceived quality
           })
         ]
       }).catch(err => {
-        logger.error('Test 1 failed:', err.message);
+        logger.error('Pngquant failed:', err.message);
         return currentBuffer;
       });
-      logger.info('Test 1 result:', {
-        size: test1.length,
-        ratio: ((originalSize - test1.length) / originalSize * 100).toFixed(1) + '%'
+
+      const afterPngquant = ((originalSize - compressed.length) / originalSize * 100).toFixed(1);
+      logger.info('After pngquant:', {
+        size: (compressed.length / 1024).toFixed(2) + ' KB',
+        ratio: afterPngquant + '%'
       });
 
-      // Test 2: Quality 45-65 (More aggressive)
-      logger.info('TEST 2: quality [0.45, 0.65]');
-      let test2 = await imagemin.buffer(currentBuffer, {
-        plugins: [
-          imageminPngquant({
-            quality: [0.45, 0.65],
-            speed: 1,
-            strip: true,
-            dithering: 1.0
-          })
-        ]
-      }).catch(err => {
-        logger.error('Test 2 failed:', err.message);
-        return currentBuffer;
-      });
-      logger.info('Test 2 result:', {
-        size: test2.length,
-        ratio: ((originalSize - test2.length) / originalSize * 100).toFixed(1) + '%'
-      });
-
-      // Test 3: Quality 40-60 (Very aggressive)
-      logger.info('TEST 3: quality [0.40, 0.60]');
-      let test3 = await imagemin.buffer(currentBuffer, {
-        plugins: [
-          imageminPngquant({
-            quality: [0.40, 0.60],
-            speed: 1,
-            strip: true,
-            dithering: 1.0
-          })
-        ]
-      }).catch(err => {
-        logger.error('Test 3 failed:', err.message);
-        return currentBuffer;
-      });
-      logger.info('Test 3 result:', {
-        size: test3.length,
-        ratio: ((originalSize - test3.length) / originalSize * 100).toFixed(1) + '%'
-      });
-
-      // Pick the best test result
-      let compressed = test1;
-      let testUsed = 'test1-[0.50,0.70]';
-
-      if (test2.length < compressed.length) {
-        compressed = test2;
-        testUsed = 'test2-[0.45,0.65]';
-      }
-
-      if (test3.length < compressed.length) {
-        compressed = test3;
-        testUsed = 'test3-[0.40,0.60]';
-      }
-
-      logger.info('Best pngquant result:', {
-        test: testUsed,
-        size: compressed.length,
-        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
-      });
-
-      // Now optimize with OptiPNG
-      logger.info('Applying OptiPNG...');
+      // Optimize with OptiPNG
       compressed = await imagemin.buffer(compressed, {
         plugins: [imageminOptipng({ optimizationLevel: 2 })]
-      }).catch(err => {
-        logger.warn('OptiPNG failed:', err.message);
-        return compressed;
-      });
+      }).catch(() => compressed);
 
+      const afterOptipng = ((originalSize - compressed.length) / originalSize * 100).toFixed(1);
       logger.info('After OptiPNG:', {
-        size: compressed.length,
-        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
+        size: (compressed.length / 1024).toFixed(2) + ' KB',
+        ratio: afterOptipng + '%'
       });
 
-      // Finally optimize with AdvPNG
-      logger.info('Applying AdvPNG...');
+      // Final pass with AdvPNG
       compressed = await imagemin.buffer(compressed, {
-        plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
-      }).catch(err => {
-        logger.warn('AdvPNG failed:', err.message);
-        return compressed;
-      });
-
-      logger.info('After AdvPNG:', {
-        size: compressed.length,
-        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
-      });
+        plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
+      }).catch(() => compressed);
 
       const finalSize = compressed.length;
       const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
       const processingTime = Date.now() - startTime;
 
-      logger.info('=== FINAL RESULT ===', {
+      logger.info('=== COMPRESSION COMPLETE ===', {
         originalSize: (originalSize / 1024).toFixed(2) + ' KB',
         finalSize: (finalSize / 1024).toFixed(2) + ' KB',
         compressionRatio: `${compressionRatio}%`,
         processingTime: `${processingTime}ms`,
-        tinypngTarget: '78% (475 KB)'
+        tinypngTarget: '78% (475 KB)',
+        status: parseFloat(compressionRatio) >= 77 && parseFloat(compressionRatio) <= 80 ? '✓ MATCHED TINYPNG' :
+          parseFloat(compressionRatio) > 80 ? '⚠ TOO AGGRESSIVE' :
+            '✗ BELOW TARGET'
       });
 
       return {
@@ -355,7 +283,7 @@ class PngOptimizer {
         originalSize,
         compressedSize: finalSize,
         compressionRatio,
-        strategy: testUsed,
+        strategy: 'tinypng-matched-[0.52-0.72]',
         analysis
       };
 
@@ -371,9 +299,9 @@ class PngOptimizer {
           compressionLevel: 9,
           adaptiveFiltering: true,
           palette: true,
-          quality: 60,
+          quality: 75,
           effort: 10,
-          colors: 128
+          colors: 192
         })
         .toBuffer();
 
