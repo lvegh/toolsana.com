@@ -200,7 +200,7 @@ class PngOptimizer {
           ]
         }).catch(() => currentBuffer);
 
-        // Lossless optimization only
+        // Lossless optimization
         let optimized = await imagemin.buffer(gradientBuffer, {
           plugins: [imageminOptipng({ optimizationLevel: 2 })]
         }).catch(() => gradientBuffer);
@@ -211,86 +211,127 @@ class PngOptimizer {
 
         attempts.push({ strategy: 'gradient-safe', size: optimized.length, buffer: optimized });
 
-        if (optimized.length < bestSize) {
-          bestBuffer = optimized;
-          bestSize = optimized.length;
-          bestStrategy = 'gradient-safe';
-        }
+        bestBuffer = optimized;
+        bestSize = optimized.length;
+        bestStrategy = 'gradient-safe';
+
+        logger.info('Gradient compression complete', {
+          size: optimized.length,
+          ratio: ((originalSize - optimized.length) / originalSize * 100).toFixed(1) + '%'
+        });
       }
 
-      // Strategy 2: TinyPNG-matched quality levels (for detailed images)
+      // Strategy 2: For detailed images - TinyPNG-calibrated compression
       if (!analysis.hasGradients) {
-        logger.info('Applying TinyPNG-matched compression strategies');
+        logger.info('Detailed image - applying TinyPNG-calibrated compression');
 
-        // These quality levels match TinyPNG's sweet spot
-        // Start with higher quality and only go lower if needed
-        const qualityLevels = [
-          { quality: [0.65, 0.80], dither: 1.0, name: 'tinypng-match-80' },
-          { quality: [0.60, 0.75], dither: 1.0, name: 'tinypng-match-75' },
-          { quality: [0.55, 0.70], dither: 1.0, name: 'tinypng-match-70' }
-        ];
+        // Primary strategy: Match TinyPNG's quality sweet spot
+        try {
+          // Step 1: Aggressive pngquant (this is the key)
+          let primaryBuffer = await imagemin.buffer(currentBuffer, {
+            plugins: [
+              imageminPngquant({
+                quality: [0.50, 0.70], // TinyPNG sweet spot
+                speed: 1,
+                strip: true,
+                dithering: 1.0, // Full dithering maintains perceived quality
+                posterize: 0
+              })
+            ]
+          });
 
-        for (const level of qualityLevels) {
+          // Step 2: OptiPNG pass
+          primaryBuffer = await imagemin.buffer(primaryBuffer, {
+            plugins: [imageminOptipng({ optimizationLevel: 2 })]
+          }).catch(() => primaryBuffer);
+
+          // Step 3: AdvPNG pass
+          primaryBuffer = await imagemin.buffer(primaryBuffer, {
+            plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 18 })]
+          }).catch(() => primaryBuffer);
+
+          const ratio = ((originalSize - primaryBuffer.length) / originalSize * 100).toFixed(1);
+
+          attempts.push({
+            strategy: 'tinypng-calibrated',
+            size: primaryBuffer.length,
+            buffer: primaryBuffer,
+            ratio: parseFloat(ratio)
+          });
+
+          logger.info(`tinypng-calibrated: ${(primaryBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
+
+          if (primaryBuffer.length < bestSize) {
+            bestBuffer = primaryBuffer;
+            bestSize = primaryBuffer.length;
+            bestStrategy = 'tinypng-calibrated';
+          }
+        } catch (error) {
+          logger.warn('Primary strategy failed:', error.message);
+        }
+
+        // Fallback strategy: If primary didn't work well
+        const currentRatio = ((originalSize - bestSize) / originalSize * 100);
+
+        if (currentRatio < 75) {
+          logger.info('Primary strategy insufficient, trying fallback (current: ' + currentRatio.toFixed(1) + '%)');
+
           try {
-            let testBuffer = await imagemin.buffer(currentBuffer, {
+            // Slightly more aggressive
+            let fallbackBuffer = await imagemin.buffer(currentBuffer, {
               plugins: [
                 imageminPngquant({
-                  quality: level.quality,
+                  quality: [0.45, 0.65],
                   speed: 1,
                   strip: true,
-                  dithering: level.dither,
+                  dithering: 1.0,
                   posterize: 0
                 })
               ]
             });
 
-            // Optimize further
-            testBuffer = await imagemin.buffer(testBuffer, {
+            fallbackBuffer = await imagemin.buffer(fallbackBuffer, {
               plugins: [imageminOptipng({ optimizationLevel: 2 })]
-            }).catch(() => testBuffer);
+            }).catch(() => fallbackBuffer);
 
-            testBuffer = await imagemin.buffer(testBuffer, {
-              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
-            }).catch(() => testBuffer);
+            fallbackBuffer = await imagemin.buffer(fallbackBuffer, {
+              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
+            }).catch(() => fallbackBuffer);
 
-            const ratio = ((originalSize - testBuffer.length) / originalSize * 100).toFixed(1);
+            const ratio = ((originalSize - fallbackBuffer.length) / originalSize * 100).toFixed(1);
 
             attempts.push({
-              strategy: level.name,
-              size: testBuffer.length,
-              buffer: testBuffer,
+              strategy: 'aggressive-fallback',
+              size: fallbackBuffer.length,
+              buffer: fallbackBuffer,
               ratio: parseFloat(ratio)
             });
 
-            logger.info(`${level.name}: ${testBuffer.length} bytes (${ratio}%)`);
+            logger.info(`aggressive-fallback: ${(fallbackBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
 
-            if (testBuffer.length < bestSize) {
-              bestBuffer = testBuffer;
-              bestSize = testBuffer.length;
-              bestStrategy = level.name;
+            // Use if it gets us to 76-82% range
+            if (fallbackBuffer.length < bestSize && parseFloat(ratio) <= 82 && parseFloat(ratio) >= 76) {
+              bestBuffer = fallbackBuffer;
+              bestSize = fallbackBuffer.length;
+              bestStrategy = 'aggressive-fallback';
             }
           } catch (error) {
-            logger.warn(`Failed ${level.name}:`, error.message);
+            logger.warn('Fallback strategy failed:', error.message);
           }
         }
-      }
 
-      // Strategy 3: Smart color quantization (only if quality levels didn't hit target)
-      const currentRatio = ((originalSize - bestSize) / originalSize * 100);
+        // Additional strategy: Color quantization (only if still below 75%)
+        const finalRatio = ((originalSize - bestSize) / originalSize * 100);
 
-      if (!analysis.hasGradients && currentRatio < 75 && originalSize > 100000) {
-        logger.info('Applying smart color quantization (current: ' + currentRatio.toFixed(1) + '%)');
+        if (finalRatio < 75 && originalSize > 100000) {
+          logger.info('Trying color quantization boost (current: ' + finalRatio.toFixed(1) + '%)');
 
-        // Only try conservative quantization levels
-        const colorCounts = [256, 192, 128];
-
-        for (const colors of colorCounts) {
           try {
             let quantBuffer = await sharp(buffer)
               .png({
                 palette: true,
-                quality: 90,
-                colors: colors,
+                quality: 85,
+                colors: 192,
                 dither: 1.0,
                 compressionLevel: 9,
                 adaptiveFiltering: true,
@@ -298,14 +339,13 @@ class PngOptimizer {
               })
               .toBuffer();
 
-            // Light optimization pass
             quantBuffer = await imagemin.buffer(quantBuffer, {
               plugins: [
                 imageminPngquant({
-                  quality: [0.85, 0.95], // High quality to preserve the quantization
+                  quality: [0.75, 0.85],
                   speed: 1,
                   strip: true,
-                  dithering: 0.3
+                  dithering: 0.5
                 })
               ]
             }).catch(() => quantBuffer);
@@ -315,98 +355,34 @@ class PngOptimizer {
             }).catch(() => quantBuffer);
 
             quantBuffer = await imagemin.buffer(quantBuffer, {
-              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 15 })]
+              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 18 })]
             }).catch(() => quantBuffer);
 
             const ratio = ((originalSize - quantBuffer.length) / originalSize * 100).toFixed(1);
 
             attempts.push({
-              strategy: `quantized-${colors}`,
+              strategy: 'quantized-boost',
               size: quantBuffer.length,
               buffer: quantBuffer,
               ratio: parseFloat(ratio)
             });
 
-            logger.info(`quantized-${colors}: ${quantBuffer.length} bytes (${ratio}%)`);
+            logger.info(`quantized-boost: ${(quantBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
 
-            // Only use if it's better AND maintains reasonable quality (above 75%)
-            if (quantBuffer.length < bestSize && parseFloat(ratio) <= 80) {
+            if (quantBuffer.length < bestSize) {
               bestBuffer = quantBuffer;
               bestSize = quantBuffer.length;
-              bestStrategy = `quantized-${colors}`;
+              bestStrategy = 'quantized-boost';
             }
           } catch (error) {
-            logger.warn(`Quantization ${colors} colors failed:`, error.message);
+            logger.warn('Quantization boost failed:', error.message);
           }
-        }
-      }
-
-      // Strategy 4: Final optimization pass (if still below target)
-      const finalRatio = ((originalSize - bestSize) / originalSize * 100);
-
-      if (!analysis.hasGradients && finalRatio < 76 && finalRatio > 70) {
-        logger.info('Applying final optimization pass to reach target (current: ' + finalRatio.toFixed(1) + '%)');
-
-        try {
-          // Slightly more aggressive, but still reasonable
-          let finalBuffer = await imagemin.buffer(buffer, {
-            plugins: [
-              imageminPngquant({
-                quality: [0.58, 0.72], // Sweet spot between quality and compression
-                speed: 1,
-                strip: true,
-                dithering: 1.0,
-                posterize: 0
-              })
-            ]
-          });
-
-          // Double optimization pass
-          finalBuffer = await imagemin.buffer(finalBuffer, {
-            plugins: [imageminOptipng({ optimizationLevel: 2 })]
-          }).catch(() => finalBuffer);
-
-          finalBuffer = await imagemin.buffer(finalBuffer, {
-            plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
-          }).catch(() => finalBuffer);
-
-          const ratio = ((originalSize - finalBuffer.length) / originalSize * 100).toFixed(1);
-
-          attempts.push({
-            strategy: 'final-optimization',
-            size: finalBuffer.length,
-            buffer: finalBuffer,
-            ratio: parseFloat(ratio)
-          });
-
-          logger.info(`final-optimization: ${finalBuffer.length} bytes (${ratio}%)`);
-
-          // Only use if it gets us closer to 78% without going too far
-          if (finalBuffer.length < bestSize && parseFloat(ratio) <= 82) {
-            bestBuffer = finalBuffer;
-            bestSize = finalBuffer.length;
-            bestStrategy = 'final-optimization';
-          }
-        } catch (error) {
-          logger.warn('Final optimization failed:', error.message);
         }
       }
 
       const finalSize = bestSize;
       const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
       const processingTime = Date.now() - startTime;
-
-      // Log all attempts sorted by best ratio
-      const sortedAttempts = attempts
-        .map(a => ({
-          strategy: a.strategy,
-          size: a.size,
-          sizeKB: (a.size / 1024).toFixed(2) + ' KB',
-          ratio: ((originalSize - a.size) / originalSize * 100).toFixed(1) + '%'
-        }))
-        .sort((a, b) => parseFloat(b.ratio) - parseFloat(a.ratio));
-
-      logger.info('All compression attempts (sorted by ratio):', sortedAttempts);
 
       logger.info('PNG compression completed', {
         originalSize: (originalSize / 1024).toFixed(2) + ' KB',
@@ -415,7 +391,9 @@ class PngOptimizer {
         strategy: bestStrategy,
         processingTime: `${processingTime}ms`,
         tinypngTarget: '78% (475 KB)',
-        status: parseFloat(compressionRatio) >= 78 ? '✓ BEAT TINYPNG' : parseFloat(compressionRatio) >= 75 ? '≈ CLOSE TO TINYPNG' : '✗ BELOW TARGET'
+        status: parseFloat(compressionRatio) >= 78 ? '✓ MATCHED OR BEAT TINYPNG' :
+          parseFloat(compressionRatio) >= 75 ? '≈ CLOSE TO TINYPNG' :
+            '✗ BELOW TARGET'
       });
 
       return {
@@ -424,23 +402,22 @@ class PngOptimizer {
         compressedSize: finalSize,
         compressionRatio,
         strategy: bestStrategy,
-        analysis,
-        allAttempts: sortedAttempts
+        analysis
       };
 
     } catch (error) {
-      logger.error('PNG compression failed completely', {
+      logger.error('PNG compression failed', {
         error: error.message,
         stack: error.stack
       });
 
-      // Fallback with balanced settings
+      // Fallback
       const fallbackBuffer = await sharp(buffer)
         .png({
           compressionLevel: 9,
           adaptiveFiltering: true,
           palette: true,
-          quality: 80,
+          quality: 75,
           effort: 10,
           colors: 192
         })
