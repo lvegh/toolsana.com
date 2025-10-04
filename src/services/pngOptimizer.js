@@ -166,8 +166,11 @@ class PngOptimizer {
     const originalSize = buffer.length;
 
     try {
+      logger.info('Starting compression', { originalSize });
+
       // Strip metadata first
       let currentBuffer = await this.stripMetadata(buffer);
+      logger.info('After metadata strip', { size: currentBuffer.length });
 
       // Analyze the image
       const analysis = await this.analyzeImage(currentBuffer);
@@ -175,16 +178,14 @@ class PngOptimizer {
       logger.info('Image analysis complete', {
         hasGradients: analysis.hasGradients,
         complexity: analysis.complexity,
-        avgStdDev: analysis.avgStdDev,
-        size: analysis.size
+        avgStdDev: analysis.avgStdDev
       });
 
       let bestBuffer = currentBuffer;
       let bestSize = currentBuffer.length;
       let bestStrategy = 'original';
-      const attempts = [];
 
-      // Strategy 1: For gradients - preserve quality to prevent banding
+      // For gradients - preserve quality
       if (analysis.hasGradients) {
         logger.info('Gradient detected - using quality-preserving compression');
 
@@ -194,219 +195,172 @@ class PngOptimizer {
               quality: [0.90, 0.98],
               speed: 1,
               strip: true,
-              dithering: 0,
-              posterize: 0
+              dithering: 0
             })
           ]
-        }).catch(() => currentBuffer);
+        }).catch(err => {
+          logger.error('Gradient pngquant failed:', err.message);
+          return currentBuffer;
+        });
 
-        // Lossless optimization
+        logger.info('After gradient pngquant', { size: gradientBuffer.length });
+
         let optimized = await imagemin.buffer(gradientBuffer, {
           plugins: [imageminOptipng({ optimizationLevel: 2 })]
         }).catch(() => gradientBuffer);
+
+        logger.info('After OptiPNG', { size: optimized.length });
 
         optimized = await imagemin.buffer(optimized, {
           plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
         }).catch(() => optimized);
 
-        attempts.push({ strategy: 'gradient-safe', size: optimized.length, buffer: optimized });
+        logger.info('After AdvPNG', { size: optimized.length });
 
-        bestBuffer = optimized;
-        bestSize = optimized.length;
-        bestStrategy = 'gradient-safe';
-
-        logger.info('Gradient compression complete', {
-          size: optimized.length,
-          ratio: ((originalSize - optimized.length) / originalSize * 100).toFixed(1) + '%'
-        });
+        return {
+          buffer: optimized,
+          originalSize,
+          compressedSize: optimized.length,
+          compressionRatio: ((originalSize - optimized.length) / originalSize * 100).toFixed(1),
+          strategy: 'gradient-safe',
+          analysis
+        };
       }
 
-      // Strategy 2: For detailed images - TinyPNG-calibrated compression
-      if (!analysis.hasGradients) {
-        logger.info('Detailed image - applying TinyPNG-calibrated compression');
+      // For detailed images - AGGRESSIVE compression
+      logger.info('Detailed image - applying AGGRESSIVE compression');
 
-        // Primary strategy: Match TinyPNG's quality sweet spot
-        try {
-          // Step 1: Aggressive pngquant (this is the key)
-          let primaryBuffer = await imagemin.buffer(currentBuffer, {
-            plugins: [
-              imageminPngquant({
-                quality: [0.50, 0.70], // TinyPNG sweet spot
-                speed: 1,
-                strip: true,
-                dithering: 1.0, // Full dithering maintains perceived quality
-                posterize: 0
-              })
-            ]
-          });
+      // Test 1: Quality 50-70 (TinyPNG range)
+      logger.info('TEST 1: quality [0.50, 0.70]');
+      let test1 = await imagemin.buffer(currentBuffer, {
+        plugins: [
+          imageminPngquant({
+            quality: [0.50, 0.70],
+            speed: 1,
+            strip: true,
+            dithering: 1.0
+          })
+        ]
+      }).catch(err => {
+        logger.error('Test 1 failed:', err.message);
+        return currentBuffer;
+      });
+      logger.info('Test 1 result:', {
+        size: test1.length,
+        ratio: ((originalSize - test1.length) / originalSize * 100).toFixed(1) + '%'
+      });
 
-          // Step 2: OptiPNG pass
-          primaryBuffer = await imagemin.buffer(primaryBuffer, {
-            plugins: [imageminOptipng({ optimizationLevel: 2 })]
-          }).catch(() => primaryBuffer);
+      // Test 2: Quality 45-65 (More aggressive)
+      logger.info('TEST 2: quality [0.45, 0.65]');
+      let test2 = await imagemin.buffer(currentBuffer, {
+        plugins: [
+          imageminPngquant({
+            quality: [0.45, 0.65],
+            speed: 1,
+            strip: true,
+            dithering: 1.0
+          })
+        ]
+      }).catch(err => {
+        logger.error('Test 2 failed:', err.message);
+        return currentBuffer;
+      });
+      logger.info('Test 2 result:', {
+        size: test2.length,
+        ratio: ((originalSize - test2.length) / originalSize * 100).toFixed(1) + '%'
+      });
 
-          // Step 3: AdvPNG pass
-          primaryBuffer = await imagemin.buffer(primaryBuffer, {
-            plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 18 })]
-          }).catch(() => primaryBuffer);
+      // Test 3: Quality 40-60 (Very aggressive)
+      logger.info('TEST 3: quality [0.40, 0.60]');
+      let test3 = await imagemin.buffer(currentBuffer, {
+        plugins: [
+          imageminPngquant({
+            quality: [0.40, 0.60],
+            speed: 1,
+            strip: true,
+            dithering: 1.0
+          })
+        ]
+      }).catch(err => {
+        logger.error('Test 3 failed:', err.message);
+        return currentBuffer;
+      });
+      logger.info('Test 3 result:', {
+        size: test3.length,
+        ratio: ((originalSize - test3.length) / originalSize * 100).toFixed(1) + '%'
+      });
 
-          const ratio = ((originalSize - primaryBuffer.length) / originalSize * 100).toFixed(1);
+      // Pick the best test result
+      let compressed = test1;
+      let testUsed = 'test1-[0.50,0.70]';
 
-          attempts.push({
-            strategy: 'tinypng-calibrated',
-            size: primaryBuffer.length,
-            buffer: primaryBuffer,
-            ratio: parseFloat(ratio)
-          });
-
-          logger.info(`tinypng-calibrated: ${(primaryBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
-
-          if (primaryBuffer.length < bestSize) {
-            bestBuffer = primaryBuffer;
-            bestSize = primaryBuffer.length;
-            bestStrategy = 'tinypng-calibrated';
-          }
-        } catch (error) {
-          logger.warn('Primary strategy failed:', error.message);
-        }
-
-        // Fallback strategy: If primary didn't work well
-        const currentRatio = ((originalSize - bestSize) / originalSize * 100);
-
-        if (currentRatio < 75) {
-          logger.info('Primary strategy insufficient, trying fallback (current: ' + currentRatio.toFixed(1) + '%)');
-
-          try {
-            // Slightly more aggressive
-            let fallbackBuffer = await imagemin.buffer(currentBuffer, {
-              plugins: [
-                imageminPngquant({
-                  quality: [0.45, 0.65],
-                  speed: 1,
-                  strip: true,
-                  dithering: 1.0,
-                  posterize: 0
-                })
-              ]
-            });
-
-            fallbackBuffer = await imagemin.buffer(fallbackBuffer, {
-              plugins: [imageminOptipng({ optimizationLevel: 2 })]
-            }).catch(() => fallbackBuffer);
-
-            fallbackBuffer = await imagemin.buffer(fallbackBuffer, {
-              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
-            }).catch(() => fallbackBuffer);
-
-            const ratio = ((originalSize - fallbackBuffer.length) / originalSize * 100).toFixed(1);
-
-            attempts.push({
-              strategy: 'aggressive-fallback',
-              size: fallbackBuffer.length,
-              buffer: fallbackBuffer,
-              ratio: parseFloat(ratio)
-            });
-
-            logger.info(`aggressive-fallback: ${(fallbackBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
-
-            // Use if it gets us to 76-82% range
-            if (fallbackBuffer.length < bestSize && parseFloat(ratio) <= 82 && parseFloat(ratio) >= 76) {
-              bestBuffer = fallbackBuffer;
-              bestSize = fallbackBuffer.length;
-              bestStrategy = 'aggressive-fallback';
-            }
-          } catch (error) {
-            logger.warn('Fallback strategy failed:', error.message);
-          }
-        }
-
-        // Additional strategy: Color quantization (only if still below 75%)
-        const finalRatio = ((originalSize - bestSize) / originalSize * 100);
-
-        if (finalRatio < 75 && originalSize > 100000) {
-          logger.info('Trying color quantization boost (current: ' + finalRatio.toFixed(1) + '%)');
-
-          try {
-            let quantBuffer = await sharp(buffer)
-              .png({
-                palette: true,
-                quality: 85,
-                colors: 192,
-                dither: 1.0,
-                compressionLevel: 9,
-                adaptiveFiltering: true,
-                effort: 10
-              })
-              .toBuffer();
-
-            quantBuffer = await imagemin.buffer(quantBuffer, {
-              plugins: [
-                imageminPngquant({
-                  quality: [0.75, 0.85],
-                  speed: 1,
-                  strip: true,
-                  dithering: 0.5
-                })
-              ]
-            }).catch(() => quantBuffer);
-
-            quantBuffer = await imagemin.buffer(quantBuffer, {
-              plugins: [imageminOptipng({ optimizationLevel: 2 })]
-            }).catch(() => quantBuffer);
-
-            quantBuffer = await imagemin.buffer(quantBuffer, {
-              plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 18 })]
-            }).catch(() => quantBuffer);
-
-            const ratio = ((originalSize - quantBuffer.length) / originalSize * 100).toFixed(1);
-
-            attempts.push({
-              strategy: 'quantized-boost',
-              size: quantBuffer.length,
-              buffer: quantBuffer,
-              ratio: parseFloat(ratio)
-            });
-
-            logger.info(`quantized-boost: ${(quantBuffer.length / 1024).toFixed(2)} KB (${ratio}%)`);
-
-            if (quantBuffer.length < bestSize) {
-              bestBuffer = quantBuffer;
-              bestSize = quantBuffer.length;
-              bestStrategy = 'quantized-boost';
-            }
-          } catch (error) {
-            logger.warn('Quantization boost failed:', error.message);
-          }
-        }
+      if (test2.length < compressed.length) {
+        compressed = test2;
+        testUsed = 'test2-[0.45,0.65]';
       }
 
-      const finalSize = bestSize;
+      if (test3.length < compressed.length) {
+        compressed = test3;
+        testUsed = 'test3-[0.40,0.60]';
+      }
+
+      logger.info('Best pngquant result:', {
+        test: testUsed,
+        size: compressed.length,
+        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
+      });
+
+      // Now optimize with OptiPNG
+      logger.info('Applying OptiPNG...');
+      compressed = await imagemin.buffer(compressed, {
+        plugins: [imageminOptipng({ optimizationLevel: 2 })]
+      }).catch(err => {
+        logger.warn('OptiPNG failed:', err.message);
+        return compressed;
+      });
+
+      logger.info('After OptiPNG:', {
+        size: compressed.length,
+        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
+      });
+
+      // Finally optimize with AdvPNG
+      logger.info('Applying AdvPNG...');
+      compressed = await imagemin.buffer(compressed, {
+        plugins: [imageminAdvpng({ optimizationLevel: 4, iterations: 20 })]
+      }).catch(err => {
+        logger.warn('AdvPNG failed:', err.message);
+        return compressed;
+      });
+
+      logger.info('After AdvPNG:', {
+        size: compressed.length,
+        ratio: ((originalSize - compressed.length) / originalSize * 100).toFixed(1) + '%'
+      });
+
+      const finalSize = compressed.length;
       const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
       const processingTime = Date.now() - startTime;
 
-      logger.info('PNG compression completed', {
+      logger.info('=== FINAL RESULT ===', {
         originalSize: (originalSize / 1024).toFixed(2) + ' KB',
         finalSize: (finalSize / 1024).toFixed(2) + ' KB',
         compressionRatio: `${compressionRatio}%`,
-        strategy: bestStrategy,
         processingTime: `${processingTime}ms`,
-        tinypngTarget: '78% (475 KB)',
-        status: parseFloat(compressionRatio) >= 78 ? '✓ MATCHED OR BEAT TINYPNG' :
-          parseFloat(compressionRatio) >= 75 ? '≈ CLOSE TO TINYPNG' :
-            '✗ BELOW TARGET'
+        tinypngTarget: '78% (475 KB)'
       });
 
       return {
-        buffer: bestBuffer,
+        buffer: compressed,
         originalSize,
         compressedSize: finalSize,
         compressionRatio,
-        strategy: bestStrategy,
+        strategy: testUsed,
         analysis
       };
 
     } catch (error) {
-      logger.error('PNG compression failed', {
+      logger.error('PNG compression failed completely', {
         error: error.message,
         stack: error.stack
       });
@@ -417,9 +371,9 @@ class PngOptimizer {
           compressionLevel: 9,
           adaptiveFiltering: true,
           palette: true,
-          quality: 75,
+          quality: 60,
           effort: 10,
-          colors: 192
+          colors: 128
         })
         .toBuffer();
 
