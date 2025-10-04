@@ -234,7 +234,7 @@ class PngOptimizer {
         let conservative = await imagemin.buffer(currentBuffer, {
           plugins: [
             imageminPngquant({
-              quality: [0.46, 0.66],
+              quality: [0.40, 0.60],
               speed: 1,
               strip: true,
               dithering: 1.0
