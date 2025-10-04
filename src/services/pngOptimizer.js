@@ -194,7 +194,7 @@ class PngOptimizer {
       }
 
       // SINGLE STRATEGY - CHANGE ONLY THIS LINE TO TEST:
-      const QUALITY_SETTING = [0.50, 0.70]; // ← CHANGE THIS LINE ONLY
+      const QUALITY_SETTING = [0.40, 0.60]; // ← CHANGE THIS LINE ONLY
 
       logger.info('Compressing with quality:', QUALITY_SETTING);
 
