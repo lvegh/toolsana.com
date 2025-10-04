@@ -95,34 +95,29 @@ class PngOptimizer {
 
   async detectEdges(buffer, metadata) {
     try {
-      // Apply Sobel edge detection
-      const edges = await sharp(buffer)
-        .greyscale()
-        .convolve({
-          width: 3,
-          height: 3,
-          kernel: [-1, 0, 1, -2, 0, 2, -1, 0, 1] // Sobel operator
-        })
-        .raw()
-        .toBuffer();
+      // Use a simpler approach: analyze statistics instead of edge detection
+      // This avoids the complexity and potential issues with convolution
+      const stats = await sharp(buffer).stats();
 
-      // Count edge pixels (high intensity values)
-      let edgePixels = 0;
-      const threshold = 50;
-      for (let i = 0; i < edges.length; i++) {
-        if (edges[i] > threshold) edgePixels++;
-      }
+      // Calculate color variance - photos have high variance, graphics have low
+      const channelVariances = stats.channels.map(ch => ch.stdev || 0);
+      const avgVariance = channelVariances.reduce((a, b) => a + b, 0) / channelVariances.length;
 
-      const totalPixels = metadata.width * metadata.height;
-      const edgePercentage = (edgePixels / totalPixels) * 100;
+      // Calculate if image has few distinct values (indicator of graphics)
+      const isLowVariance = avgVariance < 40;
 
-      // Photos typically have < 15% edges, graphics/screenshots have > 25%
-      const isPhoto = edgePercentage < 15;
+      // Estimate edge percentage based on standard deviation
+      // High std dev in localized areas = edges
+      const edgePercentage = Math.min((avgVariance / 128) * 100, 100);
+
+      // Photos have smooth gradients (high variance but distributed)
+      // Graphics have sharp edges (localized high values)
+      const isPhoto = avgVariance > 30 && !isLowVariance;
 
       return { edgePercentage, isPhoto };
     } catch (error) {
       logger.warn('Edge detection failed, using fallback', { error: error.message });
-      return { edgePercentage: 0, isPhoto: true }; // Default to photo
+      return { edgePercentage: 10, isPhoto: true }; // Default to photo for safety
     }
   }
 
@@ -364,16 +359,19 @@ class PngOptimizer {
     try {
       const stripped = await sharp(buffer)
         .withMetadata(false)
+        .png() // Ensure output is PNG
         .toBuffer();
-      
-      const reduction = buffer.length - stripped.length;
-      if (reduction > 0) {
+
+      // Only use stripped version if it's actually smaller
+      if (stripped.length < buffer.length) {
+        const reduction = buffer.length - stripped.length;
         logger.info('Metadata stripped', {
           bytesRemoved: reduction
         });
+        return stripped;
       }
-      
-      return stripped;
+
+      return buffer;
     } catch (error) {
       logger.warn('Failed to strip metadata', { error: error.message });
       return buffer;
@@ -388,7 +386,11 @@ class PngOptimizer {
       // Strip metadata first
       let currentBuffer = await this.stripMetadata(buffer);
 
-      // Analyze the image
+      // Track the best result
+      let bestBuffer = currentBuffer;
+      let bestSize = currentBuffer.length;
+
+      // Analyze the image (this doesn't modify the buffer)
       const analysis = await this.analyzeImage(currentBuffer);
 
       // Select optimal strategy based on image type
@@ -397,20 +399,21 @@ class PngOptimizer {
       // Apply pngquant with adaptive settings
       const pngquantBuffer = await this.optimizeWithPngquant(currentBuffer, strategy);
 
-      if (pngquantBuffer.length < currentBuffer.length) {
-        currentBuffer = pngquantBuffer;
-        const reduction = ((originalSize - currentBuffer.length) / originalSize * 100).toFixed(1);
+      if (pngquantBuffer && pngquantBuffer.length < bestSize) {
+        bestBuffer = pngquantBuffer;
+        bestSize = pngquantBuffer.length;
+        const reduction = ((originalSize - bestSize) / originalSize * 100).toFixed(1);
         logger.info('Pngquant achieved reduction', { reduction: `${reduction}%` });
       }
 
       // Only apply OptiPNG if it's likely to help (non-photos)
       if (!analysis.isPhoto || analysis.edgePercentage > 10) {
-        const beforeOptipng = currentBuffer.length;
-        const optipngBuffer = await this.optimizeWithOptipng(currentBuffer);
+        const optipngBuffer = await this.optimizeWithOptipng(bestBuffer);
 
-        // Only keep if reduction is at least 2%
-        if (optipngBuffer.length < beforeOptipng * 0.98) {
-          currentBuffer = optipngBuffer;
+        // Only keep if reduction is at least 1%
+        if (optipngBuffer && optipngBuffer.length < bestSize * 0.99) {
+          bestBuffer = optipngBuffer;
+          bestSize = optipngBuffer.length;
           logger.info('OptiPNG provided additional reduction');
         } else {
           logger.info('OptiPNG skipped - minimal benefit');
@@ -419,25 +422,31 @@ class PngOptimizer {
 
       // Only apply AdvPNG for graphics with sharp edges
       if (analysis.edgePercentage > 20) {
-        const beforeAdvpng = currentBuffer.length;
-        const advpngBuffer = await this.optimizeWithAdvpng(currentBuffer);
+        const advpngBuffer = await this.optimizeWithAdvpng(bestBuffer);
 
-        // Only keep if reduction is at least 2%
-        if (advpngBuffer.length < beforeAdvpng * 0.98) {
-          currentBuffer = advpngBuffer;
+        // Only keep if reduction is at least 1%
+        if (advpngBuffer && advpngBuffer.length < bestSize * 0.99) {
+          bestBuffer = advpngBuffer;
+          bestSize = advpngBuffer.length;
           logger.info('AdvPNG provided additional reduction');
         } else {
           logger.info('AdvPNG skipped - minimal benefit');
         }
       }
 
-      const finalSize = currentBuffer.length;
-      const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
+      // SAFETY CHECK: Never return a buffer larger than the original
+      if (bestSize > originalSize) {
+        logger.warn('Compressed size larger than original, returning original buffer');
+        bestBuffer = buffer;
+        bestSize = originalSize;
+      }
+
+      const compressionRatio = ((originalSize - bestSize) / originalSize * 100).toFixed(1);
       const processingTime = Date.now() - startTime;
 
       logger.info('PNG compression completed', {
         originalSize,
-        finalSize,
+        finalSize: bestSize,
         compressionRatio: `${compressionRatio}%`,
         strategy,
         processingTime: `${processingTime}ms`,
@@ -445,37 +454,27 @@ class PngOptimizer {
       });
 
       return {
-        buffer: currentBuffer,
+        buffer: bestBuffer,
         originalSize,
-        compressedSize: finalSize,
+        compressedSize: bestSize,
         compressionRatio,
         strategy,
         analysis
       };
 
     } catch (error) {
-      logger.error('PNG compression failed, using Sharp fallback', {
+      logger.error('PNG compression failed, returning original buffer', {
         error: error.message,
         stack: error.stack
       });
 
-      // Fallback to Sharp
-      const fallbackBuffer = await sharp(buffer)
-        .png({
-          compressionLevel: 9,
-          adaptiveFiltering: true,
-          palette: true,
-          quality: 80,
-          effort: 10
-        })
-        .toBuffer();
-
+      // Return original buffer if everything fails
       return {
-        buffer: fallbackBuffer,
+        buffer: buffer,
         originalSize,
-        compressedSize: fallbackBuffer.length,
-        compressionRatio: ((originalSize - fallbackBuffer.length) / originalSize * 100).toFixed(1),
-        strategy: 'fallback-sharp',
+        compressedSize: originalSize,
+        compressionRatio: '0.0',
+        strategy: 'failed-original-returned',
         analysis: null
       };
     }
