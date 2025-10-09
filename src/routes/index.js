@@ -31,7 +31,8 @@ router.get('/', basicRateLimit, (req, res) => {
       contact: '/api/contact',
       subscribe: '/api/subscribe',
       ogImage: '/api/og-image',
-      httpHeaders: '/api/http-headers'
+      httpHeaders: '/api/http-headers',
+      webhooks: '/api/webhooks'
       // Add more endpoints as they are created
       // auth: '/api/v1/auth',
       // upload: '/api/v1/upload',
@@ -222,8 +223,10 @@ const canonicalRoutes = require('./canonical');
 const corsRoutes = require('./cors');
 const ogImageRoutes = require('./ogImageRoutes');
 const httpHeadersRoutes = require('./httpHeaders');
+const { router: webhookRoutes } = require('./webhook');
 
 // Register routes
+router.use('/webhooks', webhookRoutes);
 router.use('/ai', aiRoutes);
 router.use('/compress', compressRoutes);
 router.use('/convert', convertRoutes);

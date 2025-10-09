@@ -95,19 +95,18 @@ const verifyApiKey = async (req, res, next) => {
       });
     }
 
-    // In a real application, you would validate the API key against a database
-    // For now, we'll use environment variables or a simple validation
-    const validApiKeys = (process.env.VALID_API_KEYS || '').split(',').filter(key => key.trim());
-    
-    if (validApiKeys.length === 0) {
-      logger.error('No valid API keys configured');
+    // Validate against single API key from environment
+    const validApiKey = process.env.VALID_API_KEY;
+
+    if (!validApiKey) {
+      logger.error('No valid API key configured');
       return res.status(500).json({
         success: false,
         message: 'API key validation not configured'
       });
     }
 
-    if (!validApiKeys.includes(apiKey)) {
+    if (apiKey !== validApiKey) {
       logger.securityLog('Invalid API key used', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),

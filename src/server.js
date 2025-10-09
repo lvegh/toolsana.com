@@ -67,14 +67,18 @@ app.get('/health', (req, res) => {
 try {
   const healthRoutes = require('./routes/health');
   const apiRoutes = require('./routes');
-  
+  const { webhookReceiver } = require('./routes/webhook');
+
   // Health check routes
   app.use(healthRoutes);
-  
+
+  // Webhook receiver route (not under /api prefix)
+  app.all('/webhook/:id', webhookReceiver);
+
   // API routes
   const API_PREFIX = process.env.API_PREFIX || '/api';
   app.use(API_PREFIX, apiRoutes);
-  
+
   logger.info('Routes loaded successfully');
 } catch (error) {
   logger.error('Error loading routes:', error);
