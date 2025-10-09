@@ -208,7 +208,7 @@ router.get('/docs', basicRateLimit, (req, res) => {
   sendSuccess(res, 'API documentation', docs);
 });
 
-// Import and use route modules as they are created
+// Import and use route modules as they are created2
 const aiRoutes = require('./ai');
 const compressRoutes = require('./compress');
 const convertRoutes = require('./convert');
