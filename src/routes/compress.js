@@ -97,9 +97,6 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
         quality,
         chromaSubsampling: '4:2:0',
         mozjpeg: true, // Use mozjpeg encoder for better compression
-        trellisQuantisation: true, // Better compression through trellis optimization
-        overshootDeringing: true, // Reduces compression artifacts
-        optimizeScans: true, // Optimizes progressive JPEG scans
       })
       .toBuffer();
 
@@ -350,9 +347,6 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
             quality,
             chromaSubsampling: '4:2:0',
             mozjpeg: true,
-            trellisQuantisation: true, // Better compression through trellis optimization
-            overshootDeringing: true, // Reduces compression artifacts
-            optimizeScans: true, // Optimizes progressive JPEG scans
           })
           .toBuffer();
 
