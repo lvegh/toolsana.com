@@ -71,8 +71,8 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       return sendError(res, 'No file provided', 400);
     }
 
-    // Get quality parameter (default to 80)
-    const quality = parseInt(req.body.quality) || 80;
+    // Get quality parameter (default to 75)
+    const quality = parseInt(req.body.quality) || 75;
 
     // Validate quality range
     if (quality < 1 || quality > 100) {
@@ -317,7 +317,7 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
       return sendError(res, 'No files provided', 400);
     }
 
-    const quality = parseInt(req.body.quality) || 80;
+    const quality = parseInt(req.body.quality) || 75;
 
     if (quality < 1 || quality > 100) {
       return sendError(res, 'Quality must be between 1 and 100', 400);
@@ -440,7 +440,7 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
         contentType: 'multipart/form-data',
         fields: {
           file: 'JPG/JPEG image file (required)',
-          quality: 'Compression quality 1-100 (optional, default: 80)'
+          quality: 'Compression quality 1-100 (optional, default: 75)'
         },
         response: 'Compressed image file with compression headers'
       },
@@ -460,7 +460,7 @@ router.get('/info', enhancedSecurityWithRateLimit(basicRateLimit), (req, res) =>
         contentType: 'multipart/form-data',
         fields: {
           files: 'Array of JPG/JPEG image files (required, max 5)',
-          quality: 'Compression quality 1-100 (optional, default: 80)'
+          quality: 'Compression quality 1-100 (optional, default: 75)'
         },
         response: 'JSON with compressed images as base64 and statistics'
       }
