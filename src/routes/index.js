@@ -32,7 +32,8 @@ router.get('/', basicRateLimit, (req, res) => {
       subscribe: '/api/subscribe',
       ogImage: '/api/og-image',
       httpHeaders: '/api/http-headers',
-      webhooks: '/api/webhooks'
+      webhooks: '/api/webhooks',
+      htmlValidator: '/api/html-validator'
       // Add more endpoints as they are created
       // auth: '/api/v1/auth',
       // upload: '/api/v1/upload',
@@ -224,6 +225,7 @@ const corsRoutes = require('./cors');
 const ogImageRoutes = require('./ogImageRoutes');
 const httpHeadersRoutes = require('./httpHeaders');
 const { router: webhookRoutes } = require('./webhook');
+const htmlValidatorRoutes = require('./htmlValidator');
 
 // Register routes
 router.use('/webhooks', webhookRoutes);
@@ -242,6 +244,7 @@ router.use('/subscribe', subscribeRoutes);
 router.use('/og-image', ogImageRoutes);
 router.use('/og', ogImageRoutes); // Also handle /api/og/* routes
 router.use('/http-headers', httpHeadersRoutes);
+router.use('/html-validator', htmlValidatorRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
