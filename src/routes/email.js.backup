@@ -1,0 +1,649 @@
+const express = require('express');
+const nodemailer = require('nodemailer');
+const { createCustomRateLimit } = require('../middleware/rateLimit');
+const { sendSuccess, sendError, AppError } = require('../middleware/errorHandler');
+const logger = require('../utils/logger');
+const { body, validationResult } = require('express-validator');
+const { redisUtils } = require('../config/redis');
+const { analyzeSPFRecord } = require('../services/spfParser');
+
+const router = express.Router();
+
+/**
+ * Aggressive rate limiter for SMTP testing
+ * 10 tests per hour per user to prevent abuse
+ */
+const smtpTestRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  message: {
+    success: false,
+    message: 'Too many SMTP test requests. You can perform 10 tests per hour. Please try again later.',
+    retryAfter: 3600
+  },
+  keyGenerator: (req) => {
+    // Combine IP + User-Agent for more specific rate limiting
+    return `smtp-test:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+  },
+  handler: (req, res) => {
+    logger.securityLog('SMTP test rate limit exceeded', {
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      url: req.originalUrl,
+      method: req.method
+    });
+
+    res.status(429).json({
+      success: false,
+      message: 'Too many SMTP test requests. You can perform 10 tests per hour. Please try again later.',
+      retryAfter: 3600
+    });
+  }
+});
+
+/**
+ * Rate limiter for SPF checker
+ * 30 requests per hour per user
+ */
+const spfCheckerRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30,
+  message: {
+    success: false,
+    message: 'Too many SPF checker requests. You can perform 30 checks per hour. Please try again later.',
+    retryAfter: 3600
+  },
+  keyGenerator: (req) => {
+    return `spf-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+  },
+  handler: (req, res) => {
+    logger.securityLog('SPF checker rate limit exceeded', {
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      url: req.originalUrl,
+      method: req.method
+    });
+
+    res.status(429).json({
+      success: false,
+      message: 'Too many SPF checker requests. You can perform 30 checks per hour. Please try again later.',
+      retryAfter: 3600
+    });
+  }
+});
+
+/**
+ * Validation rules for SMTP test endpoint
+ */
+const smtpTestValidation = [
+  body('host')
+    .trim()
+    .notEmpty()
+    .withMessage('SMTP host is required')
+    .isLength({ max: 255 })
+    .withMessage('Host must not exceed 255 characters')
+    .matches(/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$/)
+    .withMessage('Invalid host format'),
+
+  body('port')
+    .isInt({ min: 1, max: 65535 })
+    .withMessage('Port must be between 1 and 65535'),
+
+  body('secure')
+    .optional()
+    .isBoolean()
+    .withMessage('Secure must be a boolean'),
+
+  body('requireTLS')
+    .optional()
+    .isBoolean()
+    .withMessage('requireTLS must be a boolean'),
+
+  body('auth.user')
+    .optional()
+    .trim()
+    .isLength({ max: 255 })
+    .withMessage('Username must not exceed 255 characters'),
+
+  body('auth.pass')
+    .optional()
+    .isString()
+    .withMessage('Password must be a string'),
+
+  body('testEmail.from')
+    .optional()
+    .trim()
+    .isEmail()
+    .withMessage('Invalid from email address')
+    .normalizeEmail(),
+
+  body('testEmail.to')
+    .optional()
+    .trim()
+    .isEmail()
+    .withMessage('Invalid to email address')
+    .normalizeEmail(),
+
+  body('testEmail.subject')
+    .optional()
+    .trim()
+    .isLength({ max: 255 })
+    .withMessage('Subject must not exceed 255 characters'),
+
+  body('testEmail.text')
+    .optional()
+    .trim()
+    .isLength({ max: 10000 })
+    .withMessage('Email text must not exceed 10000 characters')
+];
+
+/**
+ * Validation rules for SPF checker endpoint
+ */
+const spfCheckerValidation = [
+  body('domain')
+    .trim()
+    .notEmpty()
+    .withMessage('Domain is required')
+    .isLength({ max: 255 })
+    .withMessage('Domain must not exceed 255 characters')
+    .matches(/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$/)
+    .withMessage('Invalid domain format')
+    .customSanitizer(value => {
+      // Remove protocol if present
+      let clean = value.replace(/^https?:\/\//, '');
+      // Remove path if present
+      clean = clean.replace(/\/.*$/, '');
+      // Remove port if present
+      clean = clean.replace(/:.*$/, '');
+      return clean.toLowerCase();
+    })
+];
+
+/**
+ * Handle validation errors
+ */
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    logger.securityLog('SMTP test validation errors', {
+      errors: errors.array(),
+      ip: req.ip,
+      url: req.originalUrl
+    });
+
+    return sendError(res, 'Validation failed', 400, errors.array().map(err => ({
+      field: err.path,
+      message: err.msg,
+      value: err.value
+    })));
+  }
+  next();
+};
+
+/**
+ * Detect insecure configurations
+ */
+function detectInsecureConfigurations(config) {
+  const warnings = [];
+
+  // Check for plain text authentication without TLS
+  if (config.auth && config.auth.user && config.auth.pass) {
+    if (!config.secure && !config.requireTLS) {
+      warnings.push({
+        severity: 'high',
+        message: 'Plain text authentication without TLS/SSL encryption. Credentials may be exposed.',
+        recommendation: 'Enable secure (SSL) or requireTLS (STARTTLS) option.'
+      });
+    }
+  }
+
+  // Check for common insecure ports
+  if (config.port === 25 && !config.secure) {
+    warnings.push({
+      severity: 'medium',
+      message: 'Using port 25 (SMTP) without encryption. Often blocked by ISPs.',
+      recommendation: 'Use port 587 with STARTTLS or port 465 with SSL.'
+    });
+  }
+
+  // Check for deprecated SSL port without secure flag
+  if (config.port === 465 && !config.secure) {
+    warnings.push({
+      severity: 'medium',
+      message: 'Port 465 typically requires SSL encryption.',
+      recommendation: 'Set secure: true for port 465.'
+    });
+  }
+
+  // Check for submission port without TLS
+  if (config.port === 587 && !config.requireTLS && !config.secure) {
+    warnings.push({
+      severity: 'medium',
+      message: 'Port 587 (submission) typically requires STARTTLS.',
+      recommendation: 'Set requireTLS: true for port 587.'
+    });
+  }
+
+  // Warn about self-signed certificates
+  if (config.tls && config.tls.rejectUnauthorized === false) {
+    warnings.push({
+      severity: 'high',
+      message: 'Self-signed or invalid certificates accepted. Vulnerable to MITM attacks.',
+      recommendation: 'Use valid SSL/TLS certificates from trusted CAs.'
+    });
+  }
+
+  return warnings;
+}
+
+/**
+ * Test SMTP connection with comprehensive checks
+ */
+async function testSMTPConnection(config, testEmail = null) {
+  const startTime = Date.now();
+  const results = {
+    connection: { success: false, message: '', responseTime: 0 },
+    authentication: { success: false, message: '' },
+    tls: { enabled: false },
+    testEmail: { sent: false },
+    warnings: [],
+    testedAt: new Date().toISOString()
+  };
+
+  let transporter = null;
+
+  try {
+    // Detect insecure configurations
+    results.warnings = detectInsecureConfigurations(config);
+
+    // Create transporter with timeout
+    const transporterConfig = {
+      host: config.host,
+      port: config.port,
+      secure: config.secure || false,
+      requireTLS: config.requireTLS || false,
+      connectionTimeout: 10000, // 10 seconds
+      greetingTimeout: 10000,
+      socketTimeout: 10000,
+      tls: {
+        rejectUnauthorized: true, // Always validate certificates
+        minVersion: 'TLSv1.2' // Enforce minimum TLS version
+      }
+    };
+
+    // Add authentication if provided
+    if (config.auth && config.auth.user) {
+      transporterConfig.auth = {
+        user: config.auth.user,
+        pass: config.auth.pass || ''
+      };
+    }
+
+    // Create transporter
+    transporter = nodemailer.createTransport(transporterConfig);
+
+    // Test connection
+    logger.info('Testing SMTP connection', {
+      host: config.host,
+      port: config.port,
+      secure: config.secure,
+      hasAuth: !!config.auth
+    });
+
+    await transporter.verify();
+
+    const connectionTime = Date.now() - startTime;
+
+    results.connection = {
+      success: true,
+      message: 'Successfully connected to SMTP server',
+      responseTime: connectionTime
+    };
+
+    // Test authentication if credentials provided
+    if (config.auth && config.auth.user) {
+      results.authentication = {
+        success: true,
+        message: 'Authentication successful'
+      };
+    } else {
+      results.authentication = {
+        success: true,
+        message: 'No authentication credentials provided (connection test only)'
+      };
+    }
+
+    // Get TLS/SSL information from connection
+    if (transporter.transporter && transporter.transporter.options) {
+      const options = transporter.transporter.options;
+      results.tls = {
+        enabled: options.secure || options.requireTLS || false,
+        protocol: options.secure ? 'SSL/TLS' : (options.requireTLS ? 'STARTTLS' : 'None'),
+        port: options.port,
+        secureConnection: options.secure || false,
+        requireTLS: options.requireTLS || false
+      };
+
+      // Add certificate information if available
+      if (transporter.transporter.socket && transporter.transporter.socket.getPeerCertificate) {
+        try {
+          const cert = transporter.transporter.socket.getPeerCertificate();
+          if (cert && cert.subject) {
+            results.tls.certificate = {
+              subject: cert.subject.CN,
+              issuer: cert.issuer.O || cert.issuer.CN,
+              validFrom: cert.valid_from,
+              validTo: cert.valid_to,
+              fingerprint: cert.fingerprint
+            };
+          }
+        } catch (certError) {
+          logger.debug('Could not retrieve certificate information', certError);
+        }
+      }
+    }
+
+    // Send test email if requested and credentials provided
+    if (testEmail && testEmail.from && testEmail.to && config.auth && config.auth.user) {
+      try {
+        const mailOptions = {
+          from: testEmail.from,
+          to: testEmail.to,
+          subject: testEmail.subject || 'SMTP Test Email from Toolsana',
+          text: testEmail.text || 'This is a test email from Toolsana SMTP Tester. If you received this, your SMTP configuration is working correctly.',
+          html: `
+            <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px;">
+              <h2 style="color: #2563eb;">SMTP Test Successful</h2>
+              <p>${testEmail.text || 'This is a test email from Toolsana SMTP Tester. If you received this, your SMTP configuration is working correctly.'}</p>
+              <hr style="border: 1px solid #e5e7eb; margin: 20px 0;">
+              <p style="color: #6b7280; font-size: 12px;">
+                Tested at: ${new Date().toISOString()}<br>
+                Host: ${config.host}<br>
+                Port: ${config.port}<br>
+                Security: ${results.tls.protocol}
+              </p>
+              <p style="color: #6b7280; font-size: 12px;">
+                Sent via <a href="https://toolsana.com" style="color: #2563eb;">Toolsana SMTP Tester</a>
+              </p>
+            </div>
+          `
+        };
+
+        const info = await transporter.sendMail(mailOptions);
+
+        results.testEmail = {
+          sent: true,
+          messageId: info.messageId,
+          accepted: info.accepted,
+          rejected: info.rejected,
+          response: info.response
+        };
+
+        logger.info('Test email sent successfully', {
+          messageId: info.messageId,
+          from: testEmail.from,
+          to: testEmail.to
+        });
+      } catch (emailError) {
+        results.testEmail = {
+          sent: false,
+          error: emailError.message,
+          code: emailError.code
+        };
+
+        logger.warn('Failed to send test email', {
+          error: emailError.message,
+          code: emailError.code
+        });
+      }
+    }
+
+    return results;
+
+  } catch (error) {
+    const connectionTime = Date.now() - startTime;
+
+    // Provide helpful error messages
+    let errorMessage = 'Connection failed';
+    let errorDetails = error.message;
+
+    if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+      errorMessage = 'Connection timeout';
+      errorDetails = 'Could not connect to SMTP server within 10 seconds. Check host and port.';
+    } else if (error.code === 'ECONNREFUSED') {
+      errorMessage = 'Connection refused';
+      errorDetails = 'SMTP server refused the connection. Check if the host and port are correct.';
+    } else if (error.code === 'ENOTFOUND') {
+      errorMessage = 'Host not found';
+      errorDetails = 'Could not resolve SMTP host. Check if the hostname is correct.';
+    } else if (error.responseCode === 535 || error.message.includes('authentication')) {
+      errorMessage = 'Authentication failed';
+      errorDetails = 'Invalid username or password. Check your credentials.';
+    } else if (error.message.includes('certificate')) {
+      errorMessage = 'TLS/SSL certificate error';
+      errorDetails = 'Invalid or self-signed certificate. Use a valid certificate from a trusted CA.';
+      results.warnings.push({
+        severity: 'high',
+        message: 'SSL/TLS certificate validation failed.',
+        recommendation: 'Ensure the server has a valid certificate from a trusted Certificate Authority.'
+      });
+    } else if (error.message.includes('STARTTLS')) {
+      errorMessage = 'STARTTLS negotiation failed';
+      errorDetails = 'Could not establish secure connection. Check TLS configuration.';
+    }
+
+    results.connection = {
+      success: false,
+      message: errorMessage,
+      details: errorDetails,
+      responseTime: connectionTime,
+      errorCode: error.code,
+      responseCode: error.responseCode
+    };
+
+    results.authentication = {
+      success: false,
+      message: 'Not tested due to connection failure'
+    };
+
+    logger.warn('SMTP connection test failed', {
+      host: config.host,
+      port: config.port,
+      error: error.message,
+      code: error.code,
+      responseCode: error.responseCode
+    });
+
+    return results;
+
+  } finally {
+    // Close transporter
+    if (transporter) {
+      try {
+        transporter.close();
+      } catch (closeError) {
+        logger.debug('Error closing transporter', closeError);
+      }
+    }
+  }
+}
+
+/**
+ * POST /api/email/smtp-test
+ * Test SMTP server configuration
+ */
+router.post('/smtp-test',
+  smtpTestRateLimit,
+  smtpTestValidation,
+  handleValidationErrors,
+  async (req, res) => {
+    const requestId = `smtp-test-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    try {
+      const { host, port, secure, requireTLS, auth, testEmail } = req.body;
+
+      // SECURITY: Never log passwords
+      logger.info('SMTP test request received', {
+        requestId,
+        host,
+        port,
+        secure: !!secure,
+        requireTLS: !!requireTLS,
+        hasAuth: !!auth,
+        hasUsername: !!(auth && auth.user),
+        testEmailRequested: !!testEmail,
+        ip: req.ip,
+        userAgent: req.get('User-Agent')
+      });
+
+      // Additional security check: prevent testing local/private networks
+      const suspiciousHosts = [
+        /localhost/i,
+        /127\./,
+        /0\.0\.0\.0/,
+        /169\.254\./, // Link-local
+        /192\.168\./, // Private network
+        /10\./, // Private network
+        /172\.(1[6-9]|2[0-9]|3[0-1])\./, // Private network
+        /::1/, // IPv6 localhost
+        /fe80::/i // IPv6 link-local
+      ];
+
+      for (const pattern of suspiciousHosts) {
+        if (pattern.test(host)) {
+          logger.securityLog('Suspicious SMTP host detected', {
+            requestId,
+            host,
+            ip: req.ip,
+            userAgent: req.get('User-Agent')
+          });
+
+          return sendError(res, 'Testing local or private network SMTP servers is not allowed for security reasons', 403);
+        }
+      }
+
+      // Perform SMTP test
+      const testResults = await testSMTPConnection(
+        { host, port, secure, requireTLS, auth },
+        testEmail
+      );
+
+      // Log results (without sensitive data)
+      logger.info('SMTP test completed', {
+        requestId,
+        host,
+        port,
+        connectionSuccess: testResults.connection.success,
+        authSuccess: testResults.authentication.success,
+        emailSent: testResults.testEmail.sent,
+        warningCount: testResults.warnings.length,
+        responseTime: testResults.connection.responseTime
+      });
+
+      // Return results
+      return sendSuccess(res, 'SMTP test completed', testResults);
+
+    } catch (error) {
+      logger.error('SMTP test error', {
+        requestId,
+        error: error.message,
+        stack: error.stack,
+        ip: req.ip
+      });
+
+      return sendError(res, 'An error occurred during SMTP testing', 500);
+    }
+  }
+);
+
+/**
+ * GET /api/email/info
+ * Get information about the email testing API
+ */
+router.get('/info', async (req, res) => {
+  const info = {
+    name: 'Email Testing API',
+    version: '1.0.0',
+    description: 'Test SMTP server configurations with comprehensive security checks',
+    endpoints: {
+      smtpTest: {
+        method: 'POST',
+        path: '/api/email/smtp-test',
+        description: 'Test SMTP server connection, authentication, and optionally send a test email',
+        rateLimit: '10 requests per hour per user',
+        timeout: '10 seconds per test'
+      }
+    },
+    features: [
+      'SMTP connection testing',
+      'Authentication verification',
+      'TLS/SSL certificate validation',
+      'Optional test email sending',
+      'Insecure configuration detection',
+      'Comprehensive error messages',
+      'Security warnings and recommendations'
+    ],
+    commonPorts: {
+      25: 'SMTP (often blocked by ISPs, unencrypted)',
+      465: 'SMTPS (SSL/TLS encryption)',
+      587: 'SMTP Submission (STARTTLS encryption)',
+      2525: 'Alternative SMTP (some providers)'
+    },
+    securityFeatures: [
+      'Rate limiting (10 tests/hour)',
+      'Input validation and sanitization',
+      'Private network testing blocked',
+      'Password never logged',
+      'TLS certificate validation',
+      'Minimum TLS version enforcement (TLSv1.2+)',
+      'Insecure configuration warnings'
+    ],
+    requestExample: {
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false,
+      requireTLS: true,
+      auth: {
+        user: 'your-email@gmail.com',
+        pass: 'your-app-password'
+      },
+      testEmail: {
+        from: 'your-email@gmail.com',
+        to: 'recipient@example.com',
+        subject: 'Test Email',
+        text: 'This is a test email'
+      }
+    },
+    responseExample: {
+      connection: {
+        success: true,
+        message: 'Successfully connected to SMTP server',
+        responseTime: 234
+      },
+      authentication: {
+        success: true,
+        message: 'Authentication successful'
+      },
+      tls: {
+        enabled: true,
+        protocol: 'STARTTLS',
+        port: 587,
+        secureConnection: false,
+        requireTLS: true
+      },
+      testEmail: {
+        sent: true,
+        messageId: '<abc123@example.com>',
+        accepted: ['recipient@example.com'],
+        rejected: []
+      },
+      warnings: [],
+      testedAt: '2025-01-15T10:30:00Z'
+    }
+  };
+
+  return sendSuccess(res, 'Email API information retrieved', info);
+});
+
+module.exports = router;
