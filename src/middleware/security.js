@@ -12,7 +12,7 @@ const xssProtection = (req, res, next) => {
   if (req.body && typeof req.body === 'object') {
     const sanitizeObject = (obj) => {
       for (const key in obj) {
-        if (obj.hasOwnProperty(key)) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
           if (typeof obj[key] === 'string') {
             obj[key] = xss(obj[key]);
           } else if (typeof obj[key] === 'object' && obj[key] !== null) {
@@ -27,7 +27,7 @@ const xssProtection = (req, res, next) => {
   // Sanitize query parameters
   if (req.query && typeof req.query === 'object') {
     for (const key in req.query) {
-      if (req.query.hasOwnProperty(key) && typeof req.query[key] === 'string') {
+      if (Object.prototype.hasOwnProperty.call(req.query, key) && typeof req.query[key] === 'string') {
         req.query[key] = xss(req.query[key]);
       }
     }
@@ -125,10 +125,10 @@ const requestSizeLimiter = (req, res, next) => {
  */
 const suspiciousActivityDetection = (req, res, next) => {
   const suspiciousPatterns = [
-    /(\<|\%3C)script(.|\n)*?(\>|\%3E)/i,
-    /(\<|\%3C)iframe(.|\n)*?(\>|\%3E)/i,
-    /(\<|\%3C)object(.|\n)*?(\>|\%3E)/i,
-    /(\<|\%3C)embed(.|\n)*?(\>|\%3E)/i,
+    /(<|%3C)script(.|\n)*?(>|%3E)/i,
+    /(<|%3C)iframe(.|\n)*?(>|%3E)/i,
+    /(<|%3C)object(.|\n)*?(>|%3E)/i,
+    /(<|%3C)embed(.|\n)*?(>|%3E)/i,
     /javascript:/i,
     /vbscript:/i,
     /onload=/i,
@@ -165,7 +165,7 @@ const suspiciousActivityDetection = (req, res, next) => {
       }
     } else if (typeof obj === 'object' && obj !== null) {
       for (const key in obj) {
-        if (obj.hasOwnProperty(key)) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
           if (checkForSuspiciousContent(obj[key], `${path}.${key}`)) {
             return true;
           }

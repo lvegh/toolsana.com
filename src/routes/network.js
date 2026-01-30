@@ -55,7 +55,7 @@ function validateAsn(asn) {
   }
 
   // Convert to string and clean
-  let cleanAsn = String(asn).trim().toUpperCase();
+  const cleanAsn = String(asn).trim().toUpperCase();
 
   // Security: Check for suspicious patterns
   const suspiciousPatterns = [
@@ -277,7 +277,7 @@ function validateAndNormalizeMac(mac) {
   }
 
   // Clean MAC address - remove whitespace
-  let cleanMac = mac.trim().toUpperCase();
+  const cleanMac = mac.trim().toUpperCase();
 
   // Security: Check for suspicious patterns
   const suspiciousPatterns = [
@@ -297,7 +297,7 @@ function validateAndNormalizeMac(mac) {
   }
 
   // Remove all separators to get the plain format
-  const plainMac = cleanMac.replace(/[:\-\.]/g, '');
+  const plainMac = cleanMac.replace(/[:\-.]/g, '');
 
   // Validate length (should be exactly 12 hex characters)
   if (plainMac.length !== 12) {

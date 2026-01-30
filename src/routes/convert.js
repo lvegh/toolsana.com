@@ -316,7 +316,7 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
     // Convert if different format requested
     if (outputFormat && outputFormat !== metadata.format) {
       try {
-        let sharpInstance = sharp(imageBuffer);
+        const sharpInstance = sharp(imageBuffer);
         
         switch (outputFormat.toLowerCase()) {
           case 'png':

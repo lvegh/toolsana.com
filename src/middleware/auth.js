@@ -228,11 +228,7 @@ const generateRefreshToken = (payload) => {
  * Verify Refresh Token
  */
 const verifyRefreshToken = (token) => {
-  try {
-    return jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-  } catch (error) {
-    throw error;
-  }
+  return jwt.verify(token, process.env.JWT_REFRESH_SECRET);
 };
 
 /**

@@ -236,8 +236,8 @@ function extractTimestamp(receivedHeader) {
  */
 function extractServer(receivedHeader) {
   // Look for "from" or "by" server names
-  const fromMatch = receivedHeader.match(/from\s+([^\s\(]+)/i);
-  const byMatch = receivedHeader.match(/by\s+([^\s\(]+)/i);
+  const fromMatch = receivedHeader.match(/from\s+([^\s(]+)/i);
+  const byMatch = receivedHeader.match(/by\s+([^\s(]+)/i);
 
   return fromMatch?.[1] || byMatch?.[1] || 'unknown';
 }

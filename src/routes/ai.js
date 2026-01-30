@@ -48,6 +48,10 @@ let processingStartTime = null;
 
 router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit), uploadImage.single('file'), async (req, res) => {
 
+    let originalBuffer = null;
+    let inputForProcessing = null;
+    let processedBuffer = null;
+
     try {
         // Check if file was uploaded
         if (!req.file) {
@@ -62,7 +66,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
         processingStartTime = Date.now();
 
         // Extract request parameters
-        const originalBuffer = req.file.buffer;
+        originalBuffer = req.file.buffer;
         const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
         const model = req.body.model || 'medium';
         const outputFormat = req.body.outputFormat || 'png';
@@ -70,7 +74,7 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
 
         // Create Blob with MIME type
         const { Blob } = require('buffer');
-        const inputForProcessing = new Blob([originalBuffer], { type: req.file.mimetype });
+        inputForProcessing = new Blob([originalBuffer], { type: req.file.mimetype });
 
         // Configure IMG.LY background removal
         const config = {
@@ -85,7 +89,6 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
 
         // Process the image
         const startTime = Date.now();
-        let processedBuffer;
 
         try {
             // Set up timeout

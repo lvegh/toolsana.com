@@ -30,7 +30,7 @@ const extractCanonicalUrl = (html, baseUrl) => {
     const canonicalRegex = /<link[^>]*rel\s*=\s*["']canonical["'][^>]*href\s*=\s*["']([^"']+)["'][^>]*>/i;
     const altCanonicalRegex = /<link[^>]*href\s*=\s*["']([^"']+)["'][^>]*rel\s*=\s*["']canonical["'][^>]*>/i;
     
-    let match = html.match(canonicalRegex) || html.match(altCanonicalRegex);
+    const match = html.match(canonicalRegex) || html.match(altCanonicalRegex);
     
     if (!match) {
       return null;
