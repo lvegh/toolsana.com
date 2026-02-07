@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'toolzyhub-api',
       script: './src/server.js',
-      instances: 'max', // Use all available CPU cores
+      instances: 4,
       exec_mode: 'cluster',
       node_args: '--expose-gc --max-old-space-size=4096',
       max_memory_restart: '1G',
