@@ -33,7 +33,7 @@ class SecurityNotifier {
         return null;
       }
 
-      this.transporter = nodemailer.createTransporter({
+      this.transporter = nodemailer.createTransport({
         host: smtpHost,
         port: parseInt(smtpPort),
         secure: false,
