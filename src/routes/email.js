@@ -2,6 +2,7 @@ const express = require('express');
 const { simpleParser } = require('mailparser');
 const geoip = require('geoip-lite');
 const dns = require('dns').promises;
+const nodemailer = require('nodemailer');
 const { createCustomRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError, AppError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
@@ -1050,6 +1051,278 @@ router.get('/info', async (req, res) => {
   };
 
   return sendSuccess(res, 'Email API information retrieved', info);
+});
+
+/**
+ * Rate limit specifically for SMTP testing — tighter than SPF because each
+ * request makes a real outbound TCP connection and (optionally) sends a real email.
+ */
+const smtpTestRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  message: {
+    success: false,
+    message: 'Too many SMTP test requests. You can perform 10 tests per hour. Please try again later.',
+    retryAfter: 3600
+  },
+  keyGenerator: (req) => `smtp-test:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  handler: (req, res) => {
+    logger.securityLog('SMTP test rate limit exceeded', {
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      url: req.originalUrl,
+      method: req.method
+    });
+    res.status(429).json({
+      success: false,
+      message: 'Too many SMTP test requests. You can perform 10 tests per hour. Please try again later.',
+      retryAfter: 3600
+    });
+  }
+});
+
+/**
+ * Reject hosts that point at private/loopback/link-local space, both by direct
+ * IP literal and by DNS resolution. Prevents the SMTP tester from being used
+ * as an internal-network port-scanner / SSRF tool.
+ */
+async function isPublicHost(hostname) {
+  const isPrivateIp = (ip) => {
+    if (!ip) return false;
+    if (ip.includes(':')) {
+      // Simple IPv6 reject for loopback / link-local / ULA
+      const l = ip.toLowerCase();
+      return l === '::1' || l.startsWith('fe80:') || l.startsWith('fc') || l.startsWith('fd');
+    }
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return false;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 0) return true;
+    if (parts[0] >= 224) return true; // multicast / reserved
+    return false;
+  };
+
+  // If hostname is an IP literal, check directly
+  if (/^[\d.]+$/.test(hostname) || hostname.includes(':')) {
+    return !isPrivateIp(hostname);
+  }
+  // Otherwise resolve and check each address
+  try {
+    const addrs = await dns.lookup(hostname, { all: true });
+    if (!addrs || addrs.length === 0) return false;
+    return addrs.every(a => !isPrivateIp(a.address));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * POST /api/email/smtp-test
+ * Test an SMTP server's connection, authentication, TLS, and optionally send
+ * a test email. Two modes — `testMode: 'connection'` only verifies the
+ * handshake / auth; `testMode: 'send'` additionally delivers a small test message.
+ *
+ * Privacy: credentials and message content live only in the request scope.
+ * Never logged. Logs record outcome (success/fail/category) but never secrets.
+ */
+router.post('/smtp-test', smtpTestRateLimit, async (req, res) => {
+  const startTime = Date.now();
+  const {
+    hostname,
+    port,
+    security,
+    username,
+    password,
+    fromEmail,
+    toEmail,
+    testMode
+  } = req.body || {};
+
+  // ---- Validation ----
+  if (!hostname || typeof hostname !== 'string') {
+    return sendError(res, 'SMTP hostname is required', 400);
+  }
+  if (!/^[a-zA-Z0-9.\-:]+$/.test(hostname) || hostname.length > 253) {
+    return sendError(res, 'Invalid SMTP hostname format', 400);
+  }
+  const portNum = Number(port);
+  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+    return sendError(res, 'Invalid port: must be an integer between 1 and 65535', 400);
+  }
+  const sec = ['STARTTLS', 'TLS', 'NONE'].includes(security) ? security : 'STARTTLS';
+  const mode = testMode === 'send' ? 'send' : 'connection';
+
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (mode === 'send') {
+    if (!fromEmail || !emailRe.test(fromEmail)) {
+      return sendError(res, 'A valid From email is required for send mode', 400);
+    }
+    if (!toEmail || !emailRe.test(toEmail)) {
+      return sendError(res, 'A valid To email is required for send mode', 400);
+    }
+  } else if (fromEmail && !emailRe.test(fromEmail)) {
+    return sendError(res, 'From email is malformed', 400);
+  } else if (toEmail && !emailRe.test(toEmail)) {
+    return sendError(res, 'To email is malformed', 400);
+  }
+
+  // Block internal targets to prevent the tool being used as an SSRF probe.
+  const isPublic = await isPublicHost(hostname);
+  if (!isPublic) {
+    return sendError(res, 'Refusing to connect to private, loopback, or unresolvable host', 400);
+  }
+
+  // ---- Build transport config ----
+  const transportConfig = {
+    host: hostname,
+    port: portNum,
+    secure: sec === 'TLS' || portNum === 465,
+    requireTLS: sec === 'STARTTLS',
+    ignoreTLS: sec === 'NONE',
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
+  };
+  if (username && password) {
+    transportConfig.auth = { user: username, pass: password };
+  }
+
+  logger.info('SMTP test starting', {
+    ip: req.ip,
+    hostname,
+    port: portNum,
+    security: sec,
+    mode,
+    hasAuth: !!(username && password),
+  });
+
+  const transporter = nodemailer.createTransport(transportConfig);
+
+  // ---- Result skeleton ----
+  let connectionStatus = 'unknown';
+  let authenticationStatus = username && password ? 'unknown' : 'not_tested';
+  let sendStatus = mode === 'send' ? 'unknown' : 'not_tested';
+  let tlsInfo;
+  let serverResponse;
+  let errorMessage;
+  const warnings = [];
+
+  /**
+   * Map a nodemailer error into a categorised diagnostic outcome.
+   * nodemailer attaches `.code` (e.g. EAUTH, ESOCKET, ETLS, EENVELOPE, EMESSAGE)
+   * and `.responseCode` (the SMTP numeric status) where applicable.
+   */
+  const categoriseError = (err) => {
+    const code = err && err.code;
+    const response = err && (err.response || err.message);
+    serverResponse = typeof response === 'string' ? response.slice(0, 500) : undefined;
+    if (code === 'EAUTH') {
+      // Auth failed but the server clearly responded — connection + TLS handshake succeeded.
+      connectionStatus = 'success';
+      authenticationStatus = 'failed';
+      errorMessage = `Authentication failed: ${err.message}`;
+    } else if (code === 'ETLS' || code === 'ECONNECTION' || code === 'ESOCKET') {
+      connectionStatus = 'failed';
+      errorMessage = `Connection or TLS error: ${err.message}`;
+    } else if (code === 'EDNS') {
+      connectionStatus = 'failed';
+      errorMessage = `DNS resolution failed for ${hostname}: ${err.message}`;
+    } else if (code === 'EENVELOPE') {
+      // Got far enough to send MAIL FROM / RCPT TO — connection + auth succeeded.
+      connectionStatus = 'success';
+      if (username && password) authenticationStatus = 'success';
+      sendStatus = 'failed';
+      errorMessage = `Envelope rejected (FROM or TO refused): ${err.message}`;
+    } else if (code === 'EMESSAGE') {
+      connectionStatus = 'success';
+      if (username && password) authenticationStatus = 'success';
+      sendStatus = 'failed';
+      errorMessage = `Message content rejected: ${err.message}`;
+    } else {
+      connectionStatus = 'failed';
+      errorMessage = err && err.message ? err.message : 'Unknown SMTP error';
+    }
+  };
+
+  try {
+    // ---- Verify connection + auth ----
+    await transporter.verify();
+    connectionStatus = 'success';
+    if (username && password) authenticationStatus = 'success';
+
+    // Capture TLS info if the transport recorded a TLS handshake.
+    // nodemailer doesn't expose this through verify(), so we derive from config
+    // and known port conventions.
+    if (sec === 'TLS' || sec === 'STARTTLS' || portNum === 465) {
+      tlsInfo = {
+        enabled: true,
+        protocol: sec === 'TLS' || portNum === 465 ? 'TLS (implicit)' : 'STARTTLS',
+      };
+    } else {
+      tlsInfo = { enabled: false };
+      warnings.push('TLS is disabled — credentials and message content would be sent in plain text. Use STARTTLS (port 587) or TLS (port 465) for any production sending.');
+    }
+
+    if (mode === 'send') {
+      const subject = 'SMTP Test from Toolsana';
+      const text = `This is a test message sent by the Toolsana SMTP Test Tool at ${new Date().toISOString()}.\n\nIf you received this, your SMTP relay accepted authentication and delivered a test message successfully.\n\n— Toolsana`;
+      try {
+        const info = await transporter.sendMail({
+          from: fromEmail,
+          to: toEmail,
+          subject,
+          text,
+        });
+        sendStatus = 'success';
+        if (info && info.response) {
+          serverResponse = String(info.response).slice(0, 500);
+        }
+      } catch (sendErr) {
+        categoriseError(sendErr);
+      }
+    }
+  } catch (verifyErr) {
+    categoriseError(verifyErr);
+  }
+
+  // Optional advisory: Gmail / Microsoft typically need app passwords for SMTP auth.
+  const hostL = hostname.toLowerCase();
+  if (authenticationStatus === 'failed' && (hostL.includes('gmail.com') || hostL.includes('googlemail') || hostL.includes('office365') || hostL.includes('outlook'))) {
+    warnings.push('Gmail and Microsoft 365 require an "App Password" for SMTP — your regular account password will not work if the account has 2FA enabled.');
+  }
+
+  const processingTime = Date.now() - startTime;
+  const success = connectionStatus === 'success'
+    && (authenticationStatus === 'success' || authenticationStatus === 'not_tested')
+    && (sendStatus === 'success' || sendStatus === 'not_tested');
+
+  logger.info('SMTP test finished', {
+    ip: req.ip,
+    hostname,
+    port: portNum,
+    mode,
+    connectionStatus,
+    authenticationStatus,
+    sendStatus,
+    success,
+    processingTimeMs: processingTime,
+  });
+
+  return sendSuccess(res, 'SMTP test completed', {
+    success,
+    connectionStatus,
+    authenticationStatus,
+    sendStatus: mode === 'send' ? sendStatus : 'not_tested',
+    tlsInfo,
+    serverResponse,
+    errorMessage,
+    processingTime,
+    warnings,
+  });
 });
 
 module.exports = router;
