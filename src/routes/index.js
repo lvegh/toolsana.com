@@ -228,6 +228,9 @@ const httpHeadersRoutes = require('./httpHeaders');
 const { router: webhookRoutes } = require('./webhook');
 const htmlValidatorRoutes = require('./htmlValidator');
 const linkCheckerRoutes = require('./link-checker');
+const emailRoutes = require('./email');
+const dnsRoutes = require('./dns');
+const securityRoutes = require('./security');
 
 // Register routes
 router.use('/webhooks', webhookRoutes);
@@ -248,6 +251,9 @@ router.use('/og', ogImageRoutes); // Also handle /api/og/* routes
 router.use('/http-headers', httpHeadersRoutes);
 router.use('/html-validator', htmlValidatorRoutes);
 router.use('/link-checker', linkCheckerRoutes);
+router.use('/email', emailRoutes);
+router.use('/dns', dnsRoutes);
+router.use('/security', securityRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');

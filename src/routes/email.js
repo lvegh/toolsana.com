@@ -273,6 +273,7 @@ async function geolocateIP(ip) {
     city: geo.city || null,
     lat: geo.ll?.[0] || null,
     lon: geo.ll?.[1] || null,
+    postalCode: geo.metro ? String(geo.metro) : null,
     timezone: geo.timezone || null,
     cached: false
   };
@@ -284,33 +285,162 @@ async function geolocateIP(ip) {
 }
 
 /**
- * Get ASN/ISP information for IP
+ * Reverse DNS (PTR) lookup with Redis caching (7 day TTL).
+ * Returns the hostname or null on no record / error.
+ */
+async function getReverseDNS(ip) {
+  const cacheKey = `ptr:${ip}`;
+  const cached = await redisUtils.get(cacheKey);
+  if (cached !== null && cached !== undefined) return cached === '' ? null : cached;
+
+  try {
+    const records = await dns.reverse(ip);
+    const hostname = (records && records[0]) || null;
+    await redisUtils.setex(cacheKey, 604800, hostname || '');
+    return hostname;
+  } catch (error) {
+    // ENOTFOUND etc. — no PTR is valid (not an error)
+    await redisUtils.setex(cacheKey, 604800, '');
+    return null;
+  }
+}
+
+/**
+ * RDAP / WHOIS lookup via rdap.org (auto-routes to the correct RIR).
+ * Returns a normalised subset of fields plus the raw payload for "show full WHOIS".
+ * Cached in Redis for 24 hours.
+ */
+async function getRDAPInfo(ip) {
+  const cacheKey = `rdap:${ip}`;
+  const cached = await redisUtils.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch(`https://rdap.org/ip/${encodeURIComponent(ip)}`, {
+      headers: { 'Accept': 'application/rdap+json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      const empty = { organization: null, abuseContact: null, networkRange: null, networkName: null, registrationDate: null, registry: null, raw: null };
+      await redisUtils.setex(cacheKey, 86400, empty);
+      return empty;
+    }
+    const raw = await res.json();
+
+    // Extract organization name from entities (look for "registrant", then "abuse" contact, then any org with vCard)
+    let organization = null;
+    let abuseContact = null;
+    const walkEntities = (entities) => {
+      if (!Array.isArray(entities)) return;
+      for (const ent of entities) {
+        const roles = ent.roles || [];
+        const vcard = ent.vcardArray && ent.vcardArray[1];
+        if (Array.isArray(vcard)) {
+          for (const field of vcard) {
+            if (!Array.isArray(field)) continue;
+            const [name, , , value] = field;
+            if (name === 'fn' && !organization && (roles.includes('registrant') || roles.includes('administrative') || roles.length === 0)) {
+              organization = typeof value === 'string' ? value : null;
+            }
+            if (name === 'email' && roles.includes('abuse') && !abuseContact) {
+              abuseContact = typeof value === 'string' ? value : null;
+            }
+          }
+        }
+        // Recurse into nested entities (some RIRs nest the abuse contact)
+        if (ent.entities) walkEntities(ent.entities);
+      }
+    };
+    walkEntities(raw.entities);
+
+    // Network range / name
+    let networkRange = null;
+    if (raw.startAddress && raw.endAddress) {
+      networkRange = `${raw.startAddress} - ${raw.endAddress}`;
+    } else if (raw.handle) {
+      networkRange = raw.handle;
+    }
+    const networkName = raw.name || null;
+
+    // Registration date from events (look for "registration" or earliest event)
+    let registrationDate = null;
+    if (Array.isArray(raw.events)) {
+      const regEvent = raw.events.find(e => e.eventAction === 'registration')
+        || raw.events.find(e => e.eventAction === 'last changed');
+      if (regEvent) registrationDate = regEvent.eventDate || null;
+    }
+
+    // RIR / registry name
+    const registry = raw.port43 || (raw.notices && raw.notices[0]?.title) || null;
+
+    const info = {
+      organization,
+      abuseContact,
+      networkRange,
+      networkName,
+      registrationDate,
+      registry,
+      raw,
+    };
+
+    await redisUtils.setex(cacheKey, 86400, info);
+    return info;
+  } catch (error) {
+    logger.debug('RDAP lookup failed', { ip, error: error.message });
+    const empty = { organization: null, abuseContact: null, networkRange: null, networkName: null, registrationDate: null, registry: null, raw: null };
+    return empty;
+  }
+}
+
+/**
+ * Get ASN / organization name for an IP via Team Cymru.
+ *
+ * This requires TWO DNS queries:
+ *   1. `<reversed-ip>.origin.asn.cymru.com` returns:
+ *        AS_NUMBER | IP_PREFIX | COUNTRY | RIR | ALLOCATED_DATE
+ *      (parts[4] is the allocation date, NOT the org name — historic bug source)
+ *   2. `AS<num>.asn.cymru.com` returns:
+ *        AS_NUMBER | COUNTRY | RIR | ALLOCATED_DATE | ORG_NAME
+ *      (parts[4] here IS the org name, which is what we want to display)
  */
 async function getASNInfo(ip) {
   try {
-    // Use DNS-based ASN lookup (Team Cymru)
     const reversedIP = ip.split('.').reverse().join('.');
-    const query = `${reversedIP}.origin.asn.cymru.com`;
-
-    const txtRecords = await dns.resolveTxt(query);
-
-    if (txtRecords && txtRecords.length > 0) {
-      const record = txtRecords[0].join('');
-      const parts = record.split('|').map(p => p.trim());
-
-      if (parts.length >= 4) {
-        return {
-          asn: `AS${parts[0]}`,
-          isp: parts[4] || parts[3] || null
-        };
-      }
+    const originQuery = `${reversedIP}.origin.asn.cymru.com`;
+    const originTxt = await dns.resolveTxt(originQuery);
+    if (!originTxt || originTxt.length === 0) {
+      return { asn: null, isp: null };
     }
-  } catch (error) {
-    // ASN lookup failed, continue without it
-    logger.debug('ASN lookup failed for IP', { ip, error: error.message });
-  }
 
-  return { asn: null, isp: null };
+    const originRecord = originTxt[0].join('');
+    const originParts = originRecord.split('|').map(p => p.trim());
+    const asNumber = originParts[0];
+    if (!asNumber) {
+      return { asn: null, isp: null };
+    }
+    const asn = `AS${asNumber}`;
+
+    // Second lookup to resolve the organization name behind the AS number.
+    try {
+      const orgQuery = `AS${asNumber}.asn.cymru.com`;
+      const orgTxt = await dns.resolveTxt(orgQuery);
+      if (orgTxt && orgTxt.length > 0) {
+        const orgRecord = orgTxt[0].join('');
+        const orgParts = orgRecord.split('|').map(p => p.trim());
+        if (orgParts.length >= 5 && orgParts[4]) {
+          return { asn, isp: orgParts[4] };
+        }
+      }
+    } catch (orgError) {
+      logger.debug('ASN org-name lookup failed', { ip, asn, error: orgError.message });
+    }
+
+    // Fall back to just the AS number if the org-name lookup didn't yield one.
+    return { asn, isp: null };
+  } catch (error) {
+    logger.debug('ASN lookup failed for IP', { ip, error: error.message });
+    return { asn: null, isp: null };
+  }
 }
 
 /**
@@ -475,24 +605,38 @@ router.post('/trace-email',
         if (ip && !allIPs.has(ip)) {
           allIPs.add(ip);
 
-          const [location, asnInfo] = await Promise.all([
+          const [location, asnInfo, hostname, whois] = await Promise.all([
             geolocateIP(ip),
-            getASNInfo(ip)
+            getASNInfo(ip),
+            getReverseDNS(ip),
+            getRDAPInfo(ip),
           ]);
 
           route.push({
             timestamp,
             server,
             ip,
+            hostname,
             location: {
               country: location.country,
               region: location.region,
               city: location.city,
               lat: location.lat,
-              lon: location.lon
+              lon: location.lon,
+              postalCode: location.postalCode || null,
+              timezone: location.timezone || null,
             },
             isp: asnInfo.isp,
-            asn: asnInfo.asn
+            asn: asnInfo.asn,
+            whois: {
+              organization: whois.organization,
+              abuseContact: whois.abuseContact,
+              networkRange: whois.networkRange,
+              networkName: whois.networkName,
+              registrationDate: whois.registrationDate,
+              registry: whois.registry,
+              raw: whois.raw,
+            },
           });
         }
       }

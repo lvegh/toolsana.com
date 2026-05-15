@@ -59,13 +59,7 @@ const DNSBL_SERVICES = [
     delistUrl: 'https://www.spamhaus.org/lookup/',
     description: 'Policy block list'
   },
-  {
-    name: 'Spamhaus DBL',
-    host: 'dbl.spamhaus.org',
-    category: 'spam',
-    delistUrl: 'https://www.spamhaus.org/lookup/',
-    description: 'Domain block list'
-  },
+  // Removed: Spamhaus DBL is a DOMAIN blocklist, not IP — IP queries produce false positives
 
   // Barracuda
   {
@@ -129,37 +123,8 @@ const DNSBL_SERVICES = [
     description: 'SORBS dynamic IP addresses'
   },
 
-  // URIBL
-  {
-    name: 'URIBL Multi',
-    host: 'multi.uribl.com',
-    category: 'spam',
-    delistUrl: 'https://admin.uribl.com/',
-    description: 'URIBL multi blocklist'
-  },
-  {
-    name: 'URIBL Black',
-    host: 'black.uribl.com',
-    category: 'spam',
-    delistUrl: 'https://admin.uribl.com/',
-    description: 'URIBL black list'
-  },
-  {
-    name: 'URIBL Grey',
-    host: 'grey.uribl.com',
-    category: 'spam',
-    delistUrl: 'https://admin.uribl.com/',
-    description: 'URIBL grey list'
-  },
-
-  // SURBL
-  {
-    name: 'SURBL Multi',
-    host: 'multi.surbl.org',
-    category: 'spam',
-    delistUrl: 'https://surbl.org/surbl-analysis',
-    description: 'SURBL multi blocklist'
-  },
+  // Removed: URIBL Multi/Black/Grey and SURBL Multi are DOMAIN/URI blocklists,
+  // not IP blocklists — querying them with reversed-IP records yields false positives
 
   // Invaluement
   {
@@ -179,23 +144,8 @@ const DNSBL_SERVICES = [
     description: 'Passive spam block list'
   },
 
-  // Composite Blocking List
-  {
-    name: 'CBL',
-    host: 'cbl.abuseat.org',
-    category: 'spam',
-    delistUrl: 'https://www.abuseat.org/lookup.cgi',
-    description: 'Composite blocking list'
-  },
-
-  // NJABL (defunct but still queried)
-  {
-    name: 'NJABL',
-    host: 'dnsbl.njabl.org',
-    category: 'spam',
-    delistUrl: 'https://www.njabl.org/',
-    description: 'Not Just Another Blocking List'
-  },
+  // Removed CBL: absorbed into Spamhaus XBL years ago, standalone no longer maintained
+  // Removed NJABL: officially shut down in 2013
 
   // Mailspike
   {
@@ -225,7 +175,7 @@ const DNSBL_SERVICES = [
   // Blocklist.de
   {
     name: 'Blocklist.de',
-    host: 'dnsbl.blocklist.de',
+    host: 'bl.blocklist.de',
     category: 'attacks',
     delistUrl: 'https://www.blocklist.de/en/delist.html',
     description: 'Attack sources'
@@ -258,14 +208,7 @@ const DNSBL_SERVICES = [
     description: 'Tor exit nodes'
   },
 
-  // WPBL
-  {
-    name: 'WPBL',
-    host: 'db.wpbl.info',
-    category: 'spam',
-    delistUrl: 'https://www.wpbl.info/',
-    description: 'Weighted private block list'
-  },
+  // Removed WPBL: defunct since ~2018, always ESERVFAIL
 
   // Backscatterer
   {
@@ -294,28 +237,8 @@ const DNSBL_SERVICES = [
     description: 'Bad reputation IPs'
   },
 
-  // SpamRATS
-  {
-    name: 'SpamRATS Dyna',
-    host: 'dyna.spamrats.com',
-    category: 'policy',
-    delistUrl: 'https://www.spamrats.com/lookup.php',
-    description: 'SpamRATS dynamic IPs'
-  },
-  {
-    name: 'SpamRATS NoPtr',
-    host: 'noptr.spamrats.com',
-    category: 'policy',
-    delistUrl: 'https://www.spamrats.com/lookup.php',
-    description: 'SpamRATS no PTR record'
-  },
-  {
-    name: 'SpamRATS Auth',
-    host: 'auth.spamrats.com',
-    category: 'spam',
-    delistUrl: 'https://www.spamrats.com/lookup.php',
-    description: 'SpamRATS spam sources'
-  },
+  // Removed SpamRATS family: aggressive rate-limiting of cloud/datacenter queries
+  // makes them produce chronic timeouts, not useful as a public-facing check
 
   // DNSWL (Whitelist - inverted logic)
   {
@@ -391,13 +314,7 @@ const DNSBL_SERVICES = [
     delistUrl: 'https://www.nordspam.com/',
     description: 'NordSpam blocklist'
   },
-  {
-    name: 'AntiSpam',
-    host: 'dnsbl.anticaptcha.net',
-    category: 'spam',
-    delistUrl: 'https://www.anticaptcha.net/',
-    description: 'AntiSpam blocklist'
-  },
+  // Removed AntiSpam: dnsbl.anticaptcha.net is not a real DNSBL — anticaptcha.net is a CAPTCHA-solving service
   {
     name: 'S5h.net',
     host: 'all.s5h.net',
@@ -405,13 +322,7 @@ const DNSBL_SERVICES = [
     delistUrl: 'https://www.s5h.net/',
     description: 'S5h combined list'
   },
-  {
-    name: 'SpamCannibal',
-    host: 'bl.spamcannibal.org',
-    category: 'spam',
-    delistUrl: 'https://www.spamcannibal.org/',
-    description: 'SpamCannibal blocklist'
-  },
+  // Removed SpamCannibal: defunct since 2018, domain sold
   {
     name: 'Cymru Fullbogons',
     host: 'v4.fullbogons.cymru.com',
@@ -426,12 +337,116 @@ const DNSBL_SERVICES = [
     delistUrl: 'https://senderscore.org/blacklistlookup/',
     description: 'Sender reputation scoring'
   },
+  // Removed Manitu: chronic ESERVFAIL responses, requires registered mail server for stable queries
+  // ---- Additional DNSBL providers ----
   {
-    name: 'Manitu',
-    host: 'ix.dnsbl.manitu.net',
+    name: '0SPAM',
+    host: 'bl.0spam.org',
     category: 'spam',
-    delistUrl: 'https://www.dnsbl.manitu.net/',
-    description: 'Manitu spam list'
+    delistUrl: 'https://0spam.org/',
+    description: '0SPAM combined block list'
+  },
+  {
+    name: '0SPAM RBL',
+    host: 'rbl.0spam.org',
+    category: 'spam',
+    delistUrl: 'https://0spam.org/',
+    description: '0SPAM RBL'
+  },
+  {
+    name: 'Anonmails DNSBL',
+    host: 'spam.dnsbl.anonmails.de',
+    category: 'spam',
+    delistUrl: 'https://anonmails.de/dnsbl.php',
+    description: 'Anonymous mail spam blocklist'
+  },
+  {
+    name: 'Hostkarma Black',
+    host: 'hostkarma.junkemailfilter.com',
+    category: 'spam',
+    delistUrl: 'http://ipadmin.junkemailfilter.com/remove.php',
+    description: 'JunkEmailFilter Hostkarma (black entries on 127.0.0.2)'
+  },
+  // Removed ivmSIP / ivmSIP24: Invaluement is a license-only service. Public/unregistered
+  // queries always receive 127.0.0.2 sentinel responses regardless of real listing,
+  // which makes them useless for free public-facing checks (constant false positives).
+  // Re-enable only with paid Invaluement DNS feed credentials.
+  {
+    name: 'LASHBACK UBL',
+    host: 'ubl.unsubscore.com',
+    category: 'spam',
+    delistUrl: 'http://blacklist.lashback.com/',
+    description: 'LashBack Unsubscribe Blacklist'
+  },
+  {
+    name: 'MSRBL Phishing',
+    host: 'phishing.rbl.msrbl.net',
+    category: 'spam',
+    delistUrl: 'http://www.msrbl.com/',
+    description: 'MSRBL phishing list'
+  },
+  {
+    name: 'MSRBL Spam',
+    host: 'spam.rbl.msrbl.net',
+    category: 'spam',
+    delistUrl: 'http://www.msrbl.com/',
+    description: 'MSRBL spam list'
+  },
+  {
+    name: 'NoSolicitado',
+    host: 'bl.nosolicitado.org',
+    category: 'spam',
+    delistUrl: 'http://www.nosolicitado.org/',
+    description: 'NoSolicitado Spanish-language spam blocklist'
+  },
+  {
+    name: 'RBL JP',
+    host: 'all.rbl.jp',
+    category: 'spam',
+    delistUrl: 'http://www.rbl.jp/',
+    description: 'Japan RBL'
+  },
+  {
+    name: 'SEM Backscatter',
+    host: 'backscatter.spameatingmonkey.net',
+    category: 'spam',
+    delistUrl: 'http://spameatingmonkey.com/',
+    description: 'Spam Eating Monkey backscatter list'
+  },
+  {
+    name: 'SEM Black',
+    host: 'bl.spameatingmonkey.net',
+    category: 'spam',
+    delistUrl: 'http://spameatingmonkey.com/',
+    description: 'Spam Eating Monkey black list'
+  },
+  {
+    name: 'SPFBL DNSBL',
+    host: 'dnsbl.spfbl.net',
+    category: 'spam',
+    delistUrl: 'https://matrix.spfbl.net/',
+    description: 'SPFBL distributed reputation blocklist'
+  },
+  {
+    name: 'Suomispam',
+    host: 'bl.suomispam.net',
+    category: 'spam',
+    delistUrl: 'https://suomispam.net/',
+    description: 'Suomispam Finnish-language spam blocklist'
+  },
+  {
+    name: "Woody's SMTP",
+    host: 'blacklist.woody.ch',
+    category: 'spam',
+    delistUrl: 'http://www.woody.ch/blacklist.html',
+    description: "Woody's SMTP Blacklist"
+  },
+  {
+    name: 'ZapBL',
+    host: 'dnsbl.zapbl.net',
+    category: 'spam',
+    delistUrl: 'https://zapbl.net/',
+    description: 'ZapBL combined blocklist'
   }
 ];
 
@@ -502,7 +517,7 @@ function reverseIP(ip) {
  * @param {number} timeout - Query timeout in milliseconds
  * @returns {Promise<object>} Query result
  */
-async function queryDNSBL(ip, dnsbl, timeout = 2000) {
+async function queryDNSBL(ip, dnsbl, timeout = 5000) {
   const startTime = Date.now();
 
   try {
@@ -523,15 +538,21 @@ async function queryDNSBL(ip, dnsbl, timeout = 2000) {
 
     const responseTime = Date.now() - startTime;
 
-    // If we got a response, the IP is listed
+    // DNSBL convention: a valid "listed" response is in 127.0.0.0/8 (typically
+    // 127.0.0.x with x encoding category). Any other A record (e.g. a Cloudflare
+    // parked IP returned via a wildcard / catch-all for non-existent subdomains)
+    // is NOT a DNSBL hit and would be a false positive if treated as one.
+    const responseIp = addresses[0];
+    const isValidDnsblHit = typeof responseIp === 'string' && responseIp.startsWith('127.');
+
     return {
       name: dnsbl.name,
       host: dnsbl.host,
-      listed: true,
+      listed: isValidDnsblHit,
       category: dnsbl.category,
       description: dnsbl.description,
       delistUrl: dnsbl.delistUrl,
-      response: addresses[0], // Return code from DNSBL
+      response: responseIp,
       responseTime,
       error: null
     };
@@ -640,7 +661,7 @@ router.post('/ip-blacklist-check', ipBlacklistRateLimit, async (req, res) => {
     });
 
     const queryPromises = DNSBL_SERVICES.map(dnsbl =>
-      queryDNSBL(cleanIp, dnsbl, 2000) // 2 second timeout per DNSBL
+      queryDNSBL(cleanIp, dnsbl, 5000) // 5 second timeout per DNSBL (some, e.g. Mailspike, are slow)
     );
 
     const results = await Promise.all(queryPromises);

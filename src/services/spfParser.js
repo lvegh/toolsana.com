@@ -127,7 +127,10 @@ class SPFParser {
 
     // Parse mechanism
     const mechanismType = mechanism.split(':')[0].split('/')[0].toLowerCase();
-    const mechanismValue = mechanism.includes(':') ? mechanism.split(':')[1] : null;
+    // Split on the FIRST colon only — IPv6 mechanism values contain colons
+    // themselves (e.g. ip6:2a01:111:f400::/48), so split(':')[1] truncates them.
+    const colonIdx = mechanism.indexOf(':');
+    const mechanismValue = colonIdx >= 0 ? mechanism.substring(colonIdx + 1) : null;
 
     const mechanismData = {
       type: mechanismType,
