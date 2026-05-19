@@ -3,6 +3,7 @@ const { simpleParser } = require('mailparser');
 const geoip = require('geoip-lite');
 const dns = require('dns').promises;
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 const { createCustomRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError, AppError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
@@ -1324,5 +1325,1065 @@ router.post('/smtp-test', smtpTestRateLimit, async (req, res) => {
     warnings,
   });
 });
+
+// ============================================================================
+// DKIM Checker
+// ============================================================================
+
+const dkimRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: {
+    success: false,
+    message: 'Too many DKIM checker requests. You can perform 30 checks per hour. Please try again later.',
+    retryAfter: 3600,
+  },
+  keyGenerator: (req) => `dkim-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: 'Too many DKIM checker requests. You can perform 30 checks per hour. Please try again later.',
+      retryAfter: 3600,
+    });
+  },
+});
+
+const COMMON_DKIM_SELECTORS = [
+  'google',
+  'selector1',
+  'selector2',
+  's1',
+  's2',
+  'mail',
+  'default',
+  'dkim',
+  'k1',
+  'k2',
+  'k3',
+  'mg',
+  'mailgun',
+  'pic',
+  'pm',
+  'smtpapi',
+  'amazonses',
+  'klaviyo1',
+  'klaviyo2',
+  'sendgrid',
+  'brevo1',
+  'brevo2',
+  'mandrill',
+  'zoho',
+  'protonmail',
+  'protonmail2',
+  'protonmail3',
+  'fastmail1',
+  'fastmail2',
+  'fastmail3',
+  'mxvault',
+  'litmus1',
+  'litmus2',
+];
+
+const SELECTOR_NAME_RE = /^[a-zA-Z0-9_\-.]{1,63}$/;
+const DOMAIN_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$/;
+
+function parseDKIMRecord(raw) {
+  const cleaned = raw.replace(/"\s*"/g, '').replace(/"/g, '').trim();
+  const tags = {};
+  const parts = cleaned.split(/\s*;\s*/);
+  for (const part of parts) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    tags[key] = value;
+  }
+  return tags;
+}
+
+function detectRSAKeyLength(base64Key) {
+  if (!base64Key) return null;
+  try {
+    const pem = `-----BEGIN PUBLIC KEY-----\n${base64Key.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----`;
+    const key = crypto.createPublicKey({ key: pem, format: 'pem' });
+    const details = key.asymmetricKeyDetails || {};
+    return details.modulusLength || null;
+  } catch {
+    // Fall back: ASN.1 sniff. Find the largest INTEGER block in the SPKI which is the modulus.
+    try {
+      const buf = Buffer.from(base64Key, 'base64');
+      // Walk SubjectPublicKeyInfo -> AlgorithmIdentifier + BIT STRING(RSAPublicKey)
+      // Heuristic: look for the modulus INTEGER tag (0x02) with a long length encoding.
+      for (let i = 0; i < buf.length - 4; i++) {
+        if (buf[i] === 0x02 && buf[i + 1] === 0x82) {
+          const len = (buf[i + 2] << 8) | buf[i + 3];
+          // Strip optional leading 0x00 padding byte
+          const lead = buf[i + 4] === 0x00 ? 1 : 0;
+          const bitLen = (len - lead) * 8;
+          if (bitLen >= 512 && bitLen <= 8192) return bitLen;
+        }
+      }
+    } catch {
+      // Fall through
+    }
+    return null;
+  }
+}
+
+async function lookupDKIMSelector(domain, selector) {
+  const host = `${selector}._domainkey.${domain}`;
+  try {
+    const txt = await dns.resolveTxt(host);
+    if (!txt || txt.length === 0) return null;
+    // TXT records may be split into multiple strings; join them
+    const raw = txt.map((arr) => arr.join('')).join('');
+    if (!raw) return null;
+    return raw;
+  } catch (e) {
+    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return null;
+    return null;
+  }
+}
+
+router.post(
+  '/dkim-checker',
+  dkimRateLimit,
+  [
+    body('domain')
+      .trim()
+      .notEmpty()
+      .withMessage('Domain is required')
+      .isLength({ max: 253 })
+      .matches(DOMAIN_NAME_RE)
+      .withMessage('Invalid domain format')
+      .customSanitizer((v) => v.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '').replace(/:.*$/, '')),
+    body('selector')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isLength({ max: 63 })
+      .matches(SELECTOR_NAME_RE)
+      .withMessage('Invalid selector format'),
+    body('selectors')
+      .optional()
+      .isArray({ max: 25 })
+      .withMessage('selectors must be an array of at most 25 items'),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const requestId = `dkim-check-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const startTime = Date.now();
+    const { domain } = req.body;
+    let { selector, selectors } = req.body;
+
+    let candidateSelectors;
+    if (selector) {
+      candidateSelectors = [selector];
+    } else if (Array.isArray(selectors) && selectors.length > 0) {
+      candidateSelectors = selectors
+        .map((s) => String(s).trim().toLowerCase())
+        .filter((s) => SELECTOR_NAME_RE.test(s))
+        .slice(0, 25);
+    } else {
+      candidateSelectors = COMMON_DKIM_SELECTORS;
+    }
+
+    const cacheKey = `dkim-check:${domain}:${candidateSelectors.join(',')}`;
+    const cached = await redisUtils.get(cacheKey);
+    if (cached) {
+      return sendSuccess(res, 'DKIM record retrieved from cache', { ...cached, cached: true });
+    }
+
+    logger.info('DKIM checker request', { requestId, domain, selectorCount: candidateSelectors.length });
+
+    const results = [];
+    // Run lookups in parallel for auto-discovery, sequentially when single selector
+    const rawResults = await Promise.all(
+      candidateSelectors.map(async (sel) => {
+        const raw = await lookupDKIMSelector(domain, sel);
+        return { selector: sel, raw };
+      })
+    );
+
+    for (const item of rawResults) {
+      if (!item.raw) {
+        results.push({ selector: item.selector, found: false });
+        continue;
+      }
+      const tags = parseDKIMRecord(item.raw);
+      const version = tags['v'] || null; // expected DKIM1
+      const keyType = (tags['k'] || 'rsa').toLowerCase();
+      const algorithms = (tags['h'] || '').split(':').filter(Boolean);
+      const serviceType = tags['s'] || '*';
+      const flags = (tags['t'] || '').split(':').filter(Boolean);
+      const note = tags['n'] || null;
+      const publicKey = tags['p'] || '';
+      const revoked = publicKey.length === 0 && Object.prototype.hasOwnProperty.call(tags, 'p');
+      let keyLength = null;
+      if (keyType === 'rsa' && publicKey && !revoked) {
+        keyLength = detectRSAKeyLength(publicKey);
+      }
+      const issues = [];
+      if (version && version !== 'DKIM1') {
+        issues.push({ severity: 'warning', message: `Unexpected DKIM version: ${version} (expected DKIM1)` });
+      }
+      if (revoked) {
+        issues.push({ severity: 'error', message: 'Public key is empty — this selector has been revoked' });
+      }
+      if (keyType !== 'rsa' && keyType !== 'ed25519') {
+        issues.push({ severity: 'warning', message: `Unusual key type: ${keyType} (most receivers expect rsa)` });
+      }
+      if (keyLength && keyLength < 1024) {
+        issues.push({ severity: 'error', message: `Key length ${keyLength}-bit is below the 1024-bit minimum` });
+      } else if (keyLength && keyLength < 2048) {
+        issues.push({
+          severity: 'warning',
+          message: `Key length ${keyLength}-bit is below the modern 2048-bit recommendation (Google bulk-sender 2024 requirement)`,
+        });
+      }
+      if (flags.includes('y')) {
+        issues.push({ severity: 'info', message: 't=y testing flag is set — failures will not be enforced' });
+      }
+      if (algorithms.length > 0 && !algorithms.includes('sha256') && !algorithms.includes('rsa-sha256')) {
+        issues.push({ severity: 'warning', message: 'Hash algorithm list does not include sha256 (rsa-sha1 alone is deprecated)' });
+      }
+      results.push({
+        selector: item.selector,
+        found: true,
+        raw: item.raw,
+        version,
+        keyType,
+        algorithms,
+        serviceType,
+        flags,
+        note,
+        publicKey,
+        publicKeyTruncated: publicKey ? `${publicKey.slice(0, 64)}…` : null,
+        keyLength,
+        revoked,
+        issues,
+        valid: issues.filter((i) => i.severity === 'error').length === 0 && !revoked,
+      });
+    }
+
+    const foundCount = results.filter((r) => r.found).length;
+    const validCount = results.filter((r) => r.found && r.valid).length;
+    const response = {
+      domain,
+      timestamp: new Date().toISOString(),
+      autoDiscovery: !selector && !Array.isArray(selectors),
+      selectorsChecked: candidateSelectors,
+      foundCount,
+      validCount,
+      results,
+      lookupTime: Date.now() - startTime,
+      cached: false,
+    };
+
+    if (foundCount > 0) {
+      await redisUtils.setex(cacheKey, 3600, response);
+    }
+
+    logger.info('DKIM check completed', { requestId, domain, foundCount, validCount, lookupTime: response.lookupTime });
+    return sendSuccess(res, foundCount > 0 ? 'DKIM records analyzed successfully' : 'No DKIM records found for the checked selectors', response);
+  }
+);
+
+// ============================================================================
+// DMARC Checker (Generator runs client-side)
+// ============================================================================
+
+const dmarcRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: {
+    success: false,
+    message: 'Too many DMARC checker requests. You can perform 30 checks per hour. Please try again later.',
+    retryAfter: 3600,
+  },
+  keyGenerator: (req) => `dmarc-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: 'Too many DMARC checker requests. You can perform 30 checks per hour. Please try again later.',
+      retryAfter: 3600,
+    });
+  },
+});
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseDMARCRecord(raw) {
+  const cleaned = raw.replace(/"\s*"/g, '').replace(/"/g, '').trim();
+  const tags = {};
+  const parts = cleaned.split(/\s*;\s*/);
+  for (const part of parts) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    tags[key] = value;
+  }
+  return tags;
+}
+
+function parseMailtoList(value) {
+  if (!value) return [];
+  return value.split(',').map((s) => {
+    const trimmed = s.trim();
+    let url = trimmed;
+    let limit = null;
+    const bangIdx = trimmed.indexOf('!');
+    if (bangIdx !== -1) {
+      url = trimmed.slice(0, bangIdx);
+      limit = trimmed.slice(bangIdx + 1);
+    }
+    const addr = url.replace(/^mailto:/i, '');
+    return {
+      raw: trimmed,
+      address: addr,
+      hasMailtoPrefix: /^mailto:/i.test(url),
+      valid: EMAIL_RE.test(addr),
+      sizeLimit: limit,
+    };
+  });
+}
+
+async function fetchDMARCRecord(domain) {
+  const host = `_dmarc.${domain}`;
+  try {
+    const txt = await dns.resolveTxt(host);
+    if (!txt || txt.length === 0) return null;
+    // Return the first record that starts with v=DMARC1 (RFC says only one valid record)
+    for (const arr of txt) {
+      const joined = arr.join('');
+      if (/^v\s*=\s*DMARC1/i.test(joined)) {
+        return joined;
+      }
+    }
+    return null;
+  } catch (e) {
+    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return null;
+    throw e;
+  }
+}
+
+function validateDMARCTags(tags) {
+  const issues = [];
+
+  if (!tags.v) {
+    issues.push({ severity: 'error', message: 'Missing required v= tag' });
+  } else if (tags.v !== 'DMARC1') {
+    issues.push({ severity: 'error', message: `Unexpected version: ${tags.v} (must be DMARC1)` });
+  }
+
+  if (!tags.p) {
+    issues.push({ severity: 'error', message: 'Missing required p= tag (none / quarantine / reject)' });
+  } else if (!['none', 'quarantine', 'reject'].includes(tags.p)) {
+    issues.push({ severity: 'error', message: `Invalid p= value: ${tags.p}` });
+  }
+
+  if (tags.sp && !['none', 'quarantine', 'reject'].includes(tags.sp)) {
+    issues.push({ severity: 'error', message: `Invalid sp= value: ${tags.sp}` });
+  }
+
+  if (tags.pct !== undefined) {
+    const pct = Number(tags.pct);
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) {
+      issues.push({ severity: 'error', message: `Invalid pct= value: ${tags.pct} (must be 0-100)` });
+    } else if (tags.p === 'none' && pct !== 100) {
+      issues.push({ severity: 'info', message: 'pct= has no effect when p=none' });
+    }
+  }
+
+  for (const key of ['adkim', 'aspf']) {
+    if (tags[key] && !['r', 's'].includes(tags[key])) {
+      issues.push({ severity: 'error', message: `Invalid ${key}= value: ${tags[key]} (must be r or s)` });
+    }
+  }
+
+  if (tags.fo !== undefined) {
+    const allowed = new Set(['0', '1', 'd', 's']);
+    const parts = tags.fo.split(':');
+    if (!parts.every((p) => allowed.has(p))) {
+      issues.push({ severity: 'warning', message: `fo= contains unknown value(s): ${tags.fo}` });
+    }
+  }
+
+  if (tags.ri !== undefined) {
+    const ri = Number(tags.ri);
+    if (!Number.isInteger(ri) || ri < 0) {
+      issues.push({ severity: 'error', message: `Invalid ri= value: ${tags.ri} (must be a non-negative integer)` });
+    }
+  }
+
+  if (tags.rf !== undefined && !['afrf', 'iodef'].includes(tags.rf)) {
+    issues.push({ severity: 'warning', message: `Unusual rf= value: ${tags.rf} (typically afrf)` });
+  }
+
+  const rua = parseMailtoList(tags.rua);
+  for (const e of rua) {
+    if (!e.valid) {
+      issues.push({ severity: 'error', message: `Invalid rua address: ${e.raw}` });
+    } else if (!e.hasMailtoPrefix) {
+      issues.push({ severity: 'error', message: `rua= entry missing mailto: prefix (${e.raw})` });
+    }
+  }
+  const ruf = parseMailtoList(tags.ruf);
+  for (const e of ruf) {
+    if (!e.valid) {
+      issues.push({ severity: 'error', message: `Invalid ruf address: ${e.raw}` });
+    } else if (!e.hasMailtoPrefix) {
+      issues.push({ severity: 'error', message: `ruf= entry missing mailto: prefix (${e.raw})` });
+    }
+  }
+
+  if (tags.p === 'none' && (!rua || rua.length === 0)) {
+    issues.push({
+      severity: 'warning',
+      message:
+        'p=none without rua= provides no monitoring data — the whole point of p=none is to collect aggregate reports. Add a rua= mailbox.',
+    });
+  }
+
+  if (tags.p === 'none') {
+    issues.push({
+      severity: 'info',
+      message:
+        'p=none is monitoring-only — receivers will not change delivery on DMARC failures. Plan a ramp to quarantine then reject.',
+    });
+  }
+
+  // 2024 Google / Yahoo bulk-sender compliance check
+  const compliant2024 = tags.v === 'DMARC1' && !!tags.p && rua.some((e) => e.valid && e.hasMailtoPrefix);
+
+  return { issues, rua, ruf, compliant2024 };
+}
+
+router.post(
+  '/dmarc-checker',
+  dmarcRateLimit,
+  [
+    body('domain')
+      .trim()
+      .notEmpty()
+      .withMessage('Domain is required')
+      .isLength({ max: 253 })
+      .matches(DOMAIN_NAME_RE)
+      .withMessage('Invalid domain format')
+      .customSanitizer((v) => v.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '').replace(/:.*$/, '')),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const requestId = `dmarc-check-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const startTime = Date.now();
+    const { domain } = req.body;
+
+    const cacheKey = `dmarc-check:${domain}`;
+    const cached = await redisUtils.get(cacheKey);
+    if (cached) {
+      return sendSuccess(res, 'DMARC record retrieved from cache', { ...cached, cached: true });
+    }
+
+    let raw;
+    try {
+      raw = await fetchDMARCRecord(domain);
+    } catch (e) {
+      logger.error('DMARC lookup failed', { requestId, domain, error: e.message, code: e.code });
+      return sendError(res, e.code === 'ENOTFOUND' ? 'Domain not found' : 'DNS lookup failed', e.code === 'ENOTFOUND' ? 404 : 500, {
+        dnsError: e.code,
+      });
+    }
+
+    if (!raw) {
+      const empty = {
+        domain,
+        timestamp: new Date().toISOString(),
+        found: false,
+        record: null,
+        tags: null,
+        issues: [
+          {
+            severity: 'error',
+            message:
+              'No DMARC record found at _dmarc.' +
+              domain +
+              '. Bulk senders to Gmail / Yahoo (2024 requirements) must publish at least v=DMARC1; p=none; rua=mailto:dmarc@yourdomain.com',
+          },
+        ],
+        rua: [],
+        ruf: [],
+        compliant2024: false,
+        lookupTime: Date.now() - startTime,
+        cached: false,
+      };
+      await redisUtils.setex(cacheKey, 3600, empty);
+      return sendSuccess(res, 'No DMARC record found', empty);
+    }
+
+    const tags = parseDMARCRecord(raw);
+    const { issues, rua, ruf, compliant2024 } = validateDMARCTags(tags);
+
+    const response = {
+      domain,
+      timestamp: new Date().toISOString(),
+      found: true,
+      record: raw,
+      tags,
+      issues,
+      rua,
+      ruf,
+      compliant2024,
+      valid: issues.filter((i) => i.severity === 'error').length === 0,
+      lookupTime: Date.now() - startTime,
+      cached: false,
+    };
+
+    await redisUtils.setex(cacheKey, 3600, response);
+
+    logger.info('DMARC check completed', {
+      requestId,
+      domain,
+      found: true,
+      compliant2024,
+      issueCount: issues.length,
+      lookupTime: response.lookupTime,
+    });
+
+    return sendSuccess(res, 'DMARC record analyzed successfully', response);
+  }
+);
+
+// ============================================================================
+// BIMI Checker (DNS + SVG Tiny PS validation + VMC + DMARC prerequisite)
+// ============================================================================
+
+const bimiRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: {
+    success: false,
+    message: 'Too many BIMI checker requests. You can perform 20 checks per hour. Please try again later.',
+    retryAfter: 3600,
+  },
+  keyGenerator: (req) => `bimi-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: 'Too many BIMI checker requests. You can perform 20 checks per hour. Please try again later.',
+      retryAfter: 3600,
+    });
+  },
+});
+
+const BIMI_MAX_SVG_BYTES = 32 * 1024; // 32KB recommended
+const BIMI_MAX_FETCH_BYTES = 256 * 1024; // hard cap defensively
+
+const SVG_FORBIDDEN_ELEMENTS = [
+  'script',
+  'animate',
+  'animateMotion',
+  'animateTransform',
+  'set',
+  'foreignObject',
+  'iframe',
+  'video',
+  'audio',
+  'image',
+];
+
+const SVG_FORBIDDEN_ATTRS = [
+  'onload',
+  'onclick',
+  'onerror',
+  'onmouseover',
+  'onmouseout',
+  'href',
+  'xlink:href',
+];
+
+function parseBIMIRecord(raw) {
+  const cleaned = raw.replace(/"\s*"/g, '').replace(/"/g, '').trim();
+  const tags = {};
+  for (const part of cleaned.split(/\s*;\s*/)) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const key = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    tags[key] = value;
+  }
+  return tags;
+}
+
+async function fetchBIMIRecord(domain) {
+  const host = `default._bimi.${domain}`;
+  try {
+    const txt = await dns.resolveTxt(host);
+    if (!txt || txt.length === 0) return null;
+    for (const arr of txt) {
+      const joined = arr.join('');
+      if (/^v\s*=\s*BIMI1/i.test(joined)) return joined;
+    }
+    return null;
+  } catch (e) {
+    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return null;
+    throw e;
+  }
+}
+
+async function fetchSizedResource(url, maxBytes, acceptHeader) {
+  const u = new URL(url);
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    throw new Error('Only http/https URLs are allowed');
+  }
+  // SSRF guard: refuse hosts that resolve into private space
+  if (u.hostname) {
+    const ok = await isPublicHost(u.hostname);
+    if (!ok) throw new Error('Refusing to fetch from private/internal host');
+  }
+  if (u.protocol !== 'https:') {
+    // BIMI requires HTTPS for logo and VMC — surface as a soft signal upstream
+  }
+  const res = await fetch(url, {
+    headers: acceptHeader ? { Accept: acceptHeader } : {},
+    signal: AbortSignal.timeout(8000),
+    redirect: 'follow',
+  });
+  if (!res.ok) {
+    return { ok: false, status: res.status, statusText: res.statusText, contentType: res.headers.get('content-type'), bytes: null, truncated: false };
+  }
+  const contentType = res.headers.get('content-type') || '';
+  const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  const truncated = bytes.length > maxBytes;
+  return {
+    ok: true,
+    status: res.status,
+    statusText: res.statusText,
+    contentType,
+    bytes: bytes.slice(0, maxBytes),
+    fullLength: bytes.length,
+    truncated,
+    isHttps: u.protocol === 'https:',
+  };
+}
+
+function validateSVGTinyPS(svgText, fullByteLength) {
+  const issues = [];
+  let viewBox = null;
+  let aspectRatioSquare = null;
+  let baseProfile = null;
+
+  if (fullByteLength > BIMI_MAX_SVG_BYTES) {
+    issues.push({
+      severity: 'warning',
+      message: `SVG file size is ${fullByteLength} bytes — above the recommended 32KB limit for BIMI`,
+    });
+  }
+
+  // Quick sanity check
+  if (!/<svg[\s>]/i.test(svgText)) {
+    issues.push({ severity: 'error', message: 'Not a valid SVG document (no <svg> root element found)' });
+    return { issues, viewBox, aspectRatioSquare, baseProfile };
+  }
+
+  // baseProfile
+  const baseProfileMatch = svgText.match(/baseProfile\s*=\s*"([^"]+)"/i);
+  baseProfile = baseProfileMatch ? baseProfileMatch[1] : null;
+  if (!baseProfile) {
+    issues.push({ severity: 'error', message: 'Missing required baseProfile="tiny-ps" attribute on <svg> root element' });
+  } else if (baseProfile !== 'tiny-ps') {
+    issues.push({
+      severity: 'error',
+      message: `Incorrect baseProfile: "${baseProfile}" (BIMI requires baseProfile="tiny-ps")`,
+    });
+  }
+
+  // viewBox & aspect ratio
+  const viewBoxMatch = svgText.match(/viewBox\s*=\s*"([^"]+)"/i);
+  if (viewBoxMatch) {
+    viewBox = viewBoxMatch[1];
+    const parts = viewBox.trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+      const [, , w, h] = parts;
+      aspectRatioSquare = w === h;
+      if (!aspectRatioSquare) {
+        issues.push({
+          severity: 'error',
+          message: `viewBox is not square (${w}×${h}). BIMI requires a 1:1 aspect ratio.`,
+        });
+      }
+    } else {
+      issues.push({ severity: 'warning', message: 'viewBox is malformed' });
+    }
+  } else {
+    issues.push({ severity: 'error', message: 'Missing required viewBox attribute on <svg> root element' });
+  }
+
+  // Forbidden elements
+  for (const el of SVG_FORBIDDEN_ELEMENTS) {
+    const re = new RegExp(`<\\s*${el}[\\s>/]`, 'i');
+    if (re.test(svgText)) {
+      issues.push({
+        severity: 'error',
+        message: `Forbidden element <${el}> found — not allowed in SVG Tiny PS`,
+      });
+    }
+  }
+
+  // Forbidden attributes (xlink:href / href can be permitted in <use> but we surface as warnings — BIMI bans external references)
+  if (/xlink:href\s*=/i.test(svgText) || /\shref\s*=/i.test(svgText)) {
+    issues.push({
+      severity: 'warning',
+      message: 'SVG contains href / xlink:href — BIMI forbids external resource references. Verify all references are internal (#id).',
+    });
+  }
+  for (const attr of SVG_FORBIDDEN_ATTRS) {
+    if (attr === 'href' || attr === 'xlink:href') continue;
+    const re = new RegExp(`\\s${attr}\\s*=`, 'i');
+    if (re.test(svgText)) {
+      issues.push({
+        severity: 'error',
+        message: `Event handler attribute "${attr}" found — not allowed in SVG Tiny PS`,
+      });
+    }
+  }
+
+  // XML declaration / DOCTYPE
+  if (/<!DOCTYPE/i.test(svgText)) {
+    issues.push({ severity: 'warning', message: 'SVG contains a DOCTYPE declaration — BIMI recommends omitting it' });
+  }
+
+  // External font references
+  if (/@font-face/i.test(svgText) || /<link\b/i.test(svgText)) {
+    issues.push({ severity: 'error', message: 'External font / link references found — not allowed in SVG Tiny PS' });
+  }
+
+  return { issues, viewBox, aspectRatioSquare, baseProfile };
+}
+
+async function fetchDMARCForBIMI(domain) {
+  try {
+    const raw = await fetchDMARCRecord(domain);
+    if (!raw) return { found: false, eligible: false, raw: null, tags: null };
+    const tags = parseDMARCRecord(raw);
+    const pct = tags.pct === undefined ? 100 : Number(tags.pct);
+    const eligible = (tags.p === 'quarantine' || tags.p === 'reject') && pct === 100;
+    return { found: true, eligible, raw, tags };
+  } catch {
+    return { found: false, eligible: false, raw: null, tags: null };
+  }
+}
+
+router.post(
+  '/bimi-checker',
+  bimiRateLimit,
+  [
+    body('domain')
+      .trim()
+      .notEmpty()
+      .withMessage('Domain is required')
+      .isLength({ max: 253 })
+      .matches(DOMAIN_NAME_RE)
+      .withMessage('Invalid domain format')
+      .customSanitizer((v) => v.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '').replace(/:.*$/, '')),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    const requestId = `bimi-check-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const startTime = Date.now();
+    const { domain } = req.body;
+
+    const cacheKey = `bimi-check:${domain}`;
+    const cached = await redisUtils.get(cacheKey);
+    if (cached) {
+      return sendSuccess(res, 'BIMI record retrieved from cache', { ...cached, cached: true });
+    }
+
+    let raw;
+    try {
+      raw = await fetchBIMIRecord(domain);
+    } catch (e) {
+      logger.error('BIMI lookup failed', { requestId, domain, error: e.message, code: e.code });
+      return sendError(res, e.code === 'ENOTFOUND' ? 'Domain not found' : 'DNS lookup failed', e.code === 'ENOTFOUND' ? 404 : 500, {
+        dnsError: e.code,
+      });
+    }
+
+    // Always evaluate DMARC prerequisite — BIMI requires it regardless of whether BIMI record exists
+    const dmarc = await fetchDMARCForBIMI(domain);
+
+    if (!raw) {
+      const issues = [
+        {
+          severity: 'error',
+          message: `No BIMI record found at default._bimi.${domain}`,
+        },
+      ];
+      if (!dmarc.eligible) {
+        issues.push({
+          severity: 'info',
+          message:
+            'DMARC prerequisite is not met — before publishing BIMI you must enforce DMARC at p=quarantine or p=reject with pct=100.',
+        });
+      }
+      const empty = {
+        domain,
+        timestamp: new Date().toISOString(),
+        found: false,
+        record: null,
+        tags: null,
+        logo: null,
+        vmc: null,
+        dmarc,
+        issues,
+        lookupTime: Date.now() - startTime,
+        cached: false,
+      };
+      await redisUtils.setex(cacheKey, 3600, empty);
+      return sendSuccess(res, 'No BIMI record found', empty);
+    }
+
+    const tags = parseBIMIRecord(raw);
+    const issues = [];
+
+    if (tags.v !== 'BIMI1') {
+      issues.push({ severity: 'error', message: `Unexpected version: ${tags.v} (must be BIMI1)` });
+    }
+
+    // DMARC prerequisite
+    if (!dmarc.found) {
+      issues.push({
+        severity: 'error',
+        message: 'No DMARC record found — BIMI requires DMARC at p=quarantine or p=reject with pct=100.',
+      });
+    } else if (!dmarc.eligible) {
+      const pct = dmarc.tags.pct === undefined ? 100 : Number(dmarc.tags.pct);
+      issues.push({
+        severity: 'error',
+        message: `DMARC policy is p=${dmarc.tags.p || 'unknown'}${pct !== 100 ? ` pct=${pct}` : ''} — BIMI requires p=quarantine or p=reject with pct=100.`,
+      });
+    }
+
+    // Logo (l=) fetch and validate
+    let logo = null;
+    if (tags.l) {
+      try {
+        const resource = await fetchSizedResource(tags.l, BIMI_MAX_FETCH_BYTES, 'image/svg+xml');
+        if (!resource.ok) {
+          logo = { url: tags.l, fetched: false, status: resource.status, statusText: resource.statusText, contentType: resource.contentType };
+          issues.push({
+            severity: 'error',
+            message: `Logo URL returned HTTP ${resource.status} ${resource.statusText} (${tags.l})`,
+          });
+        } else {
+          const svgText = new TextDecoder('utf-8').decode(resource.bytes);
+          const { issues: svgIssues, viewBox, aspectRatioSquare, baseProfile } = validateSVGTinyPS(svgText, resource.fullLength);
+          logo = {
+            url: tags.l,
+            fetched: true,
+            isHttps: resource.isHttps,
+            contentType: resource.contentType,
+            fileSize: resource.fullLength,
+            withinSizeLimit: resource.fullLength <= BIMI_MAX_SVG_BYTES,
+            baseProfile,
+            viewBox,
+            aspectRatioSquare,
+            svgPreview: svgText.slice(0, 4096),
+            svgValid: svgIssues.filter((i) => i.severity === 'error').length === 0,
+            svgIssues,
+          };
+          if (!resource.isHttps) {
+            issues.push({ severity: 'error', message: 'BIMI logo URL must use HTTPS' });
+          }
+          if (resource.contentType && !/svg/i.test(resource.contentType)) {
+            issues.push({
+              severity: 'warning',
+              message: `Logo Content-Type is "${resource.contentType}" — expected image/svg+xml`,
+            });
+          }
+          issues.push(...svgIssues);
+        }
+      } catch (e) {
+        logo = { url: tags.l, fetched: false, error: e.message };
+        issues.push({ severity: 'error', message: `Unable to fetch logo: ${e.message}` });
+      }
+    } else {
+      issues.push({ severity: 'error', message: 'Missing l= (logo URL) tag' });
+    }
+
+    // VMC (a=) fetch
+    let vmc = null;
+    if (tags.a) {
+      try {
+        const resource = await fetchSizedResource(tags.a, BIMI_MAX_FETCH_BYTES, 'application/pem-certificate-chain');
+        if (!resource.ok) {
+          vmc = { url: tags.a, fetched: false, status: resource.status, statusText: resource.statusText };
+          issues.push({
+            severity: 'warning',
+            message: `VMC URL returned HTTP ${resource.status} ${resource.statusText}. Gmail requires a valid VMC.`,
+          });
+        } else {
+          const text = new TextDecoder('utf-8').decode(resource.bytes);
+          const looksLikePem = /-----BEGIN CERTIFICATE-----/i.test(text);
+          // Parse the leaf certificate to extract issuer / subject / validity.
+          // Node's crypto.X509Certificate takes a single PEM cert; the response
+          // may contain a chain, so isolate the first BEGIN/END block.
+          let issuer = null;
+          let issuerCN = null;
+          let issuerO = null;
+          let subject = null;
+          let subjectO = null;
+          let validFrom = null;
+          let validTo = null;
+          let expired = null;
+          let expiringSoon = null;
+          if (looksLikePem) {
+            try {
+              const firstCertMatch = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
+              const firstCert = firstCertMatch ? firstCertMatch[0] : text;
+              const cert = new crypto.X509Certificate(firstCert);
+              // cert.issuer / cert.subject return DN as newline-separated key=value pairs
+              // Node returns DN values with RFC 4514 backslash escaping
+              // (e.g. "O=DigiCert\\, Inc."). Strip the backslash escapes
+              // for display so users see "DigiCert, Inc." not "DigiCert\, Inc.".
+              const unescapeDN = (v) => {
+                let out = '';
+                for (let i = 0; i < v.length; i++) {
+                  if (v[i] === '\\' && i + 1 < v.length) {
+                    out += v[i + 1];
+                    i++;
+                  } else {
+                    out += v[i];
+                  }
+                }
+                return out;
+              };
+              const parseDN = (dn) => {
+                const out = {};
+                if (!dn) return out;
+                for (const line of dn.split(/\r?\n/)) {
+                  const eq = line.indexOf('=');
+                  if (eq === -1) continue;
+                  const k = line.slice(0, eq).trim();
+                  const v = unescapeDN(line.slice(eq + 1).trim());
+                  if (k) out[k] = v;
+                }
+                return out;
+              };
+              const issuerDN = parseDN(cert.issuer);
+              const subjectDN = parseDN(cert.subject);
+              issuerCN = issuerDN.CN || null;
+              issuerO = issuerDN.O || null;
+              subject = subjectDN.CN || null;
+              subjectO = subjectDN.O || null;
+              // Canonicalise the issuing CA to one of the two known VMC issuers
+              const issuerHaystack = `${issuerO || ''} ${issuerCN || ''}`;
+              if (/DigiCert/i.test(issuerHaystack)) issuer = 'DigiCert';
+              else if (/Entrust/i.test(issuerHaystack)) issuer = 'Entrust';
+              else issuer = issuerO || issuerCN || null;
+
+              validFrom = cert.validFrom || null;
+              validTo = cert.validTo || null;
+              if (validTo) {
+                const expiry = Date.parse(validTo);
+                if (!Number.isNaN(expiry)) {
+                  const now = Date.now();
+                  expired = expiry < now;
+                  expiringSoon = !expired && expiry - now < 30 * 24 * 60 * 60 * 1000;
+                }
+              }
+            } catch (parseErr) {
+              logger.debug('VMC certificate parse failed', { error: parseErr.message });
+            }
+          }
+          vmc = {
+            url: tags.a,
+            fetched: true,
+            isHttps: resource.isHttps,
+            contentType: resource.contentType,
+            fileSize: resource.fullLength,
+            looksLikePem,
+            issuer,
+            issuerCN,
+            issuerO,
+            subject,
+            subjectO,
+            validFrom,
+            validTo,
+            expired,
+            expiringSoon,
+          };
+          if (!looksLikePem) {
+            issues.push({ severity: 'warning', message: 'VMC URL did not return a PEM certificate chain — Gmail may reject the BIMI logo' });
+          }
+          if (!resource.isHttps) {
+            issues.push({ severity: 'warning', message: 'VMC URL should use HTTPS' });
+          }
+          if (expired) {
+            issues.push({
+              severity: 'error',
+              message: `VMC certificate expired on ${validTo}. Gmail will refuse to display the BIMI logo until a new VMC is issued.`,
+            });
+          } else if (expiringSoon) {
+            issues.push({
+              severity: 'warning',
+              message: `VMC certificate expires in less than 30 days (on ${validTo}). Renew before expiry to avoid Gmail BIMI dropouts.`,
+            });
+          }
+        }
+      } catch (e) {
+        vmc = { url: tags.a, fetched: false, error: e.message };
+        issues.push({
+          severity: 'warning',
+          message: `Unable to fetch VMC: ${e.message}. Gmail BIMI requires a valid VMC.`,
+        });
+      }
+    } else {
+      issues.push({
+        severity: 'info',
+        message:
+          'No VMC (a=) tag — your logo will display in Yahoo, Apple Mail, AOL, and Fastmail but not Gmail. Gmail strictly requires a Verified Mark Certificate.',
+      });
+    }
+
+    const response = {
+      domain,
+      timestamp: new Date().toISOString(),
+      found: true,
+      record: raw,
+      tags,
+      logo,
+      vmc,
+      dmarc,
+      issues,
+      valid: issues.filter((i) => i.severity === 'error').length === 0,
+      clientCompatibility: {
+        gmail: !!(vmc && vmc.fetched && vmc.looksLikePem && vmc.expired !== true) && dmarc.eligible && !!(logo && logo.svgValid),
+        yahoo: dmarc.eligible && !!(logo && logo.svgValid),
+        appleMail: dmarc.eligible && !!(logo && logo.svgValid),
+        aol: dmarc.eligible && !!(logo && logo.svgValid),
+        fastmail: dmarc.eligible && !!(logo && logo.svgValid),
+      },
+      lookupTime: Date.now() - startTime,
+      cached: false,
+    };
+
+    await redisUtils.setex(cacheKey, 3600, response);
+
+    logger.info('BIMI check completed', {
+      requestId,
+      domain,
+      hasVMC: !!tags.a,
+      dmarcEligible: dmarc.eligible,
+      issueCount: issues.length,
+      lookupTime: response.lookupTime,
+    });
+
+    return sendSuccess(res, 'BIMI record analyzed successfully', response);
+  }
+);
 
 module.exports = router;
