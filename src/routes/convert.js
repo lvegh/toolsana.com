@@ -5,9 +5,80 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
-const Potrace = require('potrace');
+const { vectorize, ColorMode, Hierarchical, PathSimplifyMode } = require('@neplex/vectorizer');
 
 const router = express.Router();
+
+// ---------------------------------------------------------------------------
+// Raster-to-vector (image -> SVG) configuration.
+//
+// We use VTracer (@neplex/vectorizer), a full-color vectorizer, instead of the
+// old single-color Potrace engine. Potrace can only ever emit a one-color
+// silhouette, which is why colorful images collapsed into a flat blob and
+// dense/complex images came back blank. VTracer performs color clustering and
+// traces every color region, so it produces a faithful, scalable result for
+// any image - logos, colorful illustrations, infographics and photos alike.
+//
+// The frontend exposes three simple controls that map onto VTracer's params:
+//   - mode:      'color' (full color, default) | 'bw' (black & white)
+//   - detail:    'low' | 'medium' | 'high'  (how much fine detail to keep)
+//   - smoothing: 'smooth' (curved paths) | 'sharp' (angular polygons)
+// ---------------------------------------------------------------------------
+const SVG_DETAIL_PRESETS = {
+  // filterSpeckle: higher drops more tiny specks (less detail/noise)
+  // colorPrecision: higher keeps more distinct colors (more faithful)
+  // layerDifference: lower produces more color layers (more detail)
+  low: { filterSpeckle: 10, colorPrecision: 4, layerDifference: 32 },
+  medium: { filterSpeckle: 4, colorPrecision: 6, layerDifference: 16 },
+  high: { filterSpeckle: 2, colorPrecision: 8, layerDifference: 8 }
+};
+
+// Cap the raster resolution we feed to the tracer. The SVG output is
+// resolution-independent, so this keeps tracing fast and the file size sane
+// for very large uploads without reducing the quality of the scalable result.
+const SVG_MAX_TRACE_DIMENSION = 1500;
+
+/**
+ * Vectorize an encoded image buffer (PNG/JPG/etc.) into an SVG string using
+ * VTracer. Normalizes and bounds the input via sharp first for robustness.
+ *
+ * @param {Buffer} inputBuffer encoded source image
+ * @param {{mode?: string, detail?: string, smoothing?: string}} opts
+ * @returns {Promise<string>} SVG markup
+ */
+async function vectorizeImageToSvg(inputBuffer, opts = {}) {
+  const mode = opts.mode === 'bw' ? 'bw' : 'color';
+  const detail = SVG_DETAIL_PRESETS[opts.detail] ? opts.detail : 'medium';
+  const smoothing = opts.smoothing === 'sharp' ? 'sharp' : 'smooth';
+  const preset = SVG_DETAIL_PRESETS[detail];
+
+  // Normalize to a bounded PNG (preserves alpha, flattens odd color spaces).
+  const normalized = await sharp(inputBuffer)
+    .resize({
+      width: SVG_MAX_TRACE_DIMENSION,
+      height: SVG_MAX_TRACE_DIMENSION,
+      fit: 'inside',
+      withoutEnlargement: true
+    })
+    .png()
+    .toBuffer();
+
+  const svg = await vectorize(normalized, {
+    colorMode: mode === 'bw' ? ColorMode.Binary : ColorMode.Color,
+    colorPrecision: preset.colorPrecision,
+    filterSpeckle: preset.filterSpeckle,
+    layerDifference: preset.layerDifference,
+    spliceThreshold: 45,
+    cornerThreshold: 60,
+    hierarchical: Hierarchical.Stacked,
+    mode: smoothing === 'sharp' ? PathSimplifyMode.Polygon : PathSimplifyMode.Spline,
+    lengthThreshold: 4,
+    maxIterations: 10,
+    pathPrecision: 5
+  });
+
+  return svg;
+}
 
 // Configure multer for JPG/JPEG file uploads
 const uploadJpg = multer({
@@ -402,7 +473,7 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
 
 /**
  * POST /api/convert/png-to-svg
- * Convert PNG images to SVG using JavaScript Potrace (Railway-compatible)
+ * Convert PNG images to full-color SVG using VTracer (@neplex/vectorizer)
  */
 router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req, res) => {
   try {
@@ -413,50 +484,22 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const threshold = parseInt(req.body.threshold) || 128;
-    const turdSize = parseInt(req.body.turdSize) || 2;
-    const alphaMax = parseFloat(req.body.alphaMax) || 1.0;
-    const optCurve = req.body.optCurve !== 'false';
-    const optTolerance = parseFloat(req.body.optTolerance) || 0.2;
-    const turnPolicy = req.body.turnPolicy || 'minority';
-    const color = req.body.color || 'auto';
 
-    // Validate parameters
-    if (threshold < 0 || threshold > 255) {
-      return sendError(res, 'Threshold must be between 0 and 255', 400);
-    }
+    // Simple, engine-agnostic controls from the frontend.
+    const mode = req.body.mode === 'bw' ? 'bw' : 'color';
+    const detail = SVG_DETAIL_PRESETS[req.body.detail] ? req.body.detail : 'medium';
+    const smoothing = req.body.smoothing === 'sharp' ? 'sharp' : 'smooth';
 
-    if (turdSize < 0 || turdSize > 100) {
-      return sendError(res, 'Turd size must be between 0 and 100', 400);
-    }
-
-    if (alphaMax < 0 || alphaMax > 1.3) {
-      return sendError(res, 'Alpha max must be between 0 and 1.3', 400);
-    }
-
-    if (optTolerance < 0 || optTolerance > 1) {
-      return sendError(res, 'Optimization tolerance must be between 0 and 1', 400);
-    }
-
-    const validTurnPolicies = ['black', 'white', 'left', 'right', 'minority', 'majority'];
-    if (!validTurnPolicies.includes(turnPolicy)) {
-      return sendError(res, 'Invalid turn policy', 400);
-    }
-
-    logger.info('Starting PNG to SVG conversion (JavaScript Potrace)', {
+    logger.info('Starting PNG to SVG conversion (VTracer)', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       mimetype: req.file.mimetype,
-      threshold,
-      turdSize,
-      alphaMax,
-      optCurve,
-      optTolerance,
-      turnPolicy,
-      color
+      mode,
+      detail,
+      smoothing
     });
 
-    // Get PNG metadata
+    // Get PNG metadata (for logging + response headers)
     const metadata = await sharp(originalBuffer).metadata();
 
     logger.info('PNG metadata', {
@@ -468,183 +511,30 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       colorspace: metadata.space
     });
 
-    // Configure potrace options for JavaScript implementation
-    const potraceOptions = {
-      threshold: threshold,
-      turdSize: turdSize,
-      alphaMax: alphaMax,
-      optCurve: optCurve,
-      optTolerance: optTolerance,
-      turnPolicy: turnPolicy
-    };
+    // Vectorize with VTracer (full-color, handles any image).
+    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing });
 
-    // ------------------------------------------------------------------
-    // Pre-process the image so Potrace can actually trace it.
-    //
-    // Potrace traces a single-color silhouette based on luminance: pixels
-    // darker than `threshold` become the foreground that gets traced.
-    // Two common cases break this and produce a blank/empty SVG:
-    //   1. Transparent PNGs (logos/icons) - Potrace ignores the alpha
-    //      channel, so the actual shape is lost entirely.
-    //   2. Bright-colored shapes on a light background (e.g. a light-blue
-    //      logo on white) whose luminance sits above the threshold, so the
-    //      shape gets classified as background and nothing is traced.
-    //
-    // To handle both, we segment foreground from background: pixels that are
-    // transparent, or that closely match the background color (sampled from
-    // the four corners), become white; everything else becomes black. That
-    // clean black-on-white silhouette traces reliably regardless of the
-    // shape's color. We also detect the dominant foreground color so the
-    // output SVG keeps the original color instead of defaulting to black.
-    //
-    // If segmentation can't find a clear foreground/background split (e.g. a
-    // photograph with no uniform background), we fall back to handing the raw
-    // image to Potrace with the user-supplied threshold.
-    // ------------------------------------------------------------------
-    let traceBuffer = originalBuffer;
-    let outputColor = color;
-    let usedSegmentation = false;
-    let foregroundFraction = null;
-
-    if (metadata.width && metadata.height) {
-      try {
-        const width = metadata.width;
-        const height = metadata.height;
-        const rgba = await sharp(originalBuffer).ensureAlpha().raw().toBuffer();
-
-        // Estimate background color from the four corners.
-        const cornerIdx = [
-          0,
-          (width - 1) * 4,
-          (height - 1) * width * 4,
-          ((height - 1) * width + (width - 1)) * 4
-        ];
-        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
-        for (const c of cornerIdx) {
-          bgR += rgba[c];
-          bgG += rgba[c + 1];
-          bgB += rgba[c + 2];
-          bgA += rgba[c + 3];
-        }
-        bgR /= 4; bgG /= 4; bgB /= 4; bgA /= 4;
-
-        // Squared Euclidean color-distance tolerance for "matches background".
-        const tol = 60;
-        const tol2 = tol * tol * 3;
-
-        const total = width * height;
-        const mask = Buffer.alloc(total);
-        let fgR = 0, fgG = 0, fgB = 0, fgN = 0;
-        for (let p = 0, i = 0; p < total; p++, i += 4) {
-          const a = rgba[i + 3];
-          let isForeground;
-          if (a < 128) {
-            isForeground = false; // transparent => background
-          } else if (bgA < 128) {
-            isForeground = true; // transparent background => any opaque pixel is foreground
-          } else {
-            const dr = rgba[i] - bgR;
-            const dg = rgba[i + 1] - bgG;
-            const db = rgba[i + 2] - bgB;
-            isForeground = (dr * dr + dg * dg + db * db) > tol2;
-          }
-
-          if (isForeground) {
-            mask[p] = 0; // black foreground
-            fgR += rgba[i];
-            fgG += rgba[i + 1];
-            fgB += rgba[i + 2];
-            fgN += 1;
-          } else {
-            mask[p] = 255; // white background
-          }
-        }
-
-        foregroundFraction = fgN / total;
-
-        // Only trust segmentation when there's a clear foreground/background
-        // split. Otherwise fall back to the raw luminance trace.
-        if (foregroundFraction > 0.001 && foregroundFraction < 0.99) {
-          usedSegmentation = true;
-          traceBuffer = await sharp(mask, { raw: { width, height, channels: 1 } })
-            .png()
-            .toBuffer();
-
-          // The silhouette is pure black/white, so a mid threshold gives a
-          // clean trace regardless of the user-supplied threshold.
-          potraceOptions.threshold = 128;
-
-          // Keep the original color when the user left it on 'auto'.
-          if (color === 'auto' && fgN > 0) {
-            const toHex = (v) => Math.round(v).toString(16).padStart(2, '0');
-            outputColor = `#${toHex(fgR / fgN)}${toHex(fgG / fgN)}${toHex(fgB / fgN)}`;
-          }
-        }
-      } catch (segErr) {
-        logger.warn('Foreground segmentation failed, falling back to raw trace', {
-          error: segErr.message
-        });
-        traceBuffer = originalBuffer;
-        usedSegmentation = false;
-      }
-    }
-
-    // Apply the trace color: explicit user color, or auto-detected color.
-    if (outputColor && outputColor !== 'auto') {
-      potraceOptions.color = outputColor;
-    }
-    // Keep the SVG background transparent (Potrace default).
-    potraceOptions.background = 'transparent';
-
-    logger.info('JavaScript Potrace options', {
-      ...potraceOptions,
-      usedSegmentation,
-      foregroundFraction,
-      detectedColor: outputColor
-    });
-
-    // Use JavaScript Potrace to trace the (pre-processed) image
-    const svgString = await new Promise((resolve, reject) => {
-      Potrace.trace(traceBuffer, potraceOptions, (err, svg) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(svg);
-        }
-      });
-    });
-
-    // Verify the SVG was generated
+    // Verify the SVG was generated and is valid.
     if (!svgString || svgString.length === 0) {
       throw new Error('Vectorization resulted in empty SVG');
     }
-
-    // Additional validation - check if SVG is valid
     if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
       throw new Error('Generated SVG is invalid or corrupted');
     }
 
-    // Convert string to buffer for consistent handling
     const svgBuffer = Buffer.from(svgString, 'utf8');
-
-    // Generate filename
     const filename = `${originalName}.svg`;
-
     const compressionRatio = ((originalBuffer.length - svgBuffer.length) / originalBuffer.length * 100).toFixed(2);
 
-    logger.info('PNG to SVG conversion completed (JavaScript Potrace)', {
+    logger.info('PNG to SVG conversion completed (VTracer)', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       convertedSize: svgBuffer.length,
       compressionRatio: compressionRatio + '%',
       svgLength: svgString.length,
-      threshold,
-      turdSize,
-      alphaMax,
-      optCurve,
-      optTolerance,
-      turnPolicy,
-      color,
+      mode,
+      detail,
+      smoothing,
       filename
     });
 
@@ -657,35 +547,27 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': svgBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
-      'X-Threshold': threshold.toString(),
-      'X-Turd-Size': turdSize.toString(),
-      'X-Alpha-Max': alphaMax.toString(),
-      'X-Opt-Curve': optCurve.toString(),
-      'X-Opt-Tolerance': optTolerance.toString(),
-      'X-Turn-Policy': turnPolicy,
-      'X-Color': color,
+      'X-Mode': mode,
+      'X-Detail': detail,
+      'X-Smoothing': smoothing,
       'X-Original-Width': (metadata.width || 'unknown').toString(),
       'X-Original-Height': (metadata.height || 'unknown').toString(),
       'X-Original-Channels': (metadata.channels || 'unknown').toString(),
-      'X-Engine': 'potrace-js'
+      'X-Engine': 'vtracer'
     });
 
     // Send the converted SVG
     res.send(svgBuffer);
 
   } catch (error) {
-    logger.error('PNG to SVG conversion error (JavaScript Potrace):', {
+    logger.error('PNG to SVG conversion error (VTracer):', {
       error: error.message,
       stack: error.stack,
       originalName: req.file?.originalname,
       fileSize: req.file?.size,
-      threshold: req.body?.threshold,
-      turdSize: req.body?.turdSize,
-      alphaMax: req.body?.alphaMax,
-      optCurve: req.body?.optCurve,
-      optTolerance: req.body?.optTolerance,
-      turnPolicy: req.body?.turnPolicy,
-      color: req.body?.color
+      mode: req.body?.mode,
+      detail: req.body?.detail,
+      smoothing: req.body?.smoothing
     });
 
     if (error.message.includes('File must be a PNG image')) {
@@ -700,7 +582,7 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
     }
 
-    if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+    if (error.message.includes('unsupported image format') || error.message.includes('Input buffer')) {
       return sendError(res, 'Image file could not be processed. Please ensure the file is a valid PNG.', 400);
     }
 
@@ -712,7 +594,7 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
 
 /**
  * POST /api/convert/jpg-to-svg
- * Convert JPG/JPEG images to SVG using JavaScript Potrace (Railway-compatible)
+ * Convert JPG/JPEG images to full-color SVG using VTracer (@neplex/vectorizer)
  */
 router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req, res) => {
   try {
@@ -723,50 +605,22 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const threshold = parseInt(req.body.threshold) || 128;
-    const turdSize = parseInt(req.body.turdSize) || 2;
-    const alphaMax = parseFloat(req.body.alphaMax) || 1.0;
-    const optCurve = req.body.optCurve !== 'false';
-    const optTolerance = parseFloat(req.body.optTolerance) || 0.2;
-    const turnPolicy = req.body.turnPolicy || 'minority';
-    const color = req.body.color || 'auto';
 
-    // Same validation as PNG to SVG...
-    if (threshold < 0 || threshold > 255) {
-      return sendError(res, 'Threshold must be between 0 and 255', 400);
-    }
+    // Simple, engine-agnostic controls from the frontend.
+    const mode = req.body.mode === 'bw' ? 'bw' : 'color';
+    const detail = SVG_DETAIL_PRESETS[req.body.detail] ? req.body.detail : 'medium';
+    const smoothing = req.body.smoothing === 'sharp' ? 'sharp' : 'smooth';
 
-    if (turdSize < 0 || turdSize > 100) {
-      return sendError(res, 'Turd size must be between 0 and 100', 400);
-    }
-
-    if (alphaMax < 0 || alphaMax > 1.3) {
-      return sendError(res, 'Alpha max must be between 0 and 1.3', 400);
-    }
-
-    if (optTolerance < 0 || optTolerance > 1) {
-      return sendError(res, 'Optimization tolerance must be between 0 and 1', 400);
-    }
-
-    const validTurnPolicies = ['black', 'white', 'left', 'right', 'minority', 'majority'];
-    if (!validTurnPolicies.includes(turnPolicy)) {
-      return sendError(res, 'Invalid turn policy', 400);
-    }
-
-    logger.info('Starting JPG to SVG conversion (JavaScript Potrace)', {
+    logger.info('Starting JPG to SVG conversion (VTracer)', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       mimetype: req.file.mimetype,
-      threshold,
-      turdSize,
-      alphaMax,
-      optCurve,
-      optTolerance,
-      turnPolicy,
-      color
+      mode,
+      detail,
+      smoothing
     });
 
-    // Get JPG metadata
+    // Get JPG metadata (for logging + response headers)
     const metadata = await sharp(originalBuffer).metadata();
 
     logger.info('JPG metadata', {
@@ -777,161 +631,30 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       colorspace: metadata.space
     });
 
-    // Configure potrace options for JavaScript implementation
-    const potraceOptions = {
-      threshold: threshold,
-      turdSize: turdSize,
-      alphaMax: alphaMax,
-      optCurve: optCurve,
-      optTolerance: optTolerance,
-      turnPolicy: turnPolicy
-    };
+    // Vectorize with VTracer (full-color, handles any image).
+    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing });
 
-    // ------------------------------------------------------------------
-    // Pre-process the image so Potrace can actually trace it. See the
-    // detailed explanation on the /png-to-svg route above. In short: Potrace
-    // only traces shapes darker than `threshold`, so a bright-colored shape
-    // on a light background (e.g. a light-blue logo on white) gets treated
-    // as background and produces a blank SVG. We segment foreground from the
-    // background color sampled from the corners and trace a clean
-    // black-on-white silhouette instead, keeping the original color.
-    // ------------------------------------------------------------------
-    let traceBuffer = originalBuffer;
-    let outputColor = color;
-    let usedSegmentation = false;
-    let foregroundFraction = null;
-
-    if (metadata.width && metadata.height) {
-      try {
-        const width = metadata.width;
-        const height = metadata.height;
-        const rgba = await sharp(originalBuffer).ensureAlpha().raw().toBuffer();
-
-        // Estimate background color from the four corners.
-        const cornerIdx = [
-          0,
-          (width - 1) * 4,
-          (height - 1) * width * 4,
-          ((height - 1) * width + (width - 1)) * 4
-        ];
-        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
-        for (const c of cornerIdx) {
-          bgR += rgba[c];
-          bgG += rgba[c + 1];
-          bgB += rgba[c + 2];
-          bgA += rgba[c + 3];
-        }
-        bgR /= 4; bgG /= 4; bgB /= 4; bgA /= 4;
-
-        const tol = 60;
-        const tol2 = tol * tol * 3;
-
-        const total = width * height;
-        const mask = Buffer.alloc(total);
-        let fgR = 0, fgG = 0, fgB = 0, fgN = 0;
-        for (let p = 0, i = 0; p < total; p++, i += 4) {
-          const a = rgba[i + 3];
-          let isForeground;
-          if (a < 128) {
-            isForeground = false;
-          } else if (bgA < 128) {
-            isForeground = true;
-          } else {
-            const dr = rgba[i] - bgR;
-            const dg = rgba[i + 1] - bgG;
-            const db = rgba[i + 2] - bgB;
-            isForeground = (dr * dr + dg * dg + db * db) > tol2;
-          }
-
-          if (isForeground) {
-            mask[p] = 0;
-            fgR += rgba[i];
-            fgG += rgba[i + 1];
-            fgB += rgba[i + 2];
-            fgN += 1;
-          } else {
-            mask[p] = 255;
-          }
-        }
-
-        foregroundFraction = fgN / total;
-
-        if (foregroundFraction > 0.001 && foregroundFraction < 0.99) {
-          usedSegmentation = true;
-          traceBuffer = await sharp(mask, { raw: { width, height, channels: 1 } })
-            .png()
-            .toBuffer();
-          potraceOptions.threshold = 128;
-
-          if (color === 'auto' && fgN > 0) {
-            const toHex = (v) => Math.round(v).toString(16).padStart(2, '0');
-            outputColor = `#${toHex(fgR / fgN)}${toHex(fgG / fgN)}${toHex(fgB / fgN)}`;
-          }
-        }
-      } catch (segErr) {
-        logger.warn('Foreground segmentation failed, falling back to raw trace', {
-          error: segErr.message
-        });
-        traceBuffer = originalBuffer;
-        usedSegmentation = false;
-      }
-    }
-
-    // Apply the trace color: explicit user color, or auto-detected color.
-    if (outputColor && outputColor !== 'auto') {
-      potraceOptions.color = outputColor;
-    }
-    potraceOptions.background = 'transparent';
-
-    logger.info('JavaScript Potrace options', {
-      ...potraceOptions,
-      usedSegmentation,
-      foregroundFraction,
-      detectedColor: outputColor
-    });
-
-    // Use JavaScript Potrace to trace the (pre-processed) JPG image
-    const svgString = await new Promise((resolve, reject) => {
-      Potrace.trace(traceBuffer, potraceOptions, (err, svg) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(svg);
-        }
-      });
-    });
-
-    // Verify the SVG was generated
+    // Verify the SVG was generated and is valid.
     if (!svgString || svgString.length === 0) {
       throw new Error('Vectorization resulted in empty SVG');
     }
-
-    // Additional validation - check if SVG is valid
     if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
       throw new Error('Generated SVG is invalid or corrupted');
     }
 
-    // Convert string to buffer for consistent handling
     const svgBuffer = Buffer.from(svgString, 'utf8');
-
-    // Generate filename
     const filename = `${originalName}.svg`;
-
     const compressionRatio = ((originalBuffer.length - svgBuffer.length) / originalBuffer.length * 100).toFixed(2);
 
-    logger.info('JPG to SVG conversion completed (JavaScript Potrace)', {
+    logger.info('JPG to SVG conversion completed (VTracer)', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       convertedSize: svgBuffer.length,
       compressionRatio: compressionRatio + '%',
       svgLength: svgString.length,
-      threshold,
-      turdSize,
-      alphaMax,
-      optCurve,
-      optTolerance,
-      turnPolicy,
-      color,
+      mode,
+      detail,
+      smoothing,
       filename
     });
 
@@ -944,35 +667,27 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': svgBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
-      'X-Threshold': threshold.toString(),
-      'X-Turd-Size': turdSize.toString(),
-      'X-Alpha-Max': alphaMax.toString(),
-      'X-Opt-Curve': optCurve.toString(),
-      'X-Opt-Tolerance': optTolerance.toString(),
-      'X-Turn-Policy': turnPolicy,
-      'X-Color': color,
+      'X-Mode': mode,
+      'X-Detail': detail,
+      'X-Smoothing': smoothing,
       'X-Original-Width': (metadata.width || 'unknown').toString(),
       'X-Original-Height': (metadata.height || 'unknown').toString(),
       'X-Original-Format': 'JPEG',
-      'X-Engine': 'potrace-js'
+      'X-Engine': 'vtracer'
     });
 
     // Send the converted SVG
     res.send(svgBuffer);
 
   } catch (error) {
-    logger.error('JPG to SVG conversion error (JavaScript Potrace):', {
+    logger.error('JPG to SVG conversion error (VTracer):', {
       error: error.message,
       stack: error.stack,
       originalName: req.file?.originalname,
       fileSize: req.file?.size,
-      threshold: req.body?.threshold,
-      turdSize: req.body?.turdSize,
-      alphaMax: req.body?.alphaMax,
-      optCurve: req.body?.optCurve,
-      optTolerance: req.body?.optTolerance,
-      turnPolicy: req.body?.turnPolicy,
-      color: req.body?.color
+      mode: req.body?.mode,
+      detail: req.body?.detail,
+      smoothing: req.body?.smoothing
     });
 
     if (error.message.includes('File must be a JPG/JPEG image')) {
@@ -987,7 +702,7 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
     }
 
-    if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+    if (error.message.includes('unsupported image format') || error.message.includes('Input buffer')) {
       return sendError(res, 'Image file could not be processed. Please ensure the file is a valid JPG.', 400);
     }
 
