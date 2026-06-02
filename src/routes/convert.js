@@ -28,15 +28,24 @@ const SVG_DETAIL_PRESETS = {
   // filterSpeckle: higher drops more tiny specks (less detail/noise)
   // colorPrecision: higher keeps more distinct colors (more faithful)
   // layerDifference: lower produces more color layers (more detail)
-  low: { filterSpeckle: 10, colorPrecision: 4, layerDifference: 32 },
-  medium: { filterSpeckle: 4, colorPrecision: 6, layerDifference: 16 },
-  high: { filterSpeckle: 2, colorPrecision: 8, layerDifference: 8 }
+  // cornerThreshold: higher = fewer corners = smoother, rounder paths
+  // spliceThreshold: higher = paths spliced more aggressively (smoother)
+  low: { filterSpeckle: 12, colorPrecision: 5, layerDifference: 24, cornerThreshold: 90, spliceThreshold: 60 },
+  medium: { filterSpeckle: 8, colorPrecision: 6, layerDifference: 16, cornerThreshold: 80, spliceThreshold: 45 },
+  high: { filterSpeckle: 6, colorPrecision: 8, layerDifference: 12, cornerThreshold: 70, spliceThreshold: 45 }
 };
 
-// Cap the raster resolution we feed to the tracer. The SVG output is
-// resolution-independent, so this keeps tracing fast and the file size sane
-// for very large uploads without reducing the quality of the scalable result.
-const SVG_MAX_TRACE_DIMENSION = 1500;
+// Target trace resolution (longest side, in px). We normalize every image to
+// roughly this size before tracing:
+//   - Large uploads are downscaled, keeping tracing fast and file sizes sane.
+//   - Small images are UPSCALED (via lanczos). This is the key to clean output
+//     for logos/cartoons/clip-art: tracing a small anti-aliased raster yields
+//     jagged, broken edges, whereas tracing an upscaled copy lets the tracer
+//     fit smooth, continuous curves. The SVG is resolution-independent, so the
+//     normalization never limits the quality of the final scalable result.
+const SVG_TARGET_TRACE_DIMENSION = 1500;
+// Don't magnify tiny images beyond this factor (avoids an over-blurred trace).
+const SVG_MAX_UPSCALE_FACTOR = 3;
 
 /**
  * Vectorize an encoded image buffer (PNG/JPG/etc.) into an SVG string using
@@ -52,14 +61,17 @@ async function vectorizeImageToSvg(inputBuffer, opts = {}) {
   const smoothing = opts.smoothing === 'sharp' ? 'sharp' : 'smooth';
   const preset = SVG_DETAIL_PRESETS[detail];
 
-  // Normalize to a bounded PNG (preserves alpha, flattens odd color spaces).
+  // Normalize the trace resolution: upscale small art / downscale huge photos
+  // toward SVG_TARGET_TRACE_DIMENSION (see the constant's docs for why).
+  const metadata = await sharp(inputBuffer).metadata();
+  const longestSide = Math.max(metadata.width || 0, metadata.height || 0) || SVG_TARGET_TRACE_DIMENSION;
+  const scale = Math.min(SVG_TARGET_TRACE_DIMENSION / longestSide, SVG_MAX_UPSCALE_FACTOR);
+  const targetWidth = Math.max(1, Math.round((metadata.width || SVG_TARGET_TRACE_DIMENSION) * scale));
+
+  // Preserves alpha and flattens odd color spaces; lanczos keeps edges crisp.
   const normalized = await sharp(inputBuffer)
-    .resize({
-      width: SVG_MAX_TRACE_DIMENSION,
-      height: SVG_MAX_TRACE_DIMENSION,
-      fit: 'inside',
-      withoutEnlargement: true
-    })
+    .ensureAlpha()
+    .resize({ width: targetWidth, kernel: 'lanczos3' })
     .png()
     .toBuffer();
 
@@ -68,8 +80,8 @@ async function vectorizeImageToSvg(inputBuffer, opts = {}) {
     colorPrecision: preset.colorPrecision,
     filterSpeckle: preset.filterSpeckle,
     layerDifference: preset.layerDifference,
-    spliceThreshold: 45,
-    cornerThreshold: 60,
+    spliceThreshold: preset.spliceThreshold,
+    cornerThreshold: preset.cornerThreshold,
     hierarchical: Hierarchical.Stacked,
     mode: smoothing === 'sharp' ? PathSimplifyMode.Polygon : PathSimplifyMode.Spline,
     lengthThreshold: 4,
