@@ -478,16 +478,134 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       turnPolicy: turnPolicy
     };
 
-    // Add color if specified (not 'auto')
-    if (color !== 'auto') {
-      potraceOptions.color = color;
+    // ------------------------------------------------------------------
+    // Pre-process the image so Potrace can actually trace it.
+    //
+    // Potrace traces a single-color silhouette based on luminance: pixels
+    // darker than `threshold` become the foreground that gets traced.
+    // Two common cases break this and produce a blank/empty SVG:
+    //   1. Transparent PNGs (logos/icons) - Potrace ignores the alpha
+    //      channel, so the actual shape is lost entirely.
+    //   2. Bright-colored shapes on a light background (e.g. a light-blue
+    //      logo on white) whose luminance sits above the threshold, so the
+    //      shape gets classified as background and nothing is traced.
+    //
+    // To handle both, we segment foreground from background: pixels that are
+    // transparent, or that closely match the background color (sampled from
+    // the four corners), become white; everything else becomes black. That
+    // clean black-on-white silhouette traces reliably regardless of the
+    // shape's color. We also detect the dominant foreground color so the
+    // output SVG keeps the original color instead of defaulting to black.
+    //
+    // If segmentation can't find a clear foreground/background split (e.g. a
+    // photograph with no uniform background), we fall back to handing the raw
+    // image to Potrace with the user-supplied threshold.
+    // ------------------------------------------------------------------
+    let traceBuffer = originalBuffer;
+    let outputColor = color;
+    let usedSegmentation = false;
+    let foregroundFraction = null;
+
+    if (metadata.width && metadata.height) {
+      try {
+        const width = metadata.width;
+        const height = metadata.height;
+        const rgba = await sharp(originalBuffer).ensureAlpha().raw().toBuffer();
+
+        // Estimate background color from the four corners.
+        const cornerIdx = [
+          0,
+          (width - 1) * 4,
+          (height - 1) * width * 4,
+          ((height - 1) * width + (width - 1)) * 4
+        ];
+        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+        for (const c of cornerIdx) {
+          bgR += rgba[c];
+          bgG += rgba[c + 1];
+          bgB += rgba[c + 2];
+          bgA += rgba[c + 3];
+        }
+        bgR /= 4; bgG /= 4; bgB /= 4; bgA /= 4;
+
+        // Squared Euclidean color-distance tolerance for "matches background".
+        const tol = 60;
+        const tol2 = tol * tol * 3;
+
+        const total = width * height;
+        const mask = Buffer.alloc(total);
+        let fgR = 0, fgG = 0, fgB = 0, fgN = 0;
+        for (let p = 0, i = 0; p < total; p++, i += 4) {
+          const a = rgba[i + 3];
+          let isForeground;
+          if (a < 128) {
+            isForeground = false; // transparent => background
+          } else if (bgA < 128) {
+            isForeground = true; // transparent background => any opaque pixel is foreground
+          } else {
+            const dr = rgba[i] - bgR;
+            const dg = rgba[i + 1] - bgG;
+            const db = rgba[i + 2] - bgB;
+            isForeground = (dr * dr + dg * dg + db * db) > tol2;
+          }
+
+          if (isForeground) {
+            mask[p] = 0; // black foreground
+            fgR += rgba[i];
+            fgG += rgba[i + 1];
+            fgB += rgba[i + 2];
+            fgN += 1;
+          } else {
+            mask[p] = 255; // white background
+          }
+        }
+
+        foregroundFraction = fgN / total;
+
+        // Only trust segmentation when there's a clear foreground/background
+        // split. Otherwise fall back to the raw luminance trace.
+        if (foregroundFraction > 0.001 && foregroundFraction < 0.99) {
+          usedSegmentation = true;
+          traceBuffer = await sharp(mask, { raw: { width, height, channels: 1 } })
+            .png()
+            .toBuffer();
+
+          // The silhouette is pure black/white, so a mid threshold gives a
+          // clean trace regardless of the user-supplied threshold.
+          potraceOptions.threshold = 128;
+
+          // Keep the original color when the user left it on 'auto'.
+          if (color === 'auto' && fgN > 0) {
+            const toHex = (v) => Math.round(v).toString(16).padStart(2, '0');
+            outputColor = `#${toHex(fgR / fgN)}${toHex(fgG / fgN)}${toHex(fgB / fgN)}`;
+          }
+        }
+      } catch (segErr) {
+        logger.warn('Foreground segmentation failed, falling back to raw trace', {
+          error: segErr.message
+        });
+        traceBuffer = originalBuffer;
+        usedSegmentation = false;
+      }
     }
 
-    logger.info('JavaScript Potrace options', potraceOptions);
+    // Apply the trace color: explicit user color, or auto-detected color.
+    if (outputColor && outputColor !== 'auto') {
+      potraceOptions.color = outputColor;
+    }
+    // Keep the SVG background transparent (Potrace default).
+    potraceOptions.background = 'transparent';
 
-    // Use JavaScript Potrace to trace the image
+    logger.info('JavaScript Potrace options', {
+      ...potraceOptions,
+      usedSegmentation,
+      foregroundFraction,
+      detectedColor: outputColor
+    });
+
+    // Use JavaScript Potrace to trace the (pre-processed) image
     const svgString = await new Promise((resolve, reject) => {
-      Potrace.trace(originalBuffer, potraceOptions, (err, svg) => {
+      Potrace.trace(traceBuffer, potraceOptions, (err, svg) => {
         if (err) {
           reject(err);
         } else {
@@ -669,16 +787,112 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       turnPolicy: turnPolicy
     };
 
-    // Add color if specified (not 'auto')
-    if (color !== 'auto') {
-      potraceOptions.color = color;
+    // ------------------------------------------------------------------
+    // Pre-process the image so Potrace can actually trace it. See the
+    // detailed explanation on the /png-to-svg route above. In short: Potrace
+    // only traces shapes darker than `threshold`, so a bright-colored shape
+    // on a light background (e.g. a light-blue logo on white) gets treated
+    // as background and produces a blank SVG. We segment foreground from the
+    // background color sampled from the corners and trace a clean
+    // black-on-white silhouette instead, keeping the original color.
+    // ------------------------------------------------------------------
+    let traceBuffer = originalBuffer;
+    let outputColor = color;
+    let usedSegmentation = false;
+    let foregroundFraction = null;
+
+    if (metadata.width && metadata.height) {
+      try {
+        const width = metadata.width;
+        const height = metadata.height;
+        const rgba = await sharp(originalBuffer).ensureAlpha().raw().toBuffer();
+
+        // Estimate background color from the four corners.
+        const cornerIdx = [
+          0,
+          (width - 1) * 4,
+          (height - 1) * width * 4,
+          ((height - 1) * width + (width - 1)) * 4
+        ];
+        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+        for (const c of cornerIdx) {
+          bgR += rgba[c];
+          bgG += rgba[c + 1];
+          bgB += rgba[c + 2];
+          bgA += rgba[c + 3];
+        }
+        bgR /= 4; bgG /= 4; bgB /= 4; bgA /= 4;
+
+        const tol = 60;
+        const tol2 = tol * tol * 3;
+
+        const total = width * height;
+        const mask = Buffer.alloc(total);
+        let fgR = 0, fgG = 0, fgB = 0, fgN = 0;
+        for (let p = 0, i = 0; p < total; p++, i += 4) {
+          const a = rgba[i + 3];
+          let isForeground;
+          if (a < 128) {
+            isForeground = false;
+          } else if (bgA < 128) {
+            isForeground = true;
+          } else {
+            const dr = rgba[i] - bgR;
+            const dg = rgba[i + 1] - bgG;
+            const db = rgba[i + 2] - bgB;
+            isForeground = (dr * dr + dg * dg + db * db) > tol2;
+          }
+
+          if (isForeground) {
+            mask[p] = 0;
+            fgR += rgba[i];
+            fgG += rgba[i + 1];
+            fgB += rgba[i + 2];
+            fgN += 1;
+          } else {
+            mask[p] = 255;
+          }
+        }
+
+        foregroundFraction = fgN / total;
+
+        if (foregroundFraction > 0.001 && foregroundFraction < 0.99) {
+          usedSegmentation = true;
+          traceBuffer = await sharp(mask, { raw: { width, height, channels: 1 } })
+            .png()
+            .toBuffer();
+          potraceOptions.threshold = 128;
+
+          if (color === 'auto' && fgN > 0) {
+            const toHex = (v) => Math.round(v).toString(16).padStart(2, '0');
+            outputColor = `#${toHex(fgR / fgN)}${toHex(fgG / fgN)}${toHex(fgB / fgN)}`;
+          }
+        }
+      } catch (segErr) {
+        logger.warn('Foreground segmentation failed, falling back to raw trace', {
+          error: segErr.message
+        });
+        traceBuffer = originalBuffer;
+        usedSegmentation = false;
+      }
     }
 
-    logger.info('JavaScript Potrace options', potraceOptions);
+    // Apply the trace color: explicit user color, or auto-detected color.
+    if (outputColor && outputColor !== 'auto') {
+      potraceOptions.color = outputColor;
+    }
+    potraceOptions.background = 'transparent';
 
-    // Use JavaScript Potrace to trace the JPG image
+    logger.info('JavaScript Potrace options', {
+      ...potraceOptions,
+      usedSegmentation,
+      foregroundFraction,
+      detectedColor: outputColor
+    });
+
+    // Use JavaScript Potrace to trace the (pre-processed) JPG image
     const svgString = await new Promise((resolve, reject) => {
-      Potrace.trace(originalBuffer, potraceOptions, (err, svg) => {
+      Potrace.trace(traceBuffer, potraceOptions, (err, svg) => {
         if (err) {
           reject(err);
         } else {
