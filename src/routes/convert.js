@@ -48,8 +48,83 @@ const SVG_TARGET_TRACE_DIMENSION = 1500;
 const SVG_MAX_UPSCALE_FACTOR = 3;
 
 /**
+ * Detect a solid, opaque background color by sampling the image's four corners.
+ * Returns a hex color string when the corners are opaque and agree on a single
+ * color (a clean canvas background), or null when the background is transparent
+ * or non-uniform (e.g. a photo) - in which case we leave the SVG transparent.
+ *
+ * @param {Buffer} inputBuffer encoded source image
+ * @param {{width?: number, height?: number}} metadata sharp metadata
+ * @returns {Promise<string|null>} hex color or null
+ */
+async function detectSolidBackground(inputBuffer, metadata) {
+  const w = metadata.width;
+  const h = metadata.height;
+  if (!w || !h) return null;
+
+  const rgba = await sharp(inputBuffer).ensureAlpha().raw().toBuffer();
+  const idx = [0, (w - 1) * 4, (h - 1) * w * 4, ((h - 1) * w + (w - 1)) * 4];
+  const corners = idx.map((i) => [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]);
+
+  // Mostly-transparent corners => transparent background, keep it transparent.
+  const avgAlpha = corners.reduce((s, c) => s + c[3], 0) / corners.length;
+  if (avgAlpha < 200) return null;
+
+  // Corners must agree on a color to count as a uniform solid background.
+  const r = corners.reduce((s, c) => s + c[0], 0) / corners.length;
+  const g = corners.reduce((s, c) => s + c[1], 0) / corners.length;
+  const b = corners.reduce((s, c) => s + c[2], 0) / corners.length;
+  const maxDist = Math.max(...corners.map((c) => Math.hypot(c[0] - r, c[1] - g, c[2] - b)));
+  if (maxDist > 40) return null;
+
+  const toHex = (v) => Math.round(v).toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+/**
+ * Rewrite the VTracer SVG so its canvas matches the ORIGINAL upload dimensions.
+ *
+ * VTracer stamps the (upscaled) trace dimensions into the SVG's width/height and
+ * emits no viewBox. We set width/height back to the original size and add a
+ * viewBox of the trace dimensions, so the SVG renders at the original size while
+ * the paths scale losslessly into it. When a solid background was detected, we
+ * also inject a full-canvas background rect so the canvas is reliably filled.
+ *
+ * @param {string} svg VTracer SVG markup
+ * @param {number} origW original image width
+ * @param {number} origH original image height
+ * @param {string|null} bg detected background hex color, or null
+ * @returns {string} adjusted SVG markup
+ */
+function fitSvgToOriginalCanvas(svg, origW, origH, bg) {
+  const openTagMatch = svg.match(/<svg([^>]*?)>/);
+  if (!openTagMatch || !origW || !origH) return svg;
+
+  const attrs = openTagMatch[1];
+  const traceW = (attrs.match(/\bwidth="(\d+(?:\.\d+)?)"/) || [])[1];
+  const traceH = (attrs.match(/\bheight="(\d+(?:\.\d+)?)"/) || [])[1];
+  if (!traceW || !traceH) return svg;
+
+  const cleanedAttrs = attrs
+    .replace(/\s*width="[^"]*"/, '')
+    .replace(/\s*height="[^"]*"/, '')
+    .replace(/\s*viewBox="[^"]*"/, '');
+
+  let newOpenTag =
+    `<svg${cleanedAttrs} width="${origW}" height="${origH}" ` +
+    `viewBox="0 0 ${traceW} ${traceH}" preserveAspectRatio="xMidYMid meet">`;
+
+  if (bg) {
+    newOpenTag += `\n<rect width="${traceW}" height="${traceH}" fill="${bg}"/>`;
+  }
+
+  return svg.replace(/<svg[^>]*?>/, newOpenTag);
+}
+
+/**
  * Vectorize an encoded image buffer (PNG/JPG/etc.) into an SVG string using
- * VTracer. Normalizes and bounds the input via sharp first for robustness.
+ * VTracer. Normalizes and bounds the input via sharp first for robustness, then
+ * fits the output canvas back to the original upload dimensions.
  *
  * @param {Buffer} inputBuffer encoded source image
  * @param {{mode?: string, detail?: string, smoothing?: string}} opts
@@ -67,6 +142,9 @@ async function vectorizeImageToSvg(inputBuffer, opts = {}) {
   const longestSide = Math.max(metadata.width || 0, metadata.height || 0) || SVG_TARGET_TRACE_DIMENSION;
   const scale = Math.min(SVG_TARGET_TRACE_DIMENSION / longestSide, SVG_MAX_UPSCALE_FACTOR);
   const targetWidth = Math.max(1, Math.round((metadata.width || SVG_TARGET_TRACE_DIMENSION) * scale));
+
+  // Detect a solid background to preserve (or transparency) on the original.
+  const background = await detectSolidBackground(inputBuffer, metadata);
 
   // Preserves alpha and flattens odd color spaces; lanczos keeps edges crisp.
   const normalized = await sharp(inputBuffer)
@@ -89,7 +167,8 @@ async function vectorizeImageToSvg(inputBuffer, opts = {}) {
     pathPrecision: 5
   });
 
-  return svg;
+  // Fit the canvas back to the original upload size and preserve the background.
+  return fitSvgToOriginalCanvas(svg, metadata.width, metadata.height, background);
 }
 
 // Configure multer for JPG/JPEG file uploads
