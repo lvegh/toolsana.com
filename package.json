@@ -67,6 +67,7 @@
     "node-cron": "^3.0.3",
     "nodemailer": "^8.0.4",
     "p-limit": "^7.1.1",
+    "pdf-lib": "^1.17.1",
     "pngquant-bin": "^9.0.0",
     "redis": "^4.6.12",
     "satori": "^0.18.2",

@@ -231,6 +231,7 @@ const linkCheckerRoutes = require('./link-checker');
 const emailRoutes = require('./email');
 const dnsRoutes = require('./dns');
 const securityRoutes = require('./security');
+const pdfRoutes = require('./pdf');
 
 // Register routes
 router.use('/webhooks', webhookRoutes);
@@ -254,6 +255,7 @@ router.use('/link-checker', linkCheckerRoutes);
 router.use('/email', emailRoutes);
 router.use('/dns', dnsRoutes);
 router.use('/security', securityRoutes);
+router.use('/pdf', pdfRoutes);
 
 // Example for future routes:
 // const authRoutes = require('./auth');
