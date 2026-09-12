@@ -1,6 +1,19 @@
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 const ipBanManager = require('../utils/ipBanManager');
 const securityNotifier = require('../utils/securityNotifier');
+
+/**
+ * Constant-time comparison for the shared API token — see the note in
+ * enhancedSecurity.js. Kept local so this module has no dependency on it.
+ */
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 /**
  * ONNX-Compatible Enhanced Security Middleware
@@ -10,17 +23,30 @@ const securityNotifier = require('../utils/securityNotifier');
 class EnhancedSecurityAi {
   constructor() {
     this.apiSecretToken = process.env.API_SECRET_TOKEN;
-    this.isDevelopment = process.env.NODE_ENV === 'development';
-    
+
+    // Opt-in bypass, refused under NODE_ENV=production — same contract as
+    // enhancedSecurity.js. Keep the two in step.
+    const bypassRequested = process.env.DISABLE_API_AUTH === 'true';
+    const isProduction = process.env.NODE_ENV === 'production';
+    this.isDevelopment = bypassRequested && !isProduction;
+
     // In-memory store for security context (ONNX-safe)
     this.securityContexts = new Map();
-    
-    if (!this.apiSecretToken && !this.isDevelopment) {
-      logger.error('API_SECRET_TOKEN not configured - enhanced security disabled');
+
+    if (bypassRequested && isProduction) {
+      logger.error(
+        'DISABLE_API_AUTH=true ignored because NODE_ENV=production - token validation stays ON'
+      );
     }
-    
+
     if (this.isDevelopment) {
-      logger.info('Development mode detected - API token validation disabled');
+      logger.warn(
+        'DISABLE_API_AUTH=true - AI endpoint token validation is DISABLED. Never use this in a deployed environment.'
+      );
+    }
+
+    if (!this.apiSecretToken && !this.isDevelopment) {
+      logger.error('API_SECRET_TOKEN not configured - protected endpoints will reject every request');
     }
 
     // Clean up old security contexts periodically (prevent memory leaks)
@@ -31,7 +57,7 @@ class EnhancedSecurityAi {
    * Generate a unique request ID for security context tracking
    */
   generateRequestId(req) {
-    const ip = req.ip || req.connection.remoteAddress;
+    const ip = req.trustedClientIp || req.ip || req.connection.remoteAddress;
     const timestamp = Date.now();
     const userAgent = req.get('User-Agent') || 'Unknown';
     return `${ip}-${timestamp}-${Buffer.from(userAgent).toString('base64').slice(0, 8)}`;
@@ -74,7 +100,7 @@ class EnhancedSecurityAi {
   middleware() {
     return async (req, res, next) => {
       const startTime = Date.now();
-      const ip = req.ip || req.connection.remoteAddress;
+      const ip = req.trustedClientIp || req.ip || req.connection.remoteAddress;
       const userAgent = req.get('User-Agent') || 'Unknown';
       const endpoint = req.originalUrl;
       const requestId = this.generateRequestId(req);
@@ -177,7 +203,7 @@ class EnhancedSecurityAi {
         }
 
         // Check if token is valid
-        if (token !== this.apiSecretToken) {
+        if (!safeEqual(token, this.apiSecretToken)) {
           await this.handleFailedAttempt(ip, 'Invalid authentication token', {
             endpoint,
             userAgent,
@@ -334,7 +360,7 @@ class EnhancedSecurityAi {
    */
   optional() {
     return async (req, res, next) => {
-      const ip = req.ip || req.connection.remoteAddress;
+      const ip = req.trustedClientIp || req.ip || req.connection.remoteAddress;
       const userAgent = req.get('User-Agent') || 'Unknown';
       const endpoint = req.originalUrl;
       const requestId = this.generateRequestId(req);
@@ -404,7 +430,7 @@ class EnhancedSecurityAi {
 
         // If token provided, validate it
         if (token) {
-          if (token === this.apiSecretToken) {
+          if (safeEqual(token, this.apiSecretToken)) {
             this.setSecurityContext(requestId, {
               ip,
               authMethod,

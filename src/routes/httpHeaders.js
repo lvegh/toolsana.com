@@ -3,34 +3,21 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { checkPublicHostname, pinnedLookup } = require('../utils/ssrfGuard');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
-// Domain validation helper
-const isValidDomain = (hostname) => {
-  // Block private/local networks
-  const privateRanges = [
-    /^localhost$/i,
-    /^127\./,
-    /^10\./,
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
-    /^192\.168\./,
-    /^::1$/,
-    /^fc00:/i,
-    /^fe80:/i,
-  ];
-
-  return !privateRanges.some(range => range.test(hostname));
-};
-
 // Fetch HTTP headers from target URL
 const fetchHeaders = (targetUrl) => {
-  return new Promise((resolve, reject) => {
+  // eslint-disable-next-line no-async-promise-executor -- checkPublicHostname never rejects
+  return new Promise(async (resolve, reject) => {
     try {
       const urlObj = new URL(targetUrl);
 
-      // Validate domain
-      if (!isValidDomain(urlObj.hostname)) {
+      // Screen the resolved host against private/reserved ranges
+      const guard = await checkPublicHostname(urlObj.hostname);
+      if (!guard.valid) {
         reject(new Error('Domain not allowed for security reasons'));
         return;
       }
@@ -39,6 +26,12 @@ const fetchHeaders = (targetUrl) => {
 
       const options = {
         hostname: urlObj.hostname,
+        // Dial the address checkPublicHostname already vetted. Connecting by
+        // name would re-resolve and reopen the DNS-rebinding window the check
+        // above exists to close. hostname stays set so SNI/Host/cert checks
+        // still see the real name.
+        lookup: pinnedLookup(guard.addresses[0]),
+
         port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
         path: urlObj.pathname + urlObj.search,
         method: 'HEAD',
@@ -93,7 +86,7 @@ const fetchHeaders = (targetUrl) => {
 };
 
 // POST /api/http-headers/check
-router.post('/check', basicRateLimit, async (req, res) => {
+router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { url } = req.body;
 

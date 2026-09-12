@@ -1,7 +1,9 @@
 const express = require('express');
-const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
+const { checkPublicUrl, safeFetch } = require('../utils/ssrfGuard');
+const { logOutbound } = require('../utils/outboundLog');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
@@ -9,7 +11,7 @@ const router = express.Router();
  * GET /api/fetch
  * Fetch external URL content (mainly for robots.txt and similar text files)
  */
-router.get('/', basicRateLimit, async (req, res) => {
+router.get('/', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { url } = req.query;
 
@@ -17,47 +19,25 @@ router.get('/', basicRateLimit, async (req, res) => {
       return sendError(res, 'URL parameter is required', 400);
     }
 
-    // Validate and clean URL
-    let targetUrl;
-    try {
-      targetUrl = new URL(url);
-    } catch (error) {
-      return sendError(res, 'Invalid URL format', 400);
+    // Validate URL + screen the resolved host against private/reserved ranges
+    // (protocol enforcement, DNS resolution, and CIDR checks live in ssrfGuard).
+    const guard = await checkPublicUrl(url);
+    if (!guard.valid) {
+      const status = guard.error === 'Access to private/local networks is not allowed' ? 403 : 400;
+      return sendError(res, guard.error, status);
     }
+    const targetUrl = guard.url;
 
-    // Security: Only allow HTTP/HTTPS protocols
-    if (!['http:', 'https:'].includes(targetUrl.protocol)) {
-      return sendError(res, 'Only HTTP and HTTPS URLs are allowed', 400);
-    }
-
-    // Security: Block private/local IPs and localhost
-    const hostname = targetUrl.hostname.toLowerCase();
-    if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname === '0.0.0.0' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('172.16.') ||
-      hostname.startsWith('172.17.') ||
-      hostname.startsWith('172.18.') ||
-      hostname.startsWith('172.19.') ||
-      hostname.startsWith('172.2') ||
-      hostname.startsWith('172.30.') ||
-      hostname.startsWith('172.31.') ||
-      hostname === '::1' ||
-      hostname.startsWith('fc00') ||
-      hostname.startsWith('fe80')
-    ) {
-      return sendError(res, 'Access to private/local networks is not allowed', 403);
-    }
+    logOutbound({ tool: 'api-fetch', targetUrl: targetUrl.toString(), method: 'GET', req });
 
     // Fetch the content with timeout and size limits
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
     try {
-      const response = await fetch(targetUrl.toString(), {
+      // safeFetch re-screens every redirect hop — a public host must not be able
+      // to 302 us onto a private address.
+      const { response } = await safeFetch(targetUrl.toString(), {
         method: 'GET',
         headers: {
           'User-Agent': 'ToolzyHub-Fetcher/1.0 (robots.txt fetcher)',
@@ -65,7 +45,6 @@ router.get('/', basicRateLimit, async (req, res) => {
           'Accept-Encoding': 'gzip, deflate',
         },
         signal: controller.signal,
-        redirect: 'follow',
         // Note: fetch in Node.js doesn't have a direct size limit, but we'll check content-length
       });
 
@@ -105,11 +84,19 @@ router.get('/', basicRateLimit, async (req, res) => {
 
     } catch (fetchError) {
       clearTimeout(timeoutId);
-      
+
+      if (fetchError.code === 'SSRF_BLOCKED') {
+        return sendError(res, fetchError.message, 403);
+      }
+
+      if (fetchError.code === 'TOO_MANY_REDIRECTS') {
+        return sendError(res, fetchError.message, 502);
+      }
+
       if (fetchError.name === 'AbortError') {
         return sendError(res, 'Request timeout', 408);
       }
-      
+
       if (fetchError.code === 'ENOTFOUND') {
         return sendError(res, 'Domain not found', 404);
       }
@@ -135,7 +122,7 @@ router.get('/', basicRateLimit, async (req, res) => {
  * POST /api/fetch
  * Proxy HTTP requests to external URLs (for API testing tools)
  */
-router.post('/', basicRateLimit, async (req, res) => {
+router.post('/', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   const startTime = Date.now();
 
   try {
@@ -145,40 +132,13 @@ router.post('/', basicRateLimit, async (req, res) => {
       return sendError(res, 'URL is required in request body', 400);
     }
 
-    // Validate and clean URL
-    let targetUrl;
-    try {
-      targetUrl = new URL(url);
-    } catch (error) {
-      return sendError(res, 'Invalid URL format', 400);
+    // Validate URL + screen the resolved host against private/reserved ranges.
+    const guard = await checkPublicUrl(url);
+    if (!guard.valid) {
+      const status = guard.error === 'Access to private/local networks is not allowed' ? 403 : 400;
+      return sendError(res, guard.error, status);
     }
-
-    // Security: Only allow HTTP/HTTPS protocols
-    if (!['http:', 'https:'].includes(targetUrl.protocol)) {
-      return sendError(res, 'Only HTTP and HTTPS URLs are allowed', 400);
-    }
-
-    // Security: Block private/local IPs and localhost
-    const hostname = targetUrl.hostname.toLowerCase();
-    if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname === '0.0.0.0' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('172.16.') ||
-      hostname.startsWith('172.17.') ||
-      hostname.startsWith('172.18.') ||
-      hostname.startsWith('172.19.') ||
-      hostname.startsWith('172.2') ||
-      hostname.startsWith('172.30.') ||
-      hostname.startsWith('172.31.') ||
-      hostname === '::1' ||
-      hostname.startsWith('fc00') ||
-      hostname.startsWith('fe80')
-    ) {
-      return sendError(res, 'Access to private/local networks is not allowed', 403);
-    }
+    const targetUrl = guard.url;
 
     // Validate HTTP method
     const allowedMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
@@ -186,6 +146,16 @@ router.post('/', basicRateLimit, async (req, res) => {
     if (!allowedMethods.includes(upperMethod)) {
       return sendError(res, `HTTP method '${method}' is not allowed`, 400);
     }
+
+    // This is the relay path: arbitrary method, headers and body to a
+    // caller-chosen host. Record where it went before we send it.
+    logOutbound({
+      tool: 'api-fetch',
+      targetUrl: targetUrl.toString(),
+      method: upperMethod,
+      req,
+      extra: { hasBody: Boolean(body), customHeaderCount: Object.keys(headers || {}).length },
+    });
 
     // Prepare fetch options
     const controller = new AbortController();
@@ -208,12 +178,12 @@ router.post('/', basicRateLimit, async (req, res) => {
     }
 
     try {
-      // Make the request
+      // Make the request. safeFetch re-screens every redirect hop so a public
+      // host cannot bounce us onto a private address.
       const fetchOptions = {
         method: upperMethod,
         headers: fetchHeaders,
         signal: controller.signal,
-        redirect: 'follow',
       };
 
       // Add body for methods that support it
@@ -221,7 +191,7 @@ router.post('/', basicRateLimit, async (req, res) => {
         fetchOptions.body = body;
       }
 
-      const response = await fetch(targetUrl.toString(), fetchOptions);
+      const { response } = await safeFetch(targetUrl.toString(), fetchOptions);
 
       clearTimeout(timeoutId);
 
@@ -264,6 +234,14 @@ router.post('/', basicRateLimit, async (req, res) => {
 
     } catch (fetchError) {
       clearTimeout(timeoutId);
+
+      if (fetchError.code === 'SSRF_BLOCKED') {
+        return sendError(res, fetchError.message, 403);
+      }
+
+      if (fetchError.code === 'TOO_MANY_REDIRECTS') {
+        return sendError(res, fetchError.message, 502);
+      }
 
       if (fetchError.name === 'AbortError') {
         return sendError(res, 'Request timeout (10s limit)', 408);

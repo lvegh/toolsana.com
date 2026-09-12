@@ -65,13 +65,13 @@ router.get('/info', basicRateLimit, (req, res) => {
       author: 'ToolzyHub Team',
       license: 'MIT'
     },
+    // Deliberately no node_version / platform / arch / memory_usage here.
+    // This endpoint is publicly reachable, and those fields hand a caller the
+    // exact runtime build to match against CVEs plus a live memory read that
+    // makes resource-exhaustion attempts observable. Operational detail belongs
+    // on /health and /metrics, which are meant to be restricted.
     server: {
-      environment: process.env.NODE_ENV || 'development',
-      node_version: process.version,
-      uptime: process.uptime(),
-      memory_usage: process.memoryUsage(),
-      platform: process.platform,
-      arch: process.arch
+      environment: process.env.NODE_ENV || 'development'
     },
     features: {
       authentication: {

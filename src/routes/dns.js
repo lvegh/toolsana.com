@@ -1,9 +1,10 @@
 const express = require('express');
 const dns = require('dns').promises;
-const { basicRateLimit, createCustomRateLimit } = require('../middleware/rateLimit');
+const { basicRateLimit, createCustomRateLimit, ipKey } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { redisUtils } = require('../config/redis');
 const logger = require('../utils/logger');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
@@ -21,7 +22,7 @@ const dnsRateLimit = createCustomRateLimit({
   },
   keyGenerator: (req) => {
     // Combine IP + User-Agent for more specific rate limiting
-    return `dns:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    return `dns:${ipKey(req)}`;
   }
 });
 
@@ -121,7 +122,7 @@ async function resolveNameserver(hostname) {
  * POST /api/dns/mx-lookup
  * Perform MX (mail exchange) lookup for a domain
  */
-router.post('/mx-lookup', dnsRateLimit, async (req, res) => {
+router.post('/mx-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (req, res) => {
   const startTime = Date.now();
 
   try {
@@ -259,7 +260,7 @@ router.post('/mx-lookup', dnsRateLimit, async (req, res) => {
  * POST /api/dns/ns-lookup
  * Perform NS (nameserver) lookup for a domain
  */
-router.post('/ns-lookup', dnsRateLimit, async (req, res) => {
+router.post('/ns-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (req, res) => {
   const startTime = Date.now();
 
   try {

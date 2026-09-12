@@ -4,6 +4,11 @@ const cheerio = require('cheerio');
 const crypto = require('crypto');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { redisUtils } = require('../config/redis');
+const { checkPublicUrl, safeFetch } = require('../utils/ssrfGuard');
+const { enhancedSecurity } = require('../middleware/enhancedSecurity');
+const { logOutbound } = require('../utils/outboundLog');
+const { createCustomRateLimit, ipKey } = require('../middleware/rateLimit');
+const logger = require('../utils/logger');
 
 // Dynamic import for ESM module p-limit
 let pLimit = null;
@@ -17,11 +22,83 @@ const getPLimit = async () => {
 
 const router = express.Router();
 
+/**
+ * Rate limits for job creation.
+ *
+ * `/start` previously had none at all — the comment said it was "protected by
+ * worker token authentication", but that token is attached by the Worker for
+ * any caller, so in practice one request could start unlimited crawls.
+ *
+ * Split by mode because the cost is wildly different: a single-page check is
+ * one fetch plus its links, while a crawl is up to maxPages fetches plus up to
+ * maxLinksChecked link probes, all aimed at a host the caller picked.
+ */
+const crawlJobRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3,
+  message: {
+    success: false,
+    message: 'Crawl limit reached. You can start 3 site crawls per hour. Single-page checks remain available.',
+    retryAfter: 3600,
+  },
+  keyGenerator: (req) => `linkcheck-crawl:${ipKey(req)}`,
+  handler: (req, res) => {
+    logger.securityLog('Link checker crawl rate limit exceeded', {
+      ip: req.ip,
+      url: req.body?.url,
+    });
+    res.status(429).json({
+      success: false,
+      message: 'Crawl limit reached. You can start 3 site crawls per hour. Single-page checks remain available.',
+      retryAfter: 3600,
+    });
+  },
+});
+
+const singleJobRateLimit = createCustomRateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 20,
+  message: {
+    success: false,
+    message: 'Link check limit reached. You can run 20 single-page checks per hour.',
+    retryAfter: 3600,
+  },
+  keyGenerator: (req) => `linkcheck-single:${ipKey(req)}`,
+});
+
+/**
+ * Route the request to the limiter matching its mode. Reading the mode here
+ * keeps the two budgets independent — exhausting crawls must not also block
+ * the much cheaper single-page checks.
+ */
+const jobRateLimit = (req, res, next) => {
+  const limiter = req.body?.mode === 'crawl' ? crawlJobRateLimit : singleJobRateLimit;
+  return limiter(req, res, next);
+};
+
 // Configuration
+//
+// These numbers are an OUTBOUND REQUEST BUDGET, not just a feature limit.
+// A crawl fetches each page and then checks every unique link found across all
+// of them, so the traffic this tool aims at a third party is roughly
+// `maxPages + maxLinksChecked` — previously 2000 pages plus an unbounded number
+// of links, which put one API call in the 5,000-15,000 request range, spread
+// across many domains. That is an amplifier, and the target of it is chosen by
+// whoever calls us.
+//
+// For reference, Screaming Frog's free tier stops at 500 URLs — and that runs
+// on the user's own machine after they installed something. This is anonymous
+// and runs on our infrastructure, so it sits below that.
 const FREE_TIER_CONFIG = {
-  maxDepth: 999999, // Effectively unlimited depth - stop when maxPages is reached
-  maxPages: 2000,
-  maxConcurrency: 10,
+  // Bounded rather than "effectively unlimited". maxPages already stops the
+  // crawl, but depth should not silently become unbounded if that is raised.
+  maxDepth: 10,
+  maxPages: 100,
+  // The real cost driver: pages are bounded by the site's size, links are not.
+  maxLinksChecked: 500,
+  // 5 rather than 10: ten parallel requests at one host trips rate limiting and
+  // looks hostile; five rarely does.
+  maxConcurrency: 5,
   timeout: 10000, // 10 seconds per request
   maxContentSize: 5 * 1024 * 1024, // 5MB limit for HTML pages
   jobTTL: 3600, // Job expires after 1 hour
@@ -30,47 +107,21 @@ const FREE_TIER_CONFIG = {
 /**
  * Validate URL and check security
  */
-function validateUrl(urlString) {
-  try {
-    // Normalize URL - add https:// if no protocol provided
-    let normalizedUrl = urlString.trim();
-    if (!normalizedUrl.match(/^https?:\/\//i)) {
-      normalizedUrl = `https://${normalizedUrl}`;
-    }
-
-    const url = new URL(normalizedUrl);
-
-    // Only allow HTTP/HTTPS
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      return { valid: false, error: 'Only HTTP and HTTPS URLs are allowed' };
-    }
-
-    // Block private/local IPs
-    const hostname = url.hostname.toLowerCase();
-    if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname === '0.0.0.0' ||
-      hostname.startsWith('192.168.') ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('172.16.') ||
-      hostname.startsWith('172.17.') ||
-      hostname.startsWith('172.18.') ||
-      hostname.startsWith('172.19.') ||
-      hostname.startsWith('172.2') ||
-      hostname.startsWith('172.30.') ||
-      hostname.startsWith('172.31.') ||
-      hostname === '::1' ||
-      hostname.startsWith('fc00') ||
-      hostname.startsWith('fe80')
-    ) {
-      return { valid: false, error: 'Access to private/local networks is not allowed' };
-    }
-
-    return { valid: true, url, normalizedUrl };
-  } catch (error) {
-    return { valid: false, error: 'Invalid URL format' };
+async function validateUrl(urlString) {
+  // Normalize URL - add https:// if no protocol provided
+  let normalizedUrl = String(urlString || '').trim();
+  if (!normalizedUrl.match(/^https?:\/\//i)) {
+    normalizedUrl = `https://${normalizedUrl}`;
   }
+
+  // Protocol enforcement, DNS resolution, and private/reserved CIDR screening
+  // all live in the shared SSRF guard.
+  const guard = await checkPublicUrl(normalizedUrl);
+  if (!guard.valid) {
+    return { valid: false, error: guard.error };
+  }
+
+  return { valid: true, url: guard.url, normalizedUrl };
 }
 
 /**
@@ -105,14 +156,15 @@ async function fetchHtml(url, timeout = FREE_TIER_CONFIG.timeout) {
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(url, {
+    // Crawl mode calls this with URLs discovered on the page, so screen every
+    // hop here too — not just the user-submitted seed URL.
+    const { response } = await safeFetch(url, {
       method: 'GET',
       headers: {
         'User-Agent': 'ToolzyHub-LinkChecker/1.0',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
       signal: controller.signal,
-      redirect: 'follow',
     });
 
     clearTimeout(timeoutId);
@@ -459,96 +511,74 @@ async function checkLink(linkObj, timeout = FREE_TIER_CONFIG.timeout) {
     'Sec-Fetch-Site': 'none',
   };
 
-  try {
-    // Try HEAD first (faster for most sites)
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-    let response = await fetch(linkObj.url, {
-      method: 'HEAD',
+  try {
+    // Links reach here from page crawling, so they never passed validateUrl.
+    //
+    // safeFetch does the screening AND follows the redirect chain itself,
+    // re-screening every hop and pinning each screened address into the
+    // connection. The hand-rolled loop this replaces screened correctly but
+    // then called bare fetch(), so the name was resolved a second time to
+    // connect — a low-TTL record could answer "public" to the check and
+    // "private" to the socket. It also returns the redirect chain in exactly
+    // the shape this function used to assemble by hand.
+    const requestOptions = {
       headers: browserHeaders,
       signal: controller.signal,
-      redirect: 'manual', // Don't follow redirects, track them
-    });
+    };
+
+    let result = await safeFetch(linkObj.url, { ...requestOptions, method: 'HEAD' });
+
+    // If HEAD fails with 400/403/405, retry with GET (for social media sites)
+    if ([400, 403, 405].includes(result.response.status)) {
+      result = await safeFetch(linkObj.url, { ...requestOptions, method: 'GET' });
+    }
 
     clearTimeout(timeoutId);
 
-    // If HEAD fails with 400/403/405, retry with GET (for social media sites)
-    if ([400, 403, 405].includes(response.status)) {
-      const getController = new AbortController();
-      const getTimeoutId = setTimeout(() => getController.abort(), timeout);
-
-      response = await fetch(linkObj.url, {
-        method: 'GET',
-        headers: browserHeaders,
-        signal: getController.signal,
-        redirect: 'manual',
-      });
-
-      clearTimeout(getTimeoutId);
-    }
-
-    // Track redirect chain
-    const redirectChain = [];
-    let currentUrl = linkObj.url;
-    let redirectCount = 0;
-    const maxRedirects = 5;
-
-    while ([301, 302, 303, 307, 308].includes(response.status) && redirectCount < maxRedirects) {
-      const location = response.headers.get('location');
-      if (!location) break;
-
-      redirectChain.push({
-        from: currentUrl,
-        to: resolveUrl(currentUrl, location),
-        status: response.status,
-      });
-
-      currentUrl = resolveUrl(currentUrl, location);
-      redirectCount++;
-
-      // Follow the redirect
-      const redirectController = new AbortController();
-      const redirectTimeoutId = setTimeout(() => redirectController.abort(), timeout);
-
-      let redirectResponse = await fetch(currentUrl, {
-        method: 'HEAD',
-        headers: browserHeaders,
-        signal: redirectController.signal,
-        redirect: 'manual',
-      });
-
-      // Retry with GET if HEAD fails on redirect too
-      if ([400, 403, 405].includes(redirectResponse.status)) {
-        const getRedirectController = new AbortController();
-        const getRedirectTimeoutId = setTimeout(() => getRedirectController.abort(), timeout);
-
-        redirectResponse = await fetch(currentUrl, {
-          method: 'GET',
-          headers: browserHeaders,
-          signal: getRedirectController.signal,
-          redirect: 'manual',
-        });
-
-        clearTimeout(getRedirectTimeoutId);
-      }
-
-      response = redirectResponse;
-      clearTimeout(redirectTimeoutId);
-    }
-
-    const responseTime = Date.now() - startTime;
+    const { response, redirectChain, finalUrl } = result;
 
     return {
       ...linkObj,
       status: response.status,
       statusText: response.statusText,
-      responseTime,
+      responseTime: Date.now() - startTime,
       redirectChain: redirectChain.length > 0 ? redirectChain : null,
-      finalUrl: currentUrl !== linkObj.url ? currentUrl : null,
+      finalUrl: finalUrl !== linkObj.url ? finalUrl : null,
       checked: true,
     };
   } catch (error) {
+    clearTimeout(timeoutId);
+
+    // A blocked hop is a reportable result for this tool, not a crash: the user
+    // wants to see that the link points somewhere it shouldn't.
+    if (error.code === 'SSRF_BLOCKED') {
+      return {
+        ...linkObj,
+        status: 0,
+        statusText: 'Blocked',
+        responseTime: Date.now() - startTime,
+        redirectChain: null,
+        finalUrl: error.blockedUrl || null,
+        checked: true,
+        error: error.message,
+      };
+    }
+
+    if (error.code === 'TOO_MANY_REDIRECTS') {
+      return {
+        ...linkObj,
+        status: 0,
+        statusText: 'Too many redirects',
+        responseTime: Date.now() - startTime,
+        redirectChain: null,
+        checked: true,
+        error: error.message,
+      };
+    }
+
     if (error.name === 'AbortError') {
       return {
         ...linkObj,
@@ -571,6 +601,44 @@ async function checkLink(linkObj, timeout = FREE_TIER_CONFIG.timeout) {
       error: error.message,
     };
   }
+}
+
+
+/**
+ * Trim a link list to the outbound request budget.
+ *
+ * Returns the kept links plus a `truncated` descriptor when the cap bit, so the
+ * caller can be told the check was partial. Silently dropping links would let a
+ * "0 broken links" result mean "we only looked at some of them".
+ */
+function applyLinkBudget(links) {
+  const max = FREE_TIER_CONFIG.maxLinksChecked;
+  if (links.length <= max) {
+    return { links, truncated: null };
+  }
+
+  return {
+    links: links.slice(0, max),
+    truncated: {
+      found: links.length,
+      checked: max,
+      skipped: links.length - max,
+      reason: `This check is limited to ${max} links. ${links.length - max} of the ${links.length} links found were not checked.`,
+    },
+  };
+}
+
+/**
+ * Count distinct destination hosts touched by a job — the useful abuse signal.
+ * A legitimate check hits a handful; a crawl aimed at someone else's site
+ * fans out across many.
+ */
+function distinctHostCount(links) {
+  const hosts = new Set();
+  for (const l of links || []) {
+    try { hosts.add(new URL(l.url).hostname); } catch { /* ignore unparseable */ }
+  }
+  return hosts.size;
 }
 
 /**
@@ -652,9 +720,15 @@ async function processLinkCheckerJob(jobId, normalizedUrl, mode, checkOptions) {
       }
 
       // Remove duplicates
-      const uniqueLinks = Array.from(
+      const allUniqueLinks = Array.from(
         new Map(allLinks.map(link => [link.url, link])).values()
       );
+
+      // Apply the outbound request budget. Truncation is reported back to the
+      // caller rather than silently dropping links — a "no broken links" result
+      // that quietly skipped half the page would be worse than no result.
+      const { links: uniqueLinks, truncated: linksTruncated } =
+        applyLinkBudget(allUniqueLinks);
 
       // Check all links with concurrency limit
       const limitFn = await getPLimit();
@@ -701,7 +775,24 @@ async function processLinkCheckerJob(jobId, normalizedUrl, mode, checkOptions) {
         stats,
         crawledPages: [normalizedUrl],
         completedAt: Date.now(),
+        limits: {
+          maxLinksChecked: FREE_TIER_CONFIG.maxLinksChecked,
+        },
+        ...(linksTruncated ? { truncated: linksTruncated } : {}),
       };
+
+      // How much outbound traffic this job actually produced.
+      logOutbound({
+        tool: 'link-checker',
+        targetUrl: normalizedUrl,
+        method: 'single:complete',
+        extra: {
+          jobId,
+          pagesCrawled: 1,
+          linksChecked: checkedLinks.length,
+          distinctHosts: distinctHostCount(checkedLinks),
+        },
+      });
 
       // Include protection warning if detected
       if (protectionWarning) {
@@ -808,6 +899,12 @@ async function processLinkCheckerJob(jobId, normalizedUrl, mode, checkOptions) {
         uniqueLinks = uniqueLinks.filter(link => !isSameDomain(normalizedUrl, link.url));
       }
 
+      // Apply the outbound request budget AFTER the externalOnly filter, so the
+      // budget is spent on links the caller actually asked about.
+      const budgeted = applyLinkBudget(uniqueLinks);
+      const linksTruncated = budgeted.truncated;
+      uniqueLinks = budgeted.links;
+
       // Check all links with concurrency limit and update progress
       const limitFn = await getPLimit();
       const limit = limitFn(FREE_TIER_CONFIG.maxConcurrency);
@@ -852,7 +949,27 @@ async function processLinkCheckerJob(jobId, normalizedUrl, mode, checkOptions) {
         stats,
         crawledPages: crawledPages.map(p => p.url),
         completedAt: Date.now(),
+        limits: {
+          maxPages: FREE_TIER_CONFIG.maxPages,
+          maxLinksChecked: FREE_TIER_CONFIG.maxLinksChecked,
+          pagesLimitReached: crawledPages.length >= FREE_TIER_CONFIG.maxPages,
+        },
+        ...(linksTruncated ? { truncated: linksTruncated } : {}),
       };
+
+      // How much outbound traffic this job actually produced. A crawl that
+      // touched hundreds of pages across many hosts is what abuse looks like.
+      logOutbound({
+        tool: 'link-checker',
+        targetUrl: normalizedUrl,
+        method: 'crawl:complete',
+        extra: {
+          jobId,
+          pagesCrawled: crawledPages.length,
+          linksChecked: checkedLinks.length,
+          distinctHosts: distinctHostCount(checkedLinks),
+        },
+      });
 
       // Include protection warning if detected
       if (protectionWarning) {
@@ -887,9 +1004,11 @@ function calculateStats(checkedLinks) {
 /**
  * POST /api/link-checker/start
  * Start a link checking job
- * No rate limiting - protected by worker token authentication
+ * Rate limited per mode (crawlJobRateLimit / singleJobRateLimit above) and
+ * protected by worker token authentication (enhancedSecurity), which is now
+ * actually enforced here.
  */
-router.post('/start', async (req, res) => {
+router.post('/start', enhancedSecurity, jobRateLimit, async (req, res) => {
   try {
     const { url, mode = 'single', options = {} } = req.body;
 
@@ -898,7 +1017,7 @@ router.post('/start', async (req, res) => {
     }
 
     // Validate URL
-    const validation = validateUrl(url);
+    const validation = await validateUrl(url);
     if (!validation.valid) {
       return sendError(res, validation.error, 400);
     }
@@ -920,6 +1039,19 @@ router.post('/start', async (req, res) => {
 
     // Generate job ID
     const jobId = `job_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+
+    // Logged per JOB, not per link: a crawl can touch FREE_TIER_CONFIG.maxPages
+    // (100) pages, and one line each would drown the signal it exists to
+    // provide. The seed host plus the mode is what identifies "someone is
+    // pointing our crawler at a victim"; the completion summary below records
+    // how much traffic it actually generated.
+    logOutbound({
+      tool: 'link-checker',
+      targetUrl: normalizedUrl,
+      method: mode,
+      req,
+      extra: { jobId, maxPages: mode === 'crawl' ? FREE_TIER_CONFIG.maxPages : 1 },
+    });
 
     // Create job in Redis
     const jobData = {
@@ -959,9 +1091,10 @@ router.post('/start', async (req, res) => {
 /**
  * GET /api/link-checker/job/:jobId
  * Get job status and results
- * No rate limiting - protected by worker token authentication
+ * No rate limiting - protected by worker token authentication, now enforced.
+ * Deliberately not rate-limited: the client polls this while a job runs.
  */
-router.get('/job/:jobId', async (req, res) => {
+router.get('/job/:jobId', enhancedSecurity, async (req, res) => {
   try {
     const { jobId } = req.params;
 

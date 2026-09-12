@@ -1,7 +1,47 @@
 const rateLimit = require('express-rate-limit');
 const slowDown = require('express-slow-down');
+const net = require('net');
 const { getRedisClient } = require('../config/redis');
 const logger = require('../utils/logger');
+
+/**
+ * Stable per-client rate-limit key.
+ *
+ * Deliberately derived from the address alone. Earlier versions mixed in the
+ * User-Agent, which handed every caller an unlimited supply of fresh buckets —
+ * one randomized header per request defeated the limit entirely.
+ *
+ * IPv6 is collapsed to its /64 prefix: a single subscriber is routinely handed
+ * a whole /64, so keying on the full /128 would be the same bypass in a
+ * different costume.
+ */
+function ipKey(req) {
+  // `req.trustedClientIp` is set by the edge-proxy guard only after it has
+  // verified the request came through our Worker, which makes CF-Connecting-IP
+  // authoritative. Prefer it: `req.ip` derives from X-Forwarded-For, which any
+  // direct caller can forge — and forging it is how you both evade your own
+  // rate limit and get someone else's IP banned.
+  const ip = req.trustedClientIp || req.ip || req.connection?.remoteAddress || 'unknown';
+
+  if (net.isIPv6(ip)) {
+    // Fold IPv4-mapped forms (::ffff:1.2.3.4) back to the v4 address so they
+    // share a bucket with the same client arriving over v4.
+    const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+    if (mapped) return mapped[1];
+
+    const [head, tail = ''] = ip.split('::');
+    const headGroups = head ? head.split(':') : [];
+    const tailGroups = tail ? tail.split(':') : [];
+    const missing = 8 - headGroups.length - tailGroups.length;
+    const groups = ip.includes('::')
+      ? [...headGroups, ...Array(Math.max(missing, 0)).fill('0'), ...tailGroups]
+      : headGroups;
+
+    return groups.slice(0, 4).map((g) => parseInt(g || '0', 16).toString(16)).join(':') + '::/64';
+  }
+
+  return ip;
+}
 
 /**
  * Custom Brute Force Protection Class
@@ -42,7 +82,7 @@ class SecureBruteForce {
     if (typeof keyGenerator === 'function') {
       return keyGenerator(req);
     }
-    return `${req.ip}-${req.originalUrl}`;
+    return `${ipKey(req)}-${req.originalUrl}`;
   }
 
   /**
@@ -205,8 +245,10 @@ const basicRateLimit = rateLimit({
   skipSuccessfulRequests: process.env.RATE_LIMIT_SKIP_SUCCESSFUL_REQUESTS === 'true',
   skipFailedRequests: false,
   keyGenerator: (req) => {
-    // Use IP + User-Agent for more specific rate limiting
-    return `${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    // Key on IP only. The User-Agent used to be part of this key, which meant a
+    // caller got a fresh bucket for every UA string they invented — the limit
+    // was bypassable by anyone willing to randomize one header.
+    return ipKey(req);
   },
   handler: (req, res) => {
     logger.securityLog('Rate limit exceeded', {
@@ -240,7 +282,7 @@ const strictRateLimit = rateLimit({
   skipSuccessfulRequests: false,
   skipFailedRequests: false,
   keyGenerator: (req) => {
-    return `strict-${req.ip}-${req.originalUrl}`;
+    return `strict-${ipKey(req)}-${req.originalUrl}`;
   },
   handler: (req, res) => {
     logger.securityLog('Strict rate limit exceeded', {
@@ -273,7 +315,7 @@ const apiKeyRateLimit = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => {
     // Use API key or user ID if available, fallback to IP
-    return req.user?.id || req.apiKey || req.ip;
+    return req.user?.id || req.apiKey || ipKey(req);
   },
   skip: (req) => {
     // Skip rate limiting if no API key or user authentication
@@ -305,7 +347,7 @@ const progressiveSlowDown = slowDown({
   delayMs: () => parseInt(process.env.SLOW_DOWN_DELAY_MS) || 500, // add 500ms delay per request after delayAfter
   maxDelayMs: parseInt(process.env.SLOW_DOWN_MAX_DELAY_MS) || 20000, // max delay of 20 seconds
   keyGenerator: (req) => {
-    return `${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    return ipKey(req);
   },
   validate: {
     delayMs: false // Disable the deprecation warning
@@ -340,7 +382,7 @@ const loginBruteForce = createBruteForceProtection({
  * Brute Force Protection Middleware
  */
 const bruteForce = generalBruteForce.prevent(
-  (req) => `${req.ip}-${req.originalUrl}`,
+  (req) => `${ipKey(req)}-${req.originalUrl}`,
   (req, res, next, nextValidRequestDate) => {
     const retryAfter = Math.ceil((nextValidRequestDate - Date.now()) / 1000);
     res.status(429).json({
@@ -355,7 +397,7 @@ const bruteForce = generalBruteForce.prevent(
  * Login Brute Force Protection Middleware
  */
 const loginBruteForceMiddleware = loginBruteForce.prevent(
-  (req) => `${req.ip}-${req.body?.email || 'unknown'}`,
+  (req) => `${ipKey(req)}-${req.body?.email || 'unknown'}`,
   (req, res, next, nextValidRequestDate) => {
     const retryAfter = Math.ceil((nextValidRequestDate - Date.now()) / 1000);
     
@@ -390,7 +432,7 @@ const uploadRateLimit = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    return `upload-${req.ip}`;
+    return `upload-${ipKey(req)}`;
   },
   handler: (req, res) => {
     logger.securityLog('Upload rate limit exceeded', {
@@ -467,6 +509,7 @@ const incrementBruteForceOnFailure = (req, res, next) => {
 };
 
 module.exports = {
+  ipKey,
   basicRateLimit,
   strictRateLimit,
   apiKeyRateLimit,

@@ -9,7 +9,7 @@ module.exports = {
       node_args: '--expose-gc --max-old-space-size=4096',
       max_memory_restart: '1G',
       env: {
-        NODE_ENV: 'development',
+        NODE_ENV: 'production',
         PORT: 3010
       },
       env_production: {

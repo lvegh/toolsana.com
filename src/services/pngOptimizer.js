@@ -1,29 +1,212 @@
 const sharp = require('sharp');
+const { execFile } = require('child_process');
+const fs = require('fs').promises;
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 
-// Dynamic imports for ES modules (will be loaded async)
-let imagemin, imageminPngquant, imageminOptipng, imageminAdvpng;
+/*
+ * PNG optimisation is done by the system `pngquant` and `optipng` binaries
+ * (apt install pngquant optipng) instead of the imagemin wrapper packages,
+ * which download/compile the very same binaries at npm-install time.
+ *
+ * The argument mapping below is a verbatim port of imagemin-pngquant@10 and
+ * imagemin-optipng@8 so the produced bytes stay identical.
+ */
+const EXEC_TIMEOUT_MS = 30000;
+const MAX_BUFFER = 256 * 1024 * 1024; // headroom for ~50MB+ PNG payloads
 
-async function loadImageminModules() {
-  if (!imagemin) {
-    const imageminModule = await import('imagemin');
-    imagemin = imageminModule.default; // Get the default export
-    imageminPngquant = await import('imagemin-pngquant');
-    imageminOptipng = await import('imagemin-optipng');
-    imageminAdvpng = await import('imagemin-advpng');
+const pngquantBin = () => process.env.PNGQUANT_PATH || 'pngquant';
+const optipngBin = () => process.env.OPTIPNG_PATH || 'optipng';
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+// Mirrors the `is-png` check both imagemin plugins perform before shelling out.
+function isPng(buffer) {
+  return Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer.subarray(0, 8).equals(PNG_SIGNATURE);
+}
+
+/**
+ * Run a binary, optionally piping `input` to stdin, and collect stdout as a Buffer.
+ * Non-zero exits reject with `error.exitCode` set to the numeric exit status.
+ */
+function execBinary(bin, args, { input = null, timeout = EXEC_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      bin,
+      args,
+      { encoding: 'buffer', maxBuffer: MAX_BUFFER, timeout, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          error.exitCode = typeof error.code === 'number' ? error.code : null;
+          error.stdout = stdout;
+          error.stderr = stderr;
+          const details = stderr && stderr.length ? stderr.toString().trim() : '';
+          if (details) {
+            error.message = `${error.message.split('\n')[0]} (${details})`;
+          }
+          reject(error);
+          return;
+        }
+        resolve({ stdout, stderr });
+      }
+    );
+
+    if (child.stdin) {
+      // The binary can exit before reading all of stdin (e.g. pngquant exit 98/99).
+      child.stdin.on('error', () => {});
+      child.stdin.end(input || undefined);
+    }
+  });
+}
+
+/**
+ * Argument mapping copied verbatim from imagemin-pngquant@10 (node_modules/imagemin-pngquant/index.js).
+ * Argument order is preserved as well, `-` (stdin/stdout) first.
+ */
+function buildPngquantArgs(options = {}) {
+  const args = ['-'];
+
+  if (options.speed !== undefined) {
+    args.push('--speed', options.speed.toString());
+  }
+
+  if (options.strip !== undefined) {
+    if (options.strip) {
+      args.push('--strip');
+    }
+  }
+
+  if (options.quality !== undefined) {
+    const [min, max] = options.quality;
+    args.push('--quality', `${Math.round(min * 100)}-${Math.round(max * 100)}`);
+  }
+
+  if (options.dithering !== undefined) {
+    if (typeof options.dithering === 'number') {
+      args.push(`--floyd=${options.dithering}`);
+    } else if (options.dithering === false) {
+      args.push('--ordered');
+    }
+  }
+
+  if (options.posterize !== undefined) {
+    args.push('--posterize', options.posterize.toString());
+  }
+
+  return args;
+}
+
+/**
+ * pngquant via stdin/stdout. Exit 99 (TOO_LOW_QUALITY) and 98 (TOO_LARGE_FILE)
+ * mean "could not reach the requested quality" - imagemin-pngquant returns the
+ * untouched input for 99, we do the same for both.
+ */
+async function runPngquant(buffer, options = {}) {
+  if (!isPng(buffer)) {
+    return buffer;
+  }
+
+  const args = buildPngquantArgs(options);
+
+  try {
+    const { stdout } = await execBinary(pngquantBin(), args, { input: buffer });
+    return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+  } catch (error) {
+    if (error.exitCode === 99 || error.exitCode === 98) {
+      logger.info('Pngquant could not reach the requested quality, keeping input', {
+        exitCode: error.exitCode
+      });
+      return buffer;
+    }
+
+    throw error;
   }
 }
 
-// Helper to process buffer with imagemin plugins using the buffer API
-async function processWithImagemin(buffer, plugins) {
-  await loadImageminModules();
+/**
+ * optipng via temp files (it cannot write to stdout). Argument list copied
+ * verbatim from imagemin-optipng@8 + exec-buffer's input/output placeholders.
+ */
+async function runOptipng(buffer, options = {}) {
+  if (!isPng(buffer)) {
+    return buffer;
+  }
 
-  // Node.js Buffer IS a Uint8Array subclass, so we can pass it directly
-  // imagemin.buffer() accepts both Buffer and Uint8Array
-  const result = await imagemin.buffer(buffer, { plugins });
+  const opts = {
+    optimizationLevel: 3,
+    bitDepthReduction: true,
+    colorTypeReduction: true,
+    paletteReduction: true,
+    interlaced: false,
+    errorRecovery: true,
+    ...options
+  };
 
-  // Ensure result is a Node.js Buffer (convert if it's a Uint8Array)
-  return Buffer.isBuffer(result) ? result : Buffer.from(result);
+  const args = ['-strip', 'all', '-clobber', '-o', opts.optimizationLevel.toString(), '-out'];
+
+  const tmpDir = os.tmpdir();
+  const inputPath = path.join(tmpDir, crypto.randomUUID());
+  const outputPath = path.join(tmpDir, crypto.randomUUID());
+
+  args.push(outputPath);
+
+  if (opts.errorRecovery) {
+    args.push('-fix');
+  }
+
+  if (!opts.bitDepthReduction) {
+    args.push('-nb');
+  }
+
+  if (typeof opts.interlaced === 'boolean') {
+    args.push('-i', opts.interlaced ? '1' : '0');
+  }
+
+  if (!opts.colorTypeReduction) {
+    args.push('-nc');
+  }
+
+  if (!opts.paletteReduction) {
+    args.push('-np');
+  }
+
+  args.push(inputPath);
+
+  try {
+    await fs.writeFile(inputPath, buffer);
+    await execBinary(optipngBin(), args);
+    return await fs.readFile(outputPath);
+  } finally {
+    await Promise.all([
+      fs.rm(inputPath, { force: true }).catch(() => {}),
+      fs.rm(outputPath, { force: true }).catch(() => {})
+    ]);
+  }
+}
+
+/**
+ * Startup probe: reports the version of each binary, or null when it is missing.
+ */
+async function checkBinaries() {
+  const probe = async (bin, args) => {
+    try {
+      const { stdout, stderr } = await execBinary(bin, args, { timeout: 5000 });
+      const output = `${stdout ? stdout.toString() : ''}\n${stderr ? stderr.toString() : ''}`;
+      const firstLine = output.split('\n').map(line => line.trim()).find(Boolean);
+      return firstLine || 'unknown';
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const [pngquant, optipng] = await Promise.all([
+    probe(pngquantBin(), ['--version']),
+    probe(optipngBin(), ['-version'])
+  ]);
+
+  return { pngquant, optipng };
 }
 
 class PngOptimizer {
@@ -106,22 +289,31 @@ class PngOptimizer {
     return Math.min(complexity, 100);
   }
 
+  // Drop ancillary metadata chunks at the container level, without decoding or
+  // re-encoding the pixels. The previous implementation re-encoded through
+  // Sharp, which cost time and frequently made already-optimised (palette)
+  // files larger before compression even started. Colour-management chunks
+  // (sRGB/gAMA/cHRM/iCCP) are removed on purpose: pngquant applies them during
+  // quantisation, and the Sharp re-encode used to strip them, so removing them
+  // here keeps the produced bytes identical to the old pipeline.
   async stripMetadata(buffer) {
-    try {
-      const stripped = await sharp(buffer)
-        .withMetadata(false)
-        .toBuffer();
+    if (!isPng(buffer)) return buffer;
 
-      const reduction = buffer.length - stripped.length;
-      if (reduction > 0) {
-        logger.info('Metadata stripped', { bytesRemoved: reduction });
-      }
+    const keep = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'acTL', 'fcTL', 'fdAT']);
+    const parts = [buffer.subarray(0, 8)];
+    let offset = 8;
 
-      return stripped;
-    } catch (error) {
-      logger.warn('Failed to strip metadata', { error: error.message });
-      return buffer;
+    while (offset + 12 <= buffer.length) {
+      const length = buffer.readUInt32BE(offset);
+      const end = offset + 12 + length;
+      if (end > buffer.length) return buffer; // truncated/corrupt: leave it to the decoder
+      const type = buffer.toString('latin1', offset + 4, offset + 8);
+      if (keep.has(type)) parts.push(buffer.subarray(offset, end));
+      offset = end;
+      if (type === 'IEND') break;
     }
+
+    return Buffer.concat(parts);
   }
 
   // Determine image type based on analysis
@@ -165,8 +357,6 @@ class PngOptimizer {
     const originalSize = buffer.length;
 
     try {
-      await loadImageminModules();
-
       // First strip metadata
       let currentBuffer = await this.stripMetadata(buffer);
 
@@ -186,14 +376,12 @@ class PngOptimizer {
         logger.info('Using balanced pngquant for simple graphics/logos');
 
         try {
-          const pngquantBuffer = await processWithImagemin(currentBuffer, [
-            imageminPngquant.default({
-              quality: [0.5, 0.8],
-              speed: 3,
-              strip: true,
-              dithering: 0.5
-            })
-          ]);
+          const pngquantBuffer = await runPngquant(currentBuffer, {
+            quality: [0.5, 0.8],
+            speed: 3,
+            strip: true,
+            dithering: 0.5
+          });
 
           if (pngquantBuffer.length < currentBuffer.length) {
             const reduction = ((currentBuffer.length - pngquantBuffer.length) / currentBuffer.length * 100).toFixed(1);
@@ -206,11 +394,9 @@ class PngOptimizer {
 
         // Polish with OptiPNG
         try {
-          const optipngBuffer = await processWithImagemin(currentBuffer, [
-            imageminOptipng.default({
-              optimizationLevel: 7
-            })
-          ]);
+          const optipngBuffer = await runOptipng(currentBuffer, {
+            optimizationLevel: 7
+          });
 
           if (optipngBuffer.length < currentBuffer.length) {
             logger.info('OptiPNG polished the result');
@@ -226,15 +412,13 @@ class PngOptimizer {
         logger.info('Using aggressive pngquant for complex photos');
 
         try {
-          const pngquantBuffer = await processWithImagemin(currentBuffer, [
-            imageminPngquant.default({
-              quality: [0.15, 0.45],
-              speed: 1,
-              strip: true,
-              dithering: 1,
-              posterize: 1
-            })
-          ]);
+          const pngquantBuffer = await runPngquant(currentBuffer, {
+            quality: [0.15, 0.45],
+            speed: 1,
+            strip: true,
+            dithering: 1,
+            posterize: 1
+          });
 
           if (pngquantBuffer.length < currentBuffer.length) {
             const reduction = ((currentBuffer.length - pngquantBuffer.length) / currentBuffer.length * 100).toFixed(1);
@@ -251,15 +435,13 @@ class PngOptimizer {
         logger.info('Using balanced approach');
 
         try {
-          const pngquantBuffer = await processWithImagemin(currentBuffer, [
-            imageminPngquant.default({
-              quality: [0.5, 0.7],
-              speed: 2,
-              strip: true,
-              dithering: 1,
-              posterize: 1
-            })
-          ]);
+          const pngquantBuffer = await runPngquant(currentBuffer, {
+            quality: [0.5, 0.7],
+            speed: 2,
+            strip: true,
+            dithering: 1,
+            posterize: 1
+          });
 
           if (pngquantBuffer.length < currentBuffer.length) {
             const reduction = ((currentBuffer.length - pngquantBuffer.length) / currentBuffer.length * 100).toFixed(1);
@@ -271,11 +453,9 @@ class PngOptimizer {
         }
 
         try {
-          const optipngBuffer = await processWithImagemin(currentBuffer, [
-            imageminOptipng.default({
-              optimizationLevel: 7
-            })
-          ]);
+          const optipngBuffer = await runOptipng(currentBuffer, {
+            optimizationLevel: 7
+          });
 
           if (optipngBuffer.length < currentBuffer.length) {
             logger.info('OptiPNG reduced size');
@@ -287,6 +467,31 @@ class PngOptimizer {
       }
 
       const finalSize = currentBuffer.length;
+
+      // Never hand back something that is not smaller than what was uploaded:
+      // an already-optimised PNG can survive the whole pipeline unimproved.
+      if (finalSize >= originalSize) {
+        const processingTime = Date.now() - startTime;
+
+        logger.info('PNG compression completed', {
+          originalSize,
+          finalSize: originalSize,
+          compressionRatio: '0.0%',
+          strategy: 'original-kept',
+          processingTime: `${processingTime}ms`
+        });
+
+        return {
+          buffer,
+          originalSize,
+          compressedSize: originalSize,
+          compressionRatio: (0).toFixed(1),
+          strategy: 'original-kept',
+          imageType,
+          analysis
+        };
+      }
+
       const compressionRatio = ((originalSize - finalSize) / originalSize * 100).toFixed(1);
       const processingTime = Date.now() - startTime;
 
@@ -339,3 +544,4 @@ class PngOptimizer {
 }
 
 module.exports = new PngOptimizer();
+module.exports.checkBinaries = checkBinaries;

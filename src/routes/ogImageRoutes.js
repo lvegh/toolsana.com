@@ -5,6 +5,11 @@ const rateLimit = require('express-rate-limit');
 const { generateOGImage, getTemplates, getCacheKey } = require('../services/ogImageService');
 const redis = require('../config/redis');
 
+// Upper bound on the base64 blob accepted by /api/og/:encodedParams. Generous
+// next to the field limits enforced in ogImageService, but small enough that
+// the route cannot be used to hand the JSON parser an oversized payload.
+const MAX_ENCODED_PARAMS_LENGTH = 2048;
+
 // Rate limiter specific for OG image generation
 const ogRateLimit = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -186,14 +191,24 @@ router.get('/templates', async (req, res) => {
  * GET /api/og/:encodedParams
  * Dynamic OG image URL for sharing
  */
-router.get('/:encodedParams', async (req, res) => {
+router.get('/:encodedParams', ogRateLimit, async (req, res) => {
   try {
+    // Cap the encoded blob before decoding. A base64 path segment can carry a
+    // large JSON payload, and this route feeds it straight to the renderer.
+    if (req.params.encodedParams.length > MAX_ENCODED_PARAMS_LENGTH) {
+      return res.status(414).json({ error: 'Encoded parameters too long' });
+    }
+
     // Decode parameters from URL (handle base64url encoding)
     const base64 = req.params.encodedParams.replace(/-/g, '+').replace(/_/g, '/');
     const decoded = Buffer.from(base64, 'base64').toString('utf-8');
     const params = JSON.parse(decoded);
 
     // Validate basic params
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      return res.status(400).json({ error: 'Invalid parameters' });
+    }
+
     if (!params.title) {
       return res.status(400).json({ error: 'Title is required' });
     }

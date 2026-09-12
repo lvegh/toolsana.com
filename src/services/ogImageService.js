@@ -204,10 +204,18 @@ function hexToRgb(hex) {
  * Create gradient string from gradient config
  */
 function createGradient(gradient) {
-  if (!gradient) return null;
-  
-  const { direction = '135deg', from = '#667eea', to = '#764ba2' } = gradient;
-  return `linear-gradient(${direction}, ${from}, ${to})`;
+  if (!gradient || typeof gradient !== 'object') return null;
+
+  // Caller-supplied on the /api/og/:encodedParams path, so validate rather than
+  // interpolate: a malformed value here fails the whole satori render.
+  const { direction, from, to } = gradient;
+  const safeDirection = typeof direction === 'string' && /^-?\d{1,3}deg$/.test(direction)
+    ? direction
+    : '135deg';
+  const safeFrom = typeof from === 'string' && /^#[0-9a-f]{6}$/i.test(from) ? from : '#667eea';
+  const safeTo = typeof to === 'string' && /^#[0-9a-f]{6}$/i.test(to) ? to : '#764ba2';
+
+  return `linear-gradient(${safeDirection}, ${safeFrom}, ${safeTo})`;
 }
 
 /**
@@ -537,25 +545,83 @@ function jsxToReact(jsx) {
   );
 }
 
+// Hard bounds for anything that drives the render surface. These are enforced
+// here rather than only in the route validators because /api/og/:encodedParams
+// decodes its params straight out of a base64 path segment and never passes
+// through express-validator — an unbounded width/height there walks satori and
+// sharp into a multi-gigapixel allocation on a single unauthenticated GET.
+const OG_LIMITS = {
+  width: { min: 200, max: 2000, default: 1200 },
+  height: { min: 200, max: 2000, default: 630 },
+  padding: { min: 0, max: 200, default: 60 },
+  titleMaxLength: 100,
+  subtitleMaxLength: 200,
+  fontSize: { min: 8, max: 400 },
+};
+
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+const OG_FORMATS = ['png', 'jpeg', 'jpg', 'webp'];
+const OG_ALIGNMENTS = ['left', 'center', 'right'];
+
+/** Coerce to an integer inside [min, max], falling back to `default`. */
+function clampInt(value, { min, max, default: fallback }) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Coerce to a string capped at maxLength, falling back to `fallback`. */
+function clampString(value, maxLength, fallback) {
+  if (typeof value !== 'string') return fallback;
+  return value.slice(0, maxLength);
+}
+
+/** Accept only a #rrggbb literal; anything else falls back. */
+function clampColor(value, fallback) {
+  return typeof value === 'string' && HEX_COLOR.test(value) ? value : fallback;
+}
+
+/**
+ * Keep the caller-supplied title/subtitle font sizes within a sane range.
+ * The templates read `fontSize?.title` / `fontSize?.subtitle` directly, so an
+ * unbounded value goes straight into satori's layout pass.
+ */
+function clampFontSize(value) {
+  if (!value || typeof value !== 'object') return {};
+  const out = {};
+  for (const key of ['title', 'subtitle']) {
+    const n = Number(value[key]);
+    if (Number.isFinite(n)) {
+      out[key] = Math.min(OG_LIMITS.fontSize.max, Math.max(OG_LIMITS.fontSize.min, Math.trunc(n)));
+    }
+  }
+  return out;
+}
+
 /**
  * Generate OG image
  */
-async function generateOGImage(options) {
+async function generateOGImage(options = {}) {
   try {
-    // Set defaults
+    // Set defaults. Every field that affects allocation size or is fed to
+    // satori is clamped/allowlisted here — callers are not trusted to have
+    // validated it.
     const config = {
-      width: options.width || 1200,
-      height: options.height || 630,
-      title: options.title || 'OpenGraph Image',
-      subtitle: options.subtitle || '',
-      template: options.template || 'minimal',
-      bgColor: options.bgColor || '#ffffff',
+      width: clampInt(options.width, OG_LIMITS.width),
+      height: clampInt(options.height, OG_LIMITS.height),
+      title: clampString(options.title, OG_LIMITS.titleMaxLength, 'OpenGraph Image'),
+      subtitle: clampString(options.subtitle, OG_LIMITS.subtitleMaxLength, ''),
+      template: Object.prototype.hasOwnProperty.call(templates, options.template)
+        ? options.template
+        : 'minimal',
+      bgColor: clampColor(options.bgColor, '#ffffff'),
       bgGradient: options.bgGradient,
-      textColor: options.textColor,
-      fontSize: options.fontSize || {},
-      padding: options.padding || 60,
-      alignment: options.alignment || 'center',
-      format: options.format || 'png',
+      textColor: clampColor(options.textColor, undefined),
+      fontSize: clampFontSize(options.fontSize),
+      padding: clampInt(options.padding, OG_LIMITS.padding),
+      alignment: OG_ALIGNMENTS.includes(options.alignment) ? options.alignment : 'center',
+      format: OG_FORMATS.includes(options.format) ? options.format : 'png',
     };
 
     // Get template

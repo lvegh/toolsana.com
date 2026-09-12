@@ -55,7 +55,13 @@ const securityHeaders = helmet({
   
   // Cross Origin Embedder Policy
   crossOriginEmbedderPolicy: false,
-  
+
+  // Cross Origin Resource Policy. Helmet defaults this to `same-origin`, which
+  // would block the browser frontend (a different origin) from loading anything
+  // this API returns — compressed images, converted files, OG images embedded by
+  // social crawlers. This is a deliberately cross-origin API; say so.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+
   // DNS Prefetch Control
   dnsPrefetchControl: {
     allow: false
@@ -257,36 +263,68 @@ const securityResponseHeaders = (req, res, next) => {
 };
 
 /**
- * Combined Security Middleware
+ * Combined Security Middleware — the transport/header layer.
+ *
+ * This is what `server.js` mounts globally. It only sets response headers and
+ * enforces envelope-level limits; it never inspects or rewrites request content.
+ *
+ * DELIBERATELY EXCLUDED — do not add these to this array:
+ *
+ *   xssProtection              HTML-escapes every string in req.body. Toolsana
+ *                              is a developer-utilities API whose job is to
+ *                              accept arbitrary text: it would corrupt
+ *                              /api/html-validator input and, worse, silently
+ *                              hash a mangled password ("P@ssw0rd<x>" arrives at
+ *                              /api/hash/* as "P@ssw0rd&lt;x&gt;").
+ *
+ *   suspiciousActivityDetection  Rejects any request whose body/query matches
+ *                              patterns like /select.*from/i, /powershell/i,
+ *                              /onerror=/i, /javascript:/i, /exec.*\(/i. Those
+ *                              are *valid input* here — SQL formatters, regex
+ *                              testers, URL encoders, the HTML validator, and
+ *                              any password containing the word "powershell".
+ *
+ *   mongoSanitize              Rewrites object keys containing `$` or `.`.
+ *                              There is no MongoDB in this stack, and the
+ *                              format-conversion tools legitimately carry dotted
+ *                              keys in user JSON.
+ *
+ * The threats those three gesture at are handled where they actually live:
+ * output escaping at render time (e.g. the contact email template), parameterised
+ * queries if a database is ever added, and the SSRF guard in utils/ssrfGuard.js.
+ * They remain exported below so they can be applied to a specific prose-only
+ * route if one ever needs them.
  */
 const securityMiddleware = [
   // Helmet security headers
   securityHeaders,
-  
+
   // Request size limiter
   requestSizeLimiter,
-  
+
   // IP filtering
   ipFilter,
-  
-  // MongoDB injection protection
-  mongoSanitize({
-    replaceWith: '_'
-  }),
-  
-  // XSS protection
-  xssProtection,
-  
+
   // HTTP Parameter Pollution protection
   hpp({
     whitelist: ['tags', 'categories'] // Allow arrays for these parameters
   }),
-  
-  // Suspicious activity detection
-  suspiciousActivityDetection,
-  
+
   // Security response headers
   securityResponseHeaders
 ];
 
 module.exports = securityMiddleware;
+
+// Named exports for selective use. `securityMiddleware` stays the default array
+// export so existing `require('../middleware/security')` call sites keep working.
+module.exports.securityMiddleware = securityMiddleware;
+module.exports.securityHeaders = securityHeaders;
+module.exports.requestSizeLimiter = requestSizeLimiter;
+module.exports.ipFilter = ipFilter;
+module.exports.securityResponseHeaders = securityResponseHeaders;
+
+// Not mounted globally — see the note above before using these.
+module.exports.xssProtection = xssProtection;
+module.exports.suspiciousActivityDetection = suspiciousActivityDetection;
+module.exports.mongoSanitize = mongoSanitize;

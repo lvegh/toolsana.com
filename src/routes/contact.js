@@ -3,9 +3,28 @@ const nodemailer = require('nodemailer');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
+const { verifyTurnstileToken, TOKEN_FIELD } = require('../utils/turnstile');
 const logger = require('../utils/logger');
 
 const router = express.Router();
+
+/**
+ * Escape the five HTML-significant characters.
+ *
+ * Escaping happens here, at the point the value is interpolated into markup —
+ * not on the way in. Sanitising the request body would corrupt the data for
+ * every other consumer (and this API's whole job is handling arbitrary text);
+ * escaping at render time fixes the injection without touching what the user
+ * actually typed.
+ */
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 /**
  * Create nodemailer transporter
@@ -52,6 +71,34 @@ function createTransporter() {
 router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
+
+    // Verify the captcha BEFORE any other work. The client has always sent this
+    // token; until now nothing checked it, which made this endpoint a free
+    // relay through our SMTP account. Tokens are single-use at Cloudflare, so
+    // this also blocks replay of a previously-solved challenge.
+    const captcha = await verifyTurnstileToken(req.body[TOKEN_FIELD]);
+    if (!captcha.success) {
+      logger.securityLog('Contact form captcha verification failed', {
+        reason: captcha.reason,
+        codes: captcha.codes,
+        ip: req.ip,
+        userAgent: req.get('User-Agent'),
+      });
+
+      // A missing/rejected token is the caller's problem (400); a
+      // misconfigured or unreachable verifier is ours (503). Don't report an
+      // infrastructure fault as user error.
+      const isServerSide =
+        captcha.reason === 'not_configured' || captcha.reason === 'verification_unavailable';
+
+      return sendError(
+        res,
+        isServerSide
+          ? 'Captcha verification is temporarily unavailable. Please try again shortly.'
+          : 'Captcha verification failed. Please complete the challenge and try again.',
+        isServerSide ? 503 : 400
+      );
+    }
 
     // Validate required fields
     if (!name || !email || !subject || !message) {
@@ -111,28 +158,41 @@ router.post('/send-email', enhancedSecurityWithRateLimit(basicRateLimit), async 
       throw new Error('Email configuration is incomplete');
     }
 
+    // Escape every user-controlled field before it enters the HTML body.
+    // These values are attacker-controlled and land in a mail client we read;
+    // unescaped, a submitter could inject arbitrary markup and links into an
+    // email that appears to come from our own contact form.
+    const safeName = escapeHtml(name);
+    const safeEmail = escapeHtml(email);
+    const safeSubject = escapeHtml(subject);
+    // Escape first, THEN convert newlines to <br> — doing it the other way
+    // round would escape the <br> tags we just inserted.
+    const safeMessage = escapeHtml(message).replace(/\r?\n/g, '<br>');
+
     // Email content
     const mailOptions = {
       from: emailFrom,
       to: emailTo,
-      subject: `Contact Form: ${subject}`,
+      // Strip CR/LF from the subject: nodemailer guards against header
+      // injection, but a subject spanning lines is malformed regardless.
+      subject: `Contact Form: ${subject.replace(/[\r\n]+/g, ' ')}`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px;">
             New Contact Form Submission
           </h2>
-          
+
           <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
-            <p><strong>Name:</strong> ${name}</p>
-            <p><strong>Email:</strong> ${email}</p>
-            <p><strong>Subject:</strong> ${subject}</p>
+            <p><strong>Name:</strong> ${safeName}</p>
+            <p><strong>Email:</strong> ${safeEmail}</p>
+            <p><strong>Subject:</strong> ${safeSubject}</p>
           </div>
-          
+
           <div style="background-color: #ffffff; padding: 20px; border: 1px solid #dee2e6; border-radius: 5px;">
             <h3 style="color: #495057; margin-top: 0;">Message:</h3>
-            <p style="line-height: 1.6; color: #6c757d;">${message.replace(/\n/g, '<br>')}</p>
+            <p style="line-height: 1.6; color: #6c757d;">${safeMessage}</p>
           </div>
-          
+
           <div style="margin-top: 20px; padding: 15px; background-color: #e9ecef; border-radius: 5px; font-size: 12px; color: #6c757d;">
             <p>This email was sent from the ToolzyHub contact form.</p>
             <p>Submitted at: ${new Date().toLocaleString()}</p>

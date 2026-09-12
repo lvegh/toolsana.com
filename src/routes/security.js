@@ -1,9 +1,10 @@
 const express = require('express');
 const dns = require('dns').promises;
-const { basicRateLimit, createCustomRateLimit } = require('../middleware/rateLimit');
+const { basicRateLimit, createCustomRateLimit, ipKey } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { redisUtils } = require('../config/redis');
 const logger = require('../utils/logger');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
@@ -21,7 +22,7 @@ const ipBlacklistRateLimit = createCustomRateLimit({
   },
   keyGenerator: (req) => {
     // Combine IP + User-Agent for more specific rate limiting
-    return `ip-blacklist:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    return `ip-blacklist:${ipKey(req)}`;
   }
 });
 
@@ -365,7 +366,13 @@ const DNSBL_SERVICES = [
     host: 'hostkarma.junkemailfilter.com',
     category: 'spam',
     delistUrl: 'http://ipadmin.junkemailfilter.com/remove.php',
-    description: 'JunkEmailFilter Hostkarma (black entries on 127.0.0.2)'
+    description: 'JunkEmailFilter Hostkarma (black entries on 127.0.0.2)',
+    // Hostkarma answers on 127.0.0.x with the ANSWER encoded in the last octet:
+    // .1 whitelisted, .2 blacklisted, .3 yellow (mixed), .4 NOBL, .5 no-blacklist.
+    // The generic "any 127.* means listed" rule therefore reported a clean IP
+    // returning 127.0.0.5 as blacklisted — a false positive on every lookup of
+    // an IP this zone explicitly vouches for. Only .2 is a listing.
+    listedCodes: ['127.0.0.2']
   },
   // Removed ivmSIP / ivmSIP24: Invaluement is a license-only service. Public/unregistered
   // queries always receive 127.0.0.2 sentinel responses regardless of real listing,
@@ -511,6 +518,68 @@ function reverseIP(ip) {
 }
 
 /**
+ * Reserved DNSBL error codes (127.255.255.0/24).
+ *
+ * These are the zone telling US something is wrong with OUR query — not a
+ * verdict about the IP being checked. Spamhaus documents these explicitly;
+ * other zones reuse the same range.
+ */
+const DNSBL_ERROR_CODES = {
+  '127.255.255.250': 'Query rate limit exceeded',
+  '127.255.255.251': 'Unauthorised public/open resolver',
+  '127.255.255.252': 'Query volume limit exceeded - this zone is refusing our queries',
+  '127.255.255.253': 'Unauthorised query - no reverse DNS / typing error',
+  '127.255.255.254': 'Query came via an unauthorised open resolver',
+  '127.255.255.255': 'Query refused - excessive volume or policy violation',
+};
+
+/**
+ * True for any address in the reserved 127.255.255.0/24 error block.
+ */
+function isDnsblErrorCode(responseIp) {
+  return typeof responseIp === 'string' && responseIp.startsWith('127.255.255.');
+}
+
+/**
+ * Circuit breaker for zones that are refusing our queries.
+ *
+ * Every check fans out to all DNSBL_SERVICES zones at once. The free tiers of
+ * Spamhaus, SORBS and UCEPROTECT all limit volume and forbid public-facing use,
+ * so at any real traffic level some zones start answering 127.255.255.x
+ * ("go away") — and we were still querying them on every single request,
+ * which is precisely the behaviour that keeps us throttled.
+ *
+ * When a zone refuses us, stop asking for a while. That cuts the query volume
+ * where it is being rejected, leaves every healthy zone working, and recovers
+ * on its own once the cooldown expires. Redis-backed so the state is shared
+ * across PM2 workers; if Redis is down the breaker simply never opens, which
+ * is the old behaviour and safe.
+ */
+const DNSBL_BREAKER_TTL = 30 * 60; // 30 minutes
+const dnsblBreakerKey = (host) => `dnsbl:refused:${host}`;
+
+async function isZoneTripped(host) {
+  try {
+    return Boolean(await redisUtils.get(dnsblBreakerKey(host)));
+  } catch {
+    return false; // fail open — a broken breaker must not disable the tool
+  }
+}
+
+async function tripZone(host, responseIp) {
+  try {
+    await redisUtils.setex(dnsblBreakerKey(host), DNSBL_BREAKER_TTL, { responseIp, at: Date.now() });
+    logger.securityLog('DNSBL zone circuit-breaker opened', {
+      dnsbl: host,
+      responseIp,
+      cooldownSeconds: DNSBL_BREAKER_TTL,
+    });
+  } catch (error) {
+    logger.warn('Could not record DNSBL breaker state', { host, error: error.message });
+  }
+}
+
+/**
  * Query a single DNSBL service
  * @param {string} ip - IP address to check
  * @param {object} dnsbl - DNSBL service configuration
@@ -519,6 +588,23 @@ function reverseIP(ip) {
  */
 async function queryDNSBL(ip, dnsbl, timeout = 5000) {
   const startTime = Date.now();
+
+  // Don't spend a query on a zone that told us to back off recently.
+  if (await isZoneTripped(dnsbl.host)) {
+    return {
+      name: dnsbl.name,
+      host: dnsbl.host,
+      listed: false,
+      category: dnsbl.category,
+      description: dnsbl.description,
+      delistUrl: dnsbl.delistUrl,
+      response: null,
+      responseTime: 0,
+      error: 'QUERY_REFUSED',
+      errorDetail: 'Skipped: this zone recently refused our queries (cooling down)',
+      checked: false
+    };
+  }
 
   try {
     // Reverse the IP and append DNSBL host
@@ -543,7 +629,51 @@ async function queryDNSBL(ip, dnsbl, timeout = 5000) {
     // parked IP returned via a wildcard / catch-all for non-existent subdomains)
     // is NOT a DNSBL hit and would be a false positive if treated as one.
     const responseIp = addresses[0];
-    const isValidDnsblHit = typeof responseIp === 'string' && responseIp.startsWith('127.');
+
+    // ...but 127.255.255.0/24 is reserved for ERROR codes, not listings.
+    // Spamhaus returns 127.255.255.252 for "query volume limit exceeded" and
+    // 127.255.255.254 for "queried via an open/public resolver"; several other
+    // zones follow the same convention.
+    //
+    // These start with "127." and were previously reported to the caller as a
+    // confirmed listing — so the moment we got rate-limited, this tool began
+    // telling every user their IP was on Spamhaus ZEN. Treat them as what they
+    // are: our problem, not the queried IP's.
+    if (isDnsblErrorCode(responseIp)) {
+      logger.securityLog('DNSBL query refused - we are being rate-limited or blocked', {
+        dnsbl: dnsbl.host,
+        responseIp,
+        meaning: DNSBL_ERROR_CODES[responseIp] || 'reserved error code (127.255.255.0/24)'
+      });
+
+      // Stop querying this zone until the cooldown expires.
+      await tripZone(dnsbl.host, responseIp);
+
+      return {
+        name: dnsbl.name,
+        host: dnsbl.host,
+        listed: false,
+        category: dnsbl.category,
+        description: dnsbl.description,
+        delistUrl: dnsbl.delistUrl,
+        response: responseIp,
+        responseTime,
+        error: 'QUERY_REFUSED',
+        errorDetail: DNSBL_ERROR_CODES[responseIp] || 'This DNSBL refused the query',
+        checked: false
+      };
+    }
+
+    // Most zones follow the convention that any 127.0.0.x answer is a listing.
+    // A few encode the verdict in the final octet, so a "you are fine" answer
+    // also starts with 127. and would otherwise be read as a hit. Those zones
+    // declare `listedCodes` and are matched exactly.
+    //
+    // Only zones whose semantics are documented get an entry — guessing would
+    // trade today's false positives for false negatives, which is worse.
+    const isValidDnsblHit = Array.isArray(dnsbl.listedCodes)
+      ? dnsbl.listedCodes.includes(responseIp)
+      : typeof responseIp === 'string' && responseIp.startsWith('127.');
 
     return {
       name: dnsbl.name,
@@ -554,7 +684,8 @@ async function queryDNSBL(ip, dnsbl, timeout = 5000) {
       delistUrl: dnsbl.delistUrl,
       response: responseIp,
       responseTime,
-      error: null
+      error: null,
+      checked: true
     };
 
   } catch (error) {
@@ -609,7 +740,7 @@ async function queryDNSBL(ip, dnsbl, timeout = 5000) {
  * POST /api/security/ip-blacklist-check
  * Check if an IP address is listed on DNSBL services
  */
-router.post('/ip-blacklist-check', ipBlacklistRateLimit, async (req, res) => {
+router.post('/ip-blacklist-check', enhancedSecurityWithRateLimit(ipBlacklistRateLimit), async (req, res) => {
   const startTime = Date.now();
 
   try {
@@ -666,14 +797,32 @@ router.post('/ip-blacklist-check', ipBlacklistRateLimit, async (req, res) => {
 
     const results = await Promise.all(queryPromises);
 
-    // Calculate summary statistics
+    // Calculate summary statistics.
+    //
+    // `clean` counts only zones that actually answered. A zone that refused our
+    // query or timed out has told us nothing about this IP, and folding those
+    // into "clean" would report a reassuring all-clear built on zones we never
+    // successfully reached.
+    const refused = results.filter(r => r.error === 'QUERY_REFUSED');
     const summary = {
       total: results.length,
       listed: results.filter(r => r.listed === true).length,
-      clean: results.filter(r => r.listed === false).length,
+      clean: results.filter(r => r.listed === false && r.error === null).length,
       errors: results.filter(r => r.error !== null).length,
-      timeouts: results.filter(r => r.error === 'TIMEOUT').length
+      timeouts: results.filter(r => r.error === 'TIMEOUT').length,
+      // Zones that refused us (rate limit / open-resolver policy). Non-zero here
+      // means the result is incomplete and we need to look at our query volume.
+      refused: refused.length,
+      notChecked: results.filter(r => r.checked === false || r.error !== null).length
     };
+
+    if (refused.length) {
+      logger.securityLog('DNSBL zones refused our queries - blacklist results are incomplete', {
+        refusedCount: refused.length,
+        zones: refused.map(r => r.host),
+        ip: cleanIp
+      });
+    }
 
     // Categorize blacklists by category
     const categorized = results.reduce((acc, result) => {

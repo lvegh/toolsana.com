@@ -4,7 +4,8 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# Install dependencies for native modules (Sharp, bcrypt, argon2, pngquant, onnxruntime, etc.)
+# Install dependencies for native modules (Sharp, bcrypt, argon2, onnxruntime, etc.)
+# plus the PNG compressors the API shells out to (pngquant, optipng).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
@@ -16,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtool \
     nasm \
     pkg-config \
+    pngquant \
+    optipng \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files

@@ -1,22 +1,29 @@
 const express = require('express');
 const tls = require('tls');
+const net = require('net');
 const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
+const { checkPublicHostname, pinnedLookup, GENERIC_PRIVATE_ERROR } = require('../utils/ssrfGuard');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
 /**
  * Helper function to get SSL certificate information
  */
-async function getSSLCertificate(hostname, port = 443, timeout = 10000) {
+async function getSSLCertificate(hostname, port = 443, timeout = 10000, pinnedAddress = null) {
   return new Promise((resolve, reject) => {
     const socket = tls.connect({
       host: hostname,
       port: port,
       servername: hostname,
       rejectUnauthorized: false, // We want to check even invalid certificates
-      timeout: timeout
+      timeout: timeout,
+      // Dial the exact address the SSRF guard already screened. servername
+      // stays the hostname so SNI and cert validation are unaffected.
+      // See pinnedLookup in utils/ssrfGuard for the dual-callback contract.
+      ...(pinnedAddress ? { lookup: pinnedLookup(pinnedAddress.address) } : {}),
     });
 
     const timeoutId = setTimeout(() => {
@@ -131,7 +138,7 @@ function extractAltNames(cert) {
  * POST /api/ssl/check
  * Check SSL certificate for a domain
  */
-router.post('/check', basicRateLimit, async (req, res) => {
+router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { domain } = req.body;
 
@@ -157,8 +164,18 @@ router.post('/check', basicRateLimit, async (req, res) => {
       return sendError(res, 'Invalid domain format', 400);
     }
 
-    // Get SSL certificate information
-    const sslInfo = await getSSLCertificate(cleanDomain);
+    // Screen the resolved address before opening a socket. The regex above only
+    // proves the string looks like a domain — it says nothing about where that
+    // domain points, so without this a name resolving to 127.0.0.1 or
+    // 169.254.169.254 got a TLS connection and its certificate read back.
+    const guard = await checkPublicHostname(cleanDomain);
+    if (!guard.valid) {
+      return sendError(res, guard.error, guard.error === GENERIC_PRIVATE_ERROR ? 403 : 400);
+    }
+
+    // Get SSL certificate information, pinned to the screened address.
+    const pinned = { address: guard.addresses[0], family: net.isIP(guard.addresses[0]) };
+    const sslInfo = await getSSLCertificate(cleanDomain, 443, 10000, pinned);
     const cert = sslInfo.certificate;
     
     // Calculate days remaining

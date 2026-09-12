@@ -4,8 +4,11 @@ const geoip = require('geoip-lite');
 const dns = require('dns').promises;
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
-const { createCustomRateLimit } = require('../middleware/rateLimit');
+const { createCustomRateLimit, ipKey } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError, AppError } = require('../middleware/errorHandler');
+const { safeFetch, screenHostname } = require('../utils/ssrfGuard');
+const { logOutbound } = require('../utils/outboundLog');
 const logger = require('../utils/logger');
 const { body, validationResult } = require('express-validator');
 const { redisUtils } = require('../config/redis');
@@ -26,7 +29,7 @@ const emailTraceRateLimit = createCustomRateLimit({
     retryAfter: 3600
   },
   keyGenerator: (req) => {
-    return `email-trace:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    return `email-trace:${ipKey(req)}`;
   },
   handler: (req, res) => {
     logger.securityLog('Email trace rate limit exceeded', {
@@ -57,7 +60,7 @@ const spfCheckerRateLimit = createCustomRateLimit({
     retryAfter: 3600
   },
   keyGenerator: (req) => {
-    return `spf-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`;
+    return `spf-checker:${ipKey(req)}`;
   },
   handler: (req, res) => {
     logger.securityLog('SPF checker rate limit exceeded', {
@@ -540,7 +543,7 @@ async function checkBlacklist(ip) {
  * Trace email route and analyze headers
  */
 router.post('/trace-email',
-  emailTraceRateLimit,
+  enhancedSecurityWithRateLimit(emailTraceRateLimit),
   emailTraceValidation,
   handleValidationErrors,
   async (req, res) => {
@@ -726,7 +729,7 @@ router.post('/trace-email',
  * - Extracts all allowed IP ranges
  */
 router.post('/spf-checker',
-  spfCheckerRateLimit,
+  enhancedSecurityWithRateLimit(spfCheckerRateLimit),
   spfCheckerValidation,
   handleValidationErrors,
   async (req, res) => {
@@ -1058,6 +1061,10 @@ router.get('/info', async (req, res) => {
  * Rate limit specifically for SMTP testing — tighter than SPF because each
  * request makes a real outbound TCP connection and (optionally) sends a real email.
  */
+// Standard SMTP submission/transfer ports. See the note at the port check
+// in the smtp-test handler for why this is an allowlist rather than a range.
+const SMTP_ALLOWED_PORTS = [25, 465, 587, 2525];
+
 const smtpTestRateLimit = createCustomRateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 10,
@@ -1066,7 +1073,7 @@ const smtpTestRateLimit = createCustomRateLimit({
     message: 'Too many SMTP test requests. You can perform 10 tests per hour. Please try again later.',
     retryAfter: 3600
   },
-  keyGenerator: (req) => `smtp-test:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  keyGenerator: (req) => `smtp-test:${ipKey(req)}`,
   handler: (req, res) => {
     logger.securityLog('SMTP test rate limit exceeded', {
       ip: req.ip,
@@ -1082,44 +1089,10 @@ const smtpTestRateLimit = createCustomRateLimit({
   }
 });
 
-/**
- * Reject hosts that point at private/loopback/link-local space, both by direct
- * IP literal and by DNS resolution. Prevents the SMTP tester from being used
- * as an internal-network port-scanner / SSRF tool.
- */
-async function isPublicHost(hostname) {
-  const isPrivateIp = (ip) => {
-    if (!ip) return false;
-    if (ip.includes(':')) {
-      // Simple IPv6 reject for loopback / link-local / ULA
-      const l = ip.toLowerCase();
-      return l === '::1' || l.startsWith('fe80:') || l.startsWith('fc') || l.startsWith('fd');
-    }
-    const parts = ip.split('.').map(Number);
-    if (parts.length !== 4 || parts.some(n => Number.isNaN(n))) return false;
-    if (parts[0] === 10) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    if (parts[0] === 0) return true;
-    if (parts[0] >= 224) return true; // multicast / reserved
-    return false;
-  };
-
-  // If hostname is an IP literal, check directly
-  if (/^[\d.]+$/.test(hostname) || hostname.includes(':')) {
-    return !isPrivateIp(hostname);
-  }
-  // Otherwise resolve and check each address
-  try {
-    const addrs = await dns.lookup(hostname, { all: true });
-    if (!addrs || addrs.length === 0) return false;
-    return addrs.every(a => !isPrivateIp(a.address));
-  } catch {
-    return false;
-  }
-}
+// Host screening (private/loopback/link-local rejection, by IP literal and by
+// DNS resolution) lives in ../utils/ssrfGuard — see screenHostname/safeFetch.
+// It prevents the SMTP tester and BIMI fetcher from being used as an
+// internal-network port-scanner / SSRF tool.
 
 /**
  * POST /api/email/smtp-test
@@ -1130,7 +1103,7 @@ async function isPublicHost(hostname) {
  * Privacy: credentials and message content live only in the request scope.
  * Never logged. Logs record outcome (success/fail/category) but never secrets.
  */
-router.post('/smtp-test', smtpTestRateLimit, async (req, res) => {
+router.post('/smtp-test', enhancedSecurityWithRateLimit(smtpTestRateLimit), async (req, res) => {
   const startTime = Date.now();
   const {
     hostname,
@@ -1151,11 +1124,41 @@ router.post('/smtp-test', smtpTestRateLimit, async (req, res) => {
     return sendError(res, 'Invalid SMTP hostname format', 400);
   }
   const portNum = Number(port);
-  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-    return sendError(res, 'Invalid port: must be an integer between 1 and 65535', 400);
+  // Only the four standard mail-submission/transfer ports.
+  //
+  // This used to accept 1-65535, which made the tool a general-purpose TCP
+  // connect primitive: a caller could walk every port of a public host and
+  // learn what was listening from the error categorisation below. Restricting
+  // it costs nothing real — SMTP does not live anywhere else — and removes
+  // both the port-scanning use and the "connections to odd ports across many
+  // hosts" pattern that reads as bot traffic to blocklist operators.
+  if (!SMTP_ALLOWED_PORTS.includes(portNum)) {
+    return sendError(
+      res,
+      `Unsupported port. SMTP testing is limited to ${SMTP_ALLOWED_PORTS.join(', ')}.`,
+      400
+    );
   }
   const sec = ['STARTTLS', 'TLS', 'NONE'].includes(security) ? security : 'STARTTLS';
   const mode = testMode === 'send' ? 'send' : 'connection';
+
+  // Send mode requires SMTP credentials for the target server.
+  //
+  // Without this, anyone could point the tool at a third party's OPEN relay
+  // and have us submit mail through it — our IP lands in the Received headers
+  // of whatever gets sent. Requiring auth confines send mode to servers the
+  // caller can already authenticate to, which is the legitimate use case
+  // ("does my SMTP setup work?") and is not a relay for anyone else.
+  //
+  // Connection testing stays open: it is the useful majority of the tool and
+  // does not put mail on the wire.
+  if (mode === 'send' && !(username && password)) {
+    return sendError(
+      res,
+      'Send mode requires SMTP username and password. Connection testing is available without credentials.',
+      400
+    );
+  }
 
   const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (mode === 'send') {
@@ -1172,10 +1175,23 @@ router.post('/smtp-test', smtpTestRateLimit, async (req, res) => {
   }
 
   // Block internal targets to prevent the tool being used as an SSRF probe.
-  const isPublic = await isPublicHost(hostname);
-  if (!isPublic) {
+  const hostCheck = await screenHostname(hostname);
+  if (!hostCheck.valid) {
     return sendError(res, 'Refusing to connect to private, loopback, or unresolvable host', 400);
   }
+
+  // Highest blocklist-risk path in the codebase: repeated SMTP connections to
+  // many hosts from one IP is the fingerprint Spamhaus XBL/CSS looks for, and
+  // mode 'send' actually delivers mail. Record every attempt so abuse is
+  // visible here before it is visible to a blocklist operator.
+  logOutbound({
+    tool: 'smtp-test',
+    targetHost: hostname,
+    targetPort: portNum,
+    method: mode,
+    req,
+    extra: { security: sec, authenticated: Boolean(username) },
+  });
 
   // ---- Build transport config ----
   const transportConfig = {
@@ -1338,7 +1354,7 @@ const dkimRateLimit = createCustomRateLimit({
     message: 'Too many DKIM checker requests. You can perform 30 checks per hour. Please try again later.',
     retryAfter: 3600,
   },
-  keyGenerator: (req) => `dkim-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  keyGenerator: (req) => `dkim-checker:${ipKey(req)}`,
   handler: (req, res) => {
     res.status(429).json({
       success: false,
@@ -1448,7 +1464,7 @@ async function lookupDKIMSelector(domain, selector) {
 
 router.post(
   '/dkim-checker',
-  dkimRateLimit,
+  enhancedSecurityWithRateLimit(dkimRateLimit),
   [
     body('domain')
       .trim()
@@ -1601,7 +1617,7 @@ const dmarcRateLimit = createCustomRateLimit({
     message: 'Too many DMARC checker requests. You can perform 30 checks per hour. Please try again later.',
     retryAfter: 3600,
   },
-  keyGenerator: (req) => `dmarc-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  keyGenerator: (req) => `dmarc-checker:${ipKey(req)}`,
   handler: (req, res) => {
     res.status(429).json({
       success: false,
@@ -1763,7 +1779,7 @@ function validateDMARCTags(tags) {
 
 router.post(
   '/dmarc-checker',
-  dmarcRateLimit,
+  enhancedSecurityWithRateLimit(dmarcRateLimit),
   [
     body('domain')
       .trim()
@@ -1867,7 +1883,7 @@ const bimiRateLimit = createCustomRateLimit({
     message: 'Too many BIMI checker requests. You can perform 20 checks per hour. Please try again later.',
     retryAfter: 3600,
   },
-  keyGenerator: (req) => `bimi-checker:${req.ip}-${req.get('User-Agent') || 'unknown'}`,
+  keyGenerator: (req) => `bimi-checker:${ipKey(req)}`,
   handler: (req, res) => {
     res.status(429).json({
       success: false,
@@ -1938,18 +1954,20 @@ async function fetchSizedResource(url, maxBytes, acceptHeader) {
   if (u.protocol !== 'https:' && u.protocol !== 'http:') {
     throw new Error('Only http/https URLs are allowed');
   }
-  // SSRF guard: refuse hosts that resolve into private space
+  // SSRF guard: refuse hosts that resolve into private space. safeFetch below
+  // re-screens every redirect hop; this pre-check just gives a clearer error.
   if (u.hostname) {
-    const ok = await isPublicHost(u.hostname);
-    if (!ok) throw new Error('Refusing to fetch from private/internal host');
+    const hostCheck = await screenHostname(u.hostname);
+    if (!hostCheck.valid) throw new Error('Refusing to fetch from private/internal host');
   }
   if (u.protocol !== 'https:') {
     // BIMI requires HTTPS for logo and VMC — surface as a soft signal upstream
   }
-  const res = await fetch(url, {
+  // safeFetch re-screens every redirect hop, so a public host cannot 302 us
+  // onto a private address.
+  const { response: res } = await safeFetch(url, {
     headers: acceptHeader ? { Accept: acceptHeader } : {},
     signal: AbortSignal.timeout(8000),
-    redirect: 'follow',
   });
   if (!res.ok) {
     return { ok: false, status: res.status, statusText: res.statusText, contentType: res.headers.get('content-type'), bytes: null, truncated: false };
@@ -2079,7 +2097,7 @@ async function fetchDMARCForBIMI(domain) {
 
 router.post(
   '/bimi-checker',
-  bimiRateLimit,
+  enhancedSecurityWithRateLimit(bimiRateLimit),
   [
     body('domain')
       .trim()

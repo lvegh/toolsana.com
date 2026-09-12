@@ -8,6 +8,7 @@ const router = express.Router();
 const { w3cHtmlValidator } = require('w3c-html-validator');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { basicRateLimit } = require('../middleware/rateLimit');
+const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 /**
  * POST /api/html-validator
@@ -28,7 +29,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
  *   "infoCount": 0
  * }
  */
-router.post('/', basicRateLimit, async (req, res) => {
+router.post('/', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { html } = req.body;
 
@@ -76,7 +77,15 @@ router.post('/', basicRateLimit, async (req, res) => {
       errorCount,
       warningCount,
       infoCount,
-      totalIssues: messages.length
+      totalIssues: messages.length,
+      // Stated in the payload, not just the UI: this endpoint is callable
+      // directly, and a caller has no other way to learn that their markup was
+      // forwarded to a third party.
+      processing: {
+        validator: 'W3C Nu (validator.w3.org)',
+        thirdPartyTransfer: true,
+        notice: 'Submitted HTML is forwarded to the W3C validator service. It is not stored or logged by this API.'
+      }
     });
 
   } catch (error) {

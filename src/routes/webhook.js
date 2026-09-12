@@ -1,7 +1,13 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { redisUtils } = require('../config/redis');
-const { verifyApiKey } = require('../middleware/auth');
+// These used to use verifyApiKey, which checks VALID_API_KEY — a second secret
+// that happened to hold the same value as API_SECRET_TOKEN. The Worker only
+// ever sends API_SECRET_TOKEN (as x-api-key), so the two were coupled by
+// accident and rotating either would have silently broken webhooks.
+// enhancedSecurity accepts the token from x-api-key or Authorization: Bearer,
+// so the Worker needs no change, and every route now uses one mechanism.
+const { enhancedSecurity } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -59,7 +65,7 @@ const getWebhookMetadata = async (id) => {
  * POST /api/webhooks/create
  * Create a new webhook endpoint
  */
-router.post('/create', verifyApiKey, async (req, res) => {
+router.post('/create', enhancedSecurity, async (req, res) => {
   try {
     // Generate unique webhook ID
     const webhookId = uuidv4();
@@ -118,7 +124,7 @@ router.post('/create', verifyApiKey, async (req, res) => {
  * GET /api/webhooks/:id/requests
  * Get all requests received by a webhook
  */
-router.get('/:id/requests', verifyApiKey, async (req, res) => {
+router.get('/:id/requests', enhancedSecurity, async (req, res) => {
   try {
     const webhookId = req.params.id;
 
@@ -153,7 +159,7 @@ router.get('/:id/requests', verifyApiKey, async (req, res) => {
  * DELETE /api/webhooks/:id/requests
  * Clear all requests for a webhook
  */
-router.delete('/:id/requests', verifyApiKey, async (req, res) => {
+router.delete('/:id/requests', enhancedSecurity, async (req, res) => {
   try {
     const webhookId = req.params.id;
 

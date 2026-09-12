@@ -9,8 +9,68 @@ if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
+/**
+ * Keys whose values must never reach a log file or the console.
+ *
+ * Logs are written to disk, rotated, and often shipped somewhere central, so a
+ * secret that lands here outlives the request by a long way. Matching is on a
+ * lowercased substring of the key name, so `smtpPass`, `SMTP_PASS` and
+ * `authorization` are all covered by the entries below.
+ */
+const REDACT_KEY_PATTERNS = [
+  'password', 'passwd', 'pass',
+  'secret', 'token', 'apikey', 'api_key',
+  // 'authorization', not bare 'auth': the latter also swallows `authMethod`,
+  // `authType` and `authenticated`, which are diagnostic and carry no secret.
+  'authorization', 'cookie',
+  'credential', 'privatekey', 'private_key',
+];
+
+const REDACTED = '[REDACTED]';
+const MAX_REDACT_DEPTH = 6;
+
+/**
+ * A key only counts as sensitive if its VALUE could actually hold a secret.
+ * Booleans and numbers cannot, so `authenticated: true`, `hasPassword: false`
+ * and `tokenLength: 64` stay readable — those are exactly the fields you want
+ * when reading a security log, and redacting them destroys the diagnostic
+ * value the log exists for.
+ */
+function shouldRedact(key, value) {
+  if (typeof value === 'boolean' || typeof value === 'number') return false;
+  const k = String(key).toLowerCase();
+  return REDACT_KEY_PATTERNS.some((p) => k.includes(p));
+}
+
+function redactValue(value, depth = 0) {
+  if (depth > MAX_REDACT_DEPTH) return value;
+  if (Array.isArray(value)) return value.map((v) => redactValue(v, depth + 1));
+  if (value && typeof value === 'object') {
+    // Don't try to walk Errors/Buffers/Dates — winston formats those itself.
+    if (value instanceof Error || Buffer.isBuffer(value) || value instanceof Date) return value;
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = shouldRedact(k, v) ? REDACTED : redactValue(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Winston format that scrubs sensitive keys from every log entry's metadata.
+ */
+const redactFormat = winston.format((info) => {
+  for (const [k, v] of Object.entries(info)) {
+    if (k === 'level' || k === 'message' || k === 'timestamp' || k === 'stack') continue;
+    info[k] = shouldRedact(k, v) ? REDACTED : redactValue(v);
+  }
+  return info;
+});
+
 // Define log format
 const logFormat = winston.format.combine(
+  redactFormat(),
   winston.format.timestamp({
     format: 'YYYY-MM-DD HH:mm:ss'
   }),
@@ -21,6 +81,7 @@ const logFormat = winston.format.combine(
 
 // Define console format for development
 const consoleFormat = winston.format.combine(
+  redactFormat(),
   winston.format.colorize(),
   winston.format.timestamp({
     format: 'YYYY-MM-DD HH:mm:ss'

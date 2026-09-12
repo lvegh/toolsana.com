@@ -1,6 +1,20 @@
+const crypto = require('crypto');
 const logger = require('../utils/logger');
 const ipBanManager = require('../utils/ipBanManager');
 const securityNotifier = require('../utils/securityNotifier');
+
+/**
+ * Constant-time comparison for the shared API token. A plain `!==` returns as
+ * soon as two bytes differ, which leaks the length of a correct prefix — and
+ * this token is guessed against endpoints that allow repeated attempts.
+ */
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 /**
  * Enhanced Security Middleware
@@ -9,14 +23,34 @@ const securityNotifier = require('../utils/securityNotifier');
 class EnhancedSecurity {
   constructor() {
     this.apiSecretToken = process.env.API_SECRET_TOKEN;
-    this.isDevelopment = process.env.NODE_ENV === 'development';
-    
-    if (!this.apiSecretToken && !this.isDevelopment) {
-      logger.error('API_SECRET_TOKEN not configured - enhanced security disabled');
+
+    // The token bypass is opt-IN via its own flag, and is refused outright when
+    // NODE_ENV is 'production'.
+    //
+    // It used to key off `NODE_ENV === 'development'`, which meant a single
+    // stray env var turned off authentication for every protected endpoint —
+    // and `NODE_ENV=development` is currently set in both toolzyhub-api/.env
+    // and docker-compose.yml, so that was one copied file away from shipping.
+    // Disabling auth should require someone to say so explicitly.
+    const bypassRequested = process.env.DISABLE_API_AUTH === 'true';
+    const isProduction = process.env.NODE_ENV === 'production';
+
+    this.isDevelopment = bypassRequested && !isProduction;
+
+    if (bypassRequested && isProduction) {
+      logger.error(
+        'DISABLE_API_AUTH=true ignored because NODE_ENV=production - token validation stays ON'
+      );
     }
-    
+
     if (this.isDevelopment) {
-      logger.info('Development mode detected - API token validation disabled');
+      logger.warn(
+        'DISABLE_API_AUTH=true - API token validation is DISABLED. Never use this in a deployed environment.'
+      );
+    }
+
+    if (!this.apiSecretToken && !this.isDevelopment) {
+      logger.error('API_SECRET_TOKEN not configured - protected endpoints will reject every request');
     }
   }
 
@@ -26,7 +60,7 @@ class EnhancedSecurity {
   middleware() {
     return async (req, res, next) => {
       const startTime = Date.now();
-      const ip = req.ip || req.connection.remoteAddress;
+      const ip = req.trustedClientIp || req.ip || req.connection.remoteAddress;
       const userAgent = req.get('User-Agent') || 'Unknown';
       const endpoint = req.originalUrl;
 
@@ -125,7 +159,7 @@ class EnhancedSecurity {
         }
 
         // Check if token is valid
-        if (token !== this.apiSecretToken) {
+        if (!safeEqual(token, this.apiSecretToken)) {
           await this.handleFailedAttempt(ip, 'Invalid authentication token', {
             endpoint,
             userAgent,
@@ -277,7 +311,7 @@ class EnhancedSecurity {
    */
   optional() {
     return async (req, res, next) => {
-      const ip = req.ip || req.connection.remoteAddress;
+      const ip = req.trustedClientIp || req.ip || req.connection.remoteAddress;
       const userAgent = req.get('User-Agent') || 'Unknown';
       const endpoint = req.originalUrl;
 
@@ -344,7 +378,7 @@ class EnhancedSecurity {
 
         // If token provided, validate it
         if (token) {
-          if (token === this.apiSecretToken) {
+          if (safeEqual(token, this.apiSecretToken)) {
             req.security = {
               ip,
               authMethod,

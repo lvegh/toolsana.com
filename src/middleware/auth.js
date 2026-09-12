@@ -1,8 +1,35 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const logger = require('../utils/logger');
 const { redisUtils } = require('../config/redis');
+
+/**
+ * Claims pinned at both sign and verify time.
+ *
+ * Tokens were always signed with these, but verification checked neither, and
+ * no algorithm allowlist was given — so a token minted for a different audience
+ * (or, absent `algorithms`, with an unexpected algorithm) would still verify.
+ */
+const JWT_ISSUER = 'toolzyhub-api';
+const JWT_AUDIENCE = 'toolzyhub-client';
+const JWT_ALGORITHMS = ['HS256'];
+
+/**
+ * Constant-time string comparison.
+ *
+ * `a !== b` short-circuits at the first differing byte, so response time leaks
+ * how much of a guessed secret is correct. The length is compared separately
+ * (and non-secretly) because timingSafeEqual throws on length mismatch.
+ */
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 /**
  * JWT Token Verification Middleware
@@ -37,8 +64,12 @@ const verifyToken = async (req, res, next) => {
       });
     }
 
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Verify token, pinning algorithm/issuer/audience to what we sign with.
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      algorithms: JWT_ALGORITHMS,
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
     
     // Add user info to request
     req.user = decoded;
@@ -106,7 +137,7 @@ const verifyApiKey = async (req, res, next) => {
       });
     }
 
-    if (apiKey !== validApiKey) {
+    if (!safeEqual(apiKey, validApiKey)) {
       logger.securityLog('Invalid API key used', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
@@ -206,8 +237,9 @@ const requireUserOrAdmin = requireRole(['user', 'admin']);
 const generateToken = (payload, options = {}) => {
   const defaultOptions = {
     expiresIn: process.env.JWT_EXPIRES_IN || '24h',
-    issuer: 'toolzyhub-api',
-    audience: 'toolzyhub-client'
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    algorithm: JWT_ALGORITHMS[0]
   };
 
   return jwt.sign(payload, process.env.JWT_SECRET, { ...defaultOptions, ...options });
@@ -219,8 +251,9 @@ const generateToken = (payload, options = {}) => {
 const generateRefreshToken = (payload) => {
   return jwt.sign(payload, process.env.JWT_REFRESH_SECRET, {
     expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
-    issuer: 'toolzyhub-api',
-    audience: 'toolzyhub-client'
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    algorithm: JWT_ALGORITHMS[0]
   });
 };
 
@@ -228,7 +261,11 @@ const generateRefreshToken = (payload) => {
  * Verify Refresh Token
  */
 const verifyRefreshToken = (token) => {
-  return jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+  return jwt.verify(token, process.env.JWT_REFRESH_SECRET, {
+    algorithms: JWT_ALGORITHMS,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
 };
 
 /**
