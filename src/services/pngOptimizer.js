@@ -22,6 +22,32 @@ const optipngBin = () => process.env.OPTIPNG_PATH || 'optipng';
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    let c = (crc ^ buf[i]) & 0xff;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crc = (crc >>> 8) ^ c;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const typeAndData = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typeAndData));
+  return Buffer.concat([length, typeAndData, crc]);
+}
+
+// gAMA 45455 (1/2.2) + sRGB rendering intent 0 (perceptual): the chunks libvips
+// writes on every PNG it saves, i.e. what the previous Sharp-based strip produced.
+const SRGB_TAG_CHUNKS = Buffer.concat([
+  pngChunk('gAMA', Buffer.from([0x00, 0x00, 0xb1, 0x8f])),
+  pngChunk('sRGB', Buffer.from([0x00]))
+]);
+
 // Mirrors the `is-png` check both imagemin plugins perform before shelling out.
 function isPng(buffer) {
   return Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer.subarray(0, 8).equals(PNG_SIGNATURE);
@@ -317,7 +343,17 @@ class PngOptimizer {
       if (COLOUR_CHUNKS.has(type)) {
         return this.stripViaSharp(buffer);
       }
-      if (keep.has(type)) parts.push(buffer.subarray(offset, end));
+      if (keep.has(type)) {
+        parts.push(buffer.subarray(offset, end));
+        if (type === 'IHDR') {
+          // Tag the image as sRGB exactly the way the Sharp re-encode always
+          // did (gAMA 1/2.2 + sRGB perceptual). pngquant carries these through,
+          // and an untagged PNG is rendered in the display's native colour
+          // space by colour-managed viewers, which looks brighter/more
+          // saturated on wide-gamut screens than the same pixels tagged sRGB.
+          parts.push(SRGB_TAG_CHUNKS);
+        }
+      }
       offset = end;
       if (type === 'IEND') break;
     }
