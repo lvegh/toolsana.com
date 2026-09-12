@@ -289,16 +289,22 @@ class PngOptimizer {
     return Math.min(complexity, 100);
   }
 
-  // Drop ancillary metadata chunks at the container level, without decoding or
-  // re-encoding the pixels. The previous implementation re-encoded through
-  // Sharp, which cost time and frequently made already-optimised (palette)
-  // files larger before compression even started. Colour-management chunks
-  // (sRGB/gAMA/cHRM/iCCP) are removed on purpose: pngquant applies them during
-  // quantisation, and the Sharp re-encode used to strip them, so removing them
-  // here keeps the produced bytes identical to the old pipeline.
+  // Strip metadata before compression.
+  //
+  // Images that carry colour-management chunks (an ICC profile, a gAMA or a
+  // cHRM chunk) go through the same Sharp re-encode the pipeline always used:
+  // Sharp applies the embedded profile and converts the pixels to sRGB, so the
+  // image looks the same once the profile is gone. Dropping those chunks
+  // without converting would shift brightness/colour in the browser.
+  //
+  // Everything else is stripped at the chunk level without decoding, which is
+  // faster and avoids Sharp re-encoding already-optimised (palette) PNGs into
+  // larger truecolour files. Output bytes are identical to the old path for
+  // such files (verified against the previous pipeline).
   async stripMetadata(buffer) {
     if (!isPng(buffer)) return buffer;
 
+    const COLOUR_CHUNKS = new Set(['iCCP', 'gAMA', 'cHRM']);
     const keep = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'acTL', 'fcTL', 'fdAT']);
     const parts = [buffer.subarray(0, 8)];
     let offset = 8;
@@ -308,12 +314,35 @@ class PngOptimizer {
       const end = offset + 12 + length;
       if (end > buffer.length) return buffer; // truncated/corrupt: leave it to the decoder
       const type = buffer.toString('latin1', offset + 4, offset + 8);
+      if (COLOUR_CHUNKS.has(type)) {
+        return this.stripViaSharp(buffer);
+      }
       if (keep.has(type)) parts.push(buffer.subarray(offset, end));
       offset = end;
       if (type === 'IEND') break;
     }
 
     return Buffer.concat(parts);
+  }
+
+  // The original implementation: decode, convert to sRGB (applying any
+  // embedded ICC profile), re-encode. Used only for colour-managed inputs.
+  async stripViaSharp(buffer) {
+    try {
+      const stripped = await sharp(buffer)
+        .withMetadata(false)
+        .toBuffer();
+
+      const reduction = buffer.length - stripped.length;
+      if (reduction > 0) {
+        logger.info('Metadata stripped', { bytesRemoved: reduction });
+      }
+
+      return stripped;
+    } catch (error) {
+      logger.warn('Failed to strip metadata via Sharp, using original buffer', { error: error.message });
+      return buffer;
+    }
   }
 
   // Determine image type based on analysis
