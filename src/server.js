@@ -227,10 +227,11 @@ const startServer = async () => {
       const pngBinaries = await checkBinaries();
       if (!pngBinaries.pngquant || !pngBinaries.optipng) {
         logger.warn('PNG compression will fall back to Sharp \u2014 install with: apt install pngquant optipng', pngBinaries);
-      } else if (/^2\./.test(pngBinaries.pngquant)) {
-        // 2.x quantises noticeably worse than the 3.0.3 the npm package used to
-        // vendor (15-35 % larger files on real images). See DEPLOYMENT-CLOUDPANEL.md §8.
-        logger.warn('pngquant 2.x detected \u2014 install pngquant 3.x from pngquant.org for the expected compression', pngBinaries);
+      } else if (/^3\./.test(pngBinaries.pngquant)) {
+        // pngquant 3.x has a rewritten quantiser: smaller files, but at the
+        // aggressive photo settings it washes out subtle tints (visibly brighter
+        // output). Production has always run 2.x. See DEPLOYMENT-CLOUDPANEL.md §8.
+        logger.warn('pngquant 3.x detected \u2014 use the distro 2.x package (apt install pngquant) to keep the expected output', pngBinaries);
       } else {
         logger.info('PNG compression binaries available', pngBinaries);
       }

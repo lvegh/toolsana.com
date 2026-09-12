@@ -111,26 +111,22 @@ The PNG compression endpoint (`POST /api/compress/png`) shells out to
 `pngquant` and `optipng` instead of the `imagemin-pngquant` / `imagemin-optipng`
 wrappers, which downloaded the same binaries at `npm install` time.
 
-**pngquant must be 3.x.** The npm package vendored pngquant 3.0.3; Ubuntu 24.04
-and Debian 12 ship 2.18/2.17, which produce 15-35 % larger files for the same
-settings (measured on real site images). Install the official static build,
-which is byte-identical to what the npm package shipped:
-
 ```bash
-cd /tmp
-curl -sSLO https://pngquant.org/pngquant-linux.tar.bz2
-echo "25d09032f48760d34397155f3267ffadfbbbaeb2b8b39496022fc2ef1d82529e  pngquant-linux.tar.bz2" | sha256sum -c
-tar xjf pngquant-linux.tar.bz2
-sudo install -m 0755 pngquant /usr/local/bin/pngquant
-pngquant --version        # expect 3.0.3
-sudo apt install -y optipng
+sudo apt install -y pngquant optipng
+pngquant --version     # expect 2.17.x / 2.18.x
 ```
 
-`/usr/local/bin` precedes `/usr/bin` on PATH, so the API picks it up
-automatically; the startup log line "PNG compression binaries available" shows
-the versions found, and a 2.x pngquant is logged as a warning. To point at a
-binary elsewhere set `PNGQUANT_PATH` / `OPTIPNG_PATH` in `.env`. Restart PM2
-after installing.
+**Use the distro 2.x pngquant, not 3.x.** pngquant 3 has a rewritten
+quantiser: files come out 10-15 % smaller, but at the aggressive settings the
+"complex photo" branch uses (quality 15-45, posterize, speed 1) it collapses
+subtle tints — photos come back visibly brighter / washed out. Production has
+always run 2.x, and the startup check logs a warning if a 3.x binary is found.
+If a 3.x build was ever installed by hand, remove it so the apt one wins:
+`sudo rm /usr/local/bin/pngquant`.
+
+The startup log line "PNG compression binaries available" shows the versions
+found. To point at a binary elsewhere set `PNGQUANT_PATH` / `OPTIPNG_PATH` in
+`.env`. Restart PM2 after installing.
 
 ---
 
