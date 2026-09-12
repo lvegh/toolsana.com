@@ -107,35 +107,30 @@ is actively misleading when debugging. Remove it.
 
 ## 8. System packages
 
-The PNG compression endpoint (`POST /api/compress/png`) shells out to two
-system binaries instead of the `imagemin-pngquant` / `imagemin-optipng`
-wrappers, which downloaded (or compiled) the exact same binaries at
-`npm install` time. Install them once per VM:
+The PNG compression endpoint (`POST /api/compress/png`) shells out to
+`pngquant` and `optipng` instead of the `imagemin-pngquant` / `imagemin-optipng`
+wrappers, which downloaded the same binaries at `npm install` time.
+
+**pngquant must be 3.x.** The npm package vendored pngquant 3.0.3; Ubuntu 24.04
+and Debian 12 ship 2.18/2.17, which produce 15-35 % larger files for the same
+settings (measured on real site images). Install the official static build,
+which is byte-identical to what the npm package shipped:
 
 ```bash
-sudo apt update
-sudo apt install -y pngquant optipng
+cd /tmp
+curl -sSLO https://pngquant.org/pngquant-linux.tar.bz2
+echo "25d09032f48760d34397155f3267ffadfbbbaeb2b8b39496022fc2ef1d82529e  pngquant-linux.tar.bz2" | sha256sum -c
+tar xjf pngquant-linux.tar.bz2
+sudo install -m 0755 pngquant /usr/local/bin/pngquant
+pngquant --version        # expect 3.0.3
+sudo apt install -y optipng
 ```
 
-Verify:
-
-```bash
-pngquant --version   # 2.17.x or newer
-optipng -version | head -1
-```
-
-The API logs a warning at startup if either is missing
-(`PNG compression will fall back to Sharp — install with: apt install pngquant optipng`)
-but keeps running, so a missing package degrades the endpoint instead of taking
-the service down.
-
-If the binaries are not on `PATH` (custom build, non-standard prefix), point the
-API at them explicitly in the environment:
-
-```bash
-PNGQUANT_PATH=/usr/local/bin/pngquant
-OPTIPNG_PATH=/usr/local/bin/optipng
-```
+`/usr/local/bin` precedes `/usr/bin` on PATH, so the API picks it up
+automatically; the startup log line "PNG compression binaries available" shows
+the versions found, and a 2.x pngquant is logged as a warning. To point at a
+binary elsewhere set `PNGQUANT_PATH` / `OPTIPNG_PATH` in `.env`. Restart PM2
+after installing.
 
 ---
 
