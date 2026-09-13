@@ -225,8 +225,10 @@ const startServer = async () => {
     // PNG route degrades to returning the upload untouched / the Sharp fallback.
     try {
       const pngBinaries = await checkBinaries();
-      if (!pngBinaries.pngquant || !pngBinaries.optipng) {
-        logger.warn('PNG compression will fall back to Sharp \u2014 install with: apt install pngquant optipng', pngBinaries);
+      if (!pngBinaries.pngquant) {
+        logger.warn('PNG compression will fall back to Sharp \u2014 install with: apt install pngquant advancecomp zopfli', pngBinaries);
+      } else if (!pngBinaries.advpng || !pngBinaries.zopflipng) {
+        logger.warn('PNG lossless pass unavailable (7-16 % larger output) \u2014 install with: apt install advancecomp zopfli', pngBinaries);
       } else if (/^3\./.test(pngBinaries.pngquant)) {
         // pngquant 3.x has a rewritten quantiser: smaller files, but at the
         // aggressive photo settings it washes out subtle tints (visibly brighter

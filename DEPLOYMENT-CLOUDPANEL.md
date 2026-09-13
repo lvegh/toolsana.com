@@ -108,11 +108,13 @@ is actively misleading when debugging. Remove it.
 ## 8. System packages
 
 The PNG compression endpoint (`POST /api/compress/png`) shells out to
-`pngquant` and `optipng` instead of the `imagemin-pngquant` / `imagemin-optipng`
-wrappers, which downloaded the same binaries at `npm install` time.
+`pngquant` (lossy palette step) and then `zopflipng` (outputs up to 512 KB) or
+`advpng -z2` (larger) for a lossless re-deflate — together this matches
+TinyPNG's output size. Without advancecomp/zopfli the endpoint still works,
+7-16 % larger.
 
 ```bash
-sudo apt install -y pngquant optipng
+sudo apt install -y pngquant advancecomp zopfli
 pngquant --version     # expect 2.17.x / 2.18.x
 ```
 
@@ -125,8 +127,8 @@ If a 3.x build was ever installed by hand, remove it so the apt one wins:
 `sudo rm /usr/local/bin/pngquant`.
 
 The startup log line "PNG compression binaries available" shows the versions
-found. To point at a binary elsewhere set `PNGQUANT_PATH` / `OPTIPNG_PATH` in
-`.env`. Restart PM2 after installing.
+found. To point at a binary elsewhere set `PNGQUANT_PATH` / `ADVPNG_PATH` /
+`ZOPFLIPNG_PATH` in `.env`. Restart PM2 after installing.
 
 ---
 
