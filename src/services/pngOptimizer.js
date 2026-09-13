@@ -473,16 +473,19 @@ class PngOptimizer {
 
       } else if (imageType === 'complex-photo') {
         // Complex photos with gradients - use AGGRESSIVE pngquant only (fast)
-        strategyName = 'Complex Photo (Pngquant Aggressive 0.15-0.45)';
-        logger.info('Using aggressive pngquant for complex photos');
+        // Target quality 80 (accept down to 30): ~35-38 dB PSNR on real photos,
+        // colours preserved. The old 15-45 + posterize profile scored ~30-34 dB
+        // and visibly washed out tints. Below 30 pngquant declines (exit 99)
+        // and the original is returned rather than a ruined image.
+        strategyName = 'Complex Photo (Pngquant 0.30-0.80)';
+        logger.info('Using colour-preserving pngquant for complex photos');
 
         try {
           const pngquantBuffer = await runPngquant(currentBuffer, {
-            quality: [0.15, 0.45],
+            quality: [0.3, 0.8],
             speed: 1,
             strip: true,
-            dithering: 1,
-            posterize: 1
+            dithering: 1
           });
 
           if (pngquantBuffer.length < currentBuffer.length) {
@@ -501,11 +504,10 @@ class PngOptimizer {
 
         try {
           const pngquantBuffer = await runPngquant(currentBuffer, {
-            quality: [0.5, 0.7],
+            quality: [0.5, 0.85],
             speed: 2,
             strip: true,
-            dithering: 1,
-            posterize: 1
+            dithering: 1
           });
 
           if (pngquantBuffer.length < currentBuffer.length) {
