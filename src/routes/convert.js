@@ -47,6 +47,103 @@ const SVG_TARGET_TRACE_DIMENSION = 1500;
 // Don't magnify tiny images beyond this factor (avoids an over-blurred trace).
 const SVG_MAX_UPSCALE_FACTOR = 3;
 
+// Hard ceiling for a single vectorization. The VTracer binding accepts an
+// AbortSignal as vectorize()'s third argument, so the abort is honoured by the
+// native task; the race below additionally guarantees the HTTP request stays
+// bounded even if an older installed build ignores the signal.
+const SVG_VECTORIZE_TIMEOUT_MS = 45000;
+
+// A healthy trace produces many small paths. One or two paths means the tracer
+// collapsed the whole image into a flat silhouette - technically a valid SVG,
+// but useless to the user, so we flag it instead of reporting plain success.
+const SVG_MIN_HEALTHY_PATHS = 3;
+
+// colorPrecision is "significant bits per RGB channel": 1 (2 levels/channel) to
+// 8 (full fidelity). Exposed to the frontend as the optional `colors` param.
+const SVG_MIN_COLOR_PRECISION = 1;
+const SVG_MAX_COLOR_PRECISION = 8;
+
+/**
+ * Normalize the frontend `mode` parameter.
+ *
+ * 'color' (default) | 'grayscale' | 'bw'
+ * VTracer itself only has Color and Binary color modes, so 'grayscale' is
+ * implemented by desaturating the raster before tracing and then tracing in
+ * Color mode - that keeps soft shading (unlike Binary) without colour noise.
+ *
+ * @param {string} value raw request value
+ * @returns {'color'|'grayscale'|'bw'} normalized mode
+ */
+function normalizeTraceMode(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (['bw', 'binary', 'blackwhite', 'black-and-white', 'black_white'].includes(v)) return 'bw';
+  if (['grayscale', 'greyscale', 'gray', 'grey'].includes(v)) return 'grayscale';
+  return 'color';
+}
+
+/**
+ * Clamp the optional `colors` parameter (VTracer's colorPrecision).
+ *
+ * @param {string|number|undefined} value raw request value
+ * @returns {number|null} clamped precision, or null to keep the detail preset
+ */
+function normalizeColorPrecision(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(SVG_MAX_COLOR_PRECISION, Math.max(SVG_MIN_COLOR_PRECISION, n));
+}
+
+/**
+ * Inspect a traced SVG and report how much structure it actually contains.
+ *
+ * "Non-empty and contains <svg>" is NOT a success criterion: a photo can trace
+ * down to a single full-canvas rectangle, which passes that check while being
+ * worthless. Counting paths is the cheap, reliable signal for that failure.
+ *
+ * @param {string} svg traced SVG markup
+ * @param {number} originalBytes size of the uploaded raster
+ * @returns {{paths: number, outputBytes: number, degenerate: boolean, sizeFactor: number|null}}
+ */
+function analyzeTrace(svg, originalBytes) {
+  const paths = (svg.match(/<path\b/g) || []).length;
+  const outputBytes = Buffer.byteLength(svg, 'utf8');
+  return {
+    paths,
+    outputBytes,
+    // Fewer than a handful of paths => a flat silhouette / single fill.
+    degenerate: paths < SVG_MIN_HEALTHY_PATHS,
+    // > 1 means the SVG is larger than the raster it came from (normal for photos).
+    sizeFactor: originalBytes > 0 ? Number((outputBytes / originalBytes).toFixed(2)) : null
+  };
+}
+
+/**
+ * Run VTracer with a wall-clock ceiling so a pathological image can never pin a
+ * request (high detail on a large photo has been measured at ~15s).
+ *
+ * @param {Buffer} buffer normalized PNG buffer
+ * @param {object} config VTracer config
+ * @param {number} timeoutMs ceiling in milliseconds
+ * @returns {Promise<string>} SVG markup
+ */
+async function vectorizeWithTimeout(buffer, config, timeoutMs = SVG_VECTORIZE_TIMEOUT_MS) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error('Vectorization timed out'));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([vectorize(buffer, config, controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Detect a solid, opaque background color by sampling the image's four corners.
  * Returns a hex color string when the corners are opaque and agree on a single
@@ -127,14 +224,16 @@ function fitSvgToOriginalCanvas(svg, origW, origH, bg) {
  * fits the output canvas back to the original upload dimensions.
  *
  * @param {Buffer} inputBuffer encoded source image
- * @param {{mode?: string, detail?: string, smoothing?: string}} opts
+ * @param {{mode?: string, detail?: string, smoothing?: string, colors?: string|number}} opts
  * @returns {Promise<string>} SVG markup
  */
 async function vectorizeImageToSvg(inputBuffer, opts = {}) {
-  const mode = opts.mode === 'bw' ? 'bw' : 'color';
+  const mode = normalizeTraceMode(opts.mode);
   const detail = SVG_DETAIL_PRESETS[opts.detail] ? opts.detail : 'medium';
   const smoothing = opts.smoothing === 'sharp' ? 'sharp' : 'smooth';
   const preset = SVG_DETAIL_PRESETS[detail];
+  // Optional explicit colour fidelity; falls back to the detail preset.
+  const colorPrecision = normalizeColorPrecision(opts.colors) ?? preset.colorPrecision;
 
   // Normalize the trace resolution: upscale small art / downscale huge photos
   // toward SVG_TARGET_TRACE_DIMENSION (see the constant's docs for why).
@@ -147,15 +246,21 @@ async function vectorizeImageToSvg(inputBuffer, opts = {}) {
   const background = await detectSolidBackground(inputBuffer, metadata);
 
   // Preserves alpha and flattens odd color spaces; lanczos keeps edges crisp.
-  const normalized = await sharp(inputBuffer)
+  let pipeline = sharp(inputBuffer)
     .ensureAlpha()
-    .resize({ width: targetWidth, kernel: 'lanczos3' })
-    .png()
-    .toBuffer();
+    .resize({ width: targetWidth, kernel: 'lanczos3' });
 
-  const svg = await vectorize(normalized, {
+  // Greyscale mode: desaturate before tracing, then trace in Color mode so the
+  // tonal range survives as grey layers instead of a two-tone silhouette.
+  if (mode === 'grayscale') {
+    pipeline = pipeline.grayscale();
+  }
+
+  const normalized = await pipeline.png().toBuffer();
+
+  const svg = await vectorizeWithTimeout(normalized, {
     colorMode: mode === 'bw' ? ColorMode.Binary : ColorMode.Color,
-    colorPrecision: preset.colorPrecision,
+    colorPrecision,
     filterSpeckle: preset.filterSpeckle,
     layerDifference: preset.layerDifference,
     spliceThreshold: preset.spliceThreshold,
@@ -577,9 +682,14 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
 
     // Simple, engine-agnostic controls from the frontend.
-    const mode = req.body.mode === 'bw' ? 'bw' : 'color';
+    // `detail` is kept for backward compatibility; `mode` now also accepts
+    // 'grayscale', and `colors` optionally overrides the preset's colour
+    // fidelity (VTracer colorPrecision, 1-8 significant bits per channel).
+    const mode = normalizeTraceMode(req.body.mode);
     const detail = SVG_DETAIL_PRESETS[req.body.detail] ? req.body.detail : 'medium';
     const smoothing = req.body.smoothing === 'sharp' ? 'sharp' : 'smooth';
+    const colors = normalizeColorPrecision(req.body.colors);
+    const colorPrecision = colors ?? SVG_DETAIL_PRESETS[detail].colorPrecision;
 
     logger.info('Starting PNG to SVG conversion (VTracer)', {
       originalName: req.file.originalname,
@@ -587,7 +697,8 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       mimetype: req.file.mimetype,
       mode,
       detail,
-      smoothing
+      smoothing,
+      colorPrecision
     });
 
     // Get PNG metadata (for logging + response headers)
@@ -603,7 +714,7 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
     });
 
     // Vectorize with VTracer (full-color, handles any image).
-    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing });
+    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing, colors });
 
     // Verify the SVG was generated and is valid.
     if (!svgString || svgString.length === 0) {
@@ -612,6 +723,11 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
     if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
       throw new Error('Generated SVG is invalid or corrupted');
     }
+
+    // Structural quality check. A valid-but-degenerate trace (a photo that
+    // collapsed into one rectangle) is still returned - the caller may want it -
+    // but it is reported as such instead of being passed off as a clean result.
+    const trace = analyzeTrace(svgString, originalBuffer.length);
 
     const svgBuffer = Buffer.from(svgString, 'utf8');
     const filename = `${originalName}.svg`;
@@ -623,11 +739,25 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       convertedSize: svgBuffer.length,
       compressionRatio: compressionRatio + '%',
       svgLength: svgString.length,
+      tracePaths: trace.paths,
+      traceDegenerate: trace.degenerate,
+      sizeFactor: trace.sizeFactor,
       mode,
       detail,
       smoothing,
+      colorPrecision,
       filename
     });
+
+    if (trace.degenerate) {
+      logger.warn('PNG to SVG produced a degenerate trace', {
+        originalName: req.file.originalname,
+        tracePaths: trace.paths,
+        mode,
+        detail,
+        colorPrecision
+      });
+    }
 
     // Set response headers
     res.set({
@@ -641,11 +771,34 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       'X-Mode': mode,
       'X-Detail': detail,
       'X-Smoothing': smoothing,
+      'X-Color-Precision': colorPrecision.toString(),
+      'X-Trace-Paths': trace.paths.toString(),
       'X-Original-Width': (metadata.width || 'unknown').toString(),
       'X-Original-Height': (metadata.height || 'unknown').toString(),
       'X-Original-Channels': (metadata.channels || 'unknown').toString(),
-      'X-Engine': 'vtracer'
+      'X-Engine': 'vtracer',
+      // Direct API/SDK callers need the trace stats across origins. (The edge
+      // worker maintains its own allowlist, so browsers going through it may
+      // still only see the allowlisted subset - clients must degrade
+      // gracefully and count paths in the returned SVG themselves.)
+      'Access-Control-Expose-Headers': [
+        'Content-Disposition',
+        'X-Original-Size',
+        'X-Converted-Size',
+        'X-Compression-Ratio',
+        'X-Mode',
+        'X-Detail',
+        'X-Smoothing',
+        'X-Color-Precision',
+        'X-Trace-Paths',
+        'X-Trace-Warning',
+        'X-Engine'
+      ].join(', ')
     });
+
+    if (trace.degenerate) {
+      res.set('X-Trace-Warning', 'degenerate');
+    }
 
     // Send the converted SVG
     res.send(svgBuffer);
@@ -658,27 +811,56 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       fileSize: req.file?.size,
       mode: req.body?.mode,
       detail: req.body?.detail,
-      smoothing: req.body?.smoothing
+      smoothing: req.body?.smoothing,
+      colors: req.body?.colors
     });
 
-    if (error.message.includes('File must be a PNG image')) {
+    const message = (error && error.message) || '';
+
+    // Input was rejected before/independently of tracing: no trace diagnostics.
+    if (message.includes('File must be a PNG image')) {
       return sendError(res, 'File must be a PNG image', 400);
     }
 
-    if (error.message.includes('Vectorization resulted in empty SVG')) {
-      return sendError(res, 'Vectorization failed. The image may be too complex or contain no traceable content.', 500);
-    }
-
-    if (error.message.includes('Generated SVG is invalid')) {
-      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
-    }
-
-    if (error.message.includes('unsupported image format') || error.message.includes('Input buffer')) {
+    if (message.includes('unsupported image format') || message.includes('Input buffer')) {
       return sendError(res, 'Image file could not be processed. Please ensure the file is a valid PNG.', 400);
     }
 
+    // Tracing itself failed. Mirror the trace diagnostics onto the failure path
+    // (headers + JSON body) so a client can tell an unusable trace apart from an
+    // infrastructure error and re-run with different settings.
+    const traceDiagnostics = { tracePaths: 0, traceWarning: 'degenerate' };
+    res.set({
+      'X-Trace-Paths': '0',
+      'X-Trace-Warning': 'degenerate',
+      'Access-Control-Expose-Headers': 'X-Trace-Paths, X-Trace-Warning'
+    });
+
+    if (message.includes('Vectorization timed out')) {
+      return sendError(
+        res,
+        'Vectorisation timed out. Try a smaller image or a lower Detail setting.',
+        503,
+        traceDiagnostics
+      );
+    }
+
+    if (message.includes('Vectorization resulted in empty SVG')) {
+      return sendError(
+        res,
+        'Vectorisation produced nothing traceable. Try Detail: High, or a higher-contrast image.',
+        500,
+        traceDiagnostics
+      );
+    }
+
+    if (message.includes('Generated SVG is invalid')) {
+      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500, traceDiagnostics);
+    }
+
     return sendError(res, 'Failed to convert PNG to SVG', 500, {
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      ...traceDiagnostics,
+      details: process.env.NODE_ENV === 'development' ? message : undefined
     });
   }
 });

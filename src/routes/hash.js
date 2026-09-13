@@ -60,8 +60,12 @@ router.post('/argon2generate', enhancedSecurityWithRateLimit(basicRateLimit), as
       return sendError(res, 'Hash length must be between 16 and 64 bytes', 400);
     }
 
-    // Calculate estimated memory usage
-    const memoryUsageMB = Math.round(memCost * parallelismParam / 1024);
+    // Calculate memory usage. Argon2's `m` (memoryCost) is the TOTAL memory a
+    // single hash occupies, in KiB; `p` (parallelism) is the number of lanes
+    // that memory is partitioned into — it never multiplies it. Multiplying
+    // memCost by parallelismParam here reported e.g. 256MB for a 64MB hash.
+    const memoryUsageMB = Math.round(memCost / 1024);
+    const memoryUsage = memCost >= 1024 ? `${memoryUsageMB}MB` : `${memCost}KB`;
 
     logger.info('Starting argon2 hash generation', {
       passwordLength: password.length,
@@ -110,7 +114,7 @@ router.post('/argon2generate', enhancedSecurityWithRateLimit(basicRateLimit), as
       parallelism: parallelismParam,
       hashLength: hashLen,
       actualHashLength: hash.length,
-      memoryUsage: `${memoryUsageMB}MB`,
+      memoryUsage: memoryUsage,
       processingTime: `${processingTime}ms`
     });
 
@@ -123,7 +127,7 @@ router.post('/argon2generate', enhancedSecurityWithRateLimit(basicRateLimit), as
         parallelism: parallelismParam,
         hashLength: hashLen
       },
-      memoryUsage: `${memoryUsageMB}MB`,
+      memoryUsage: memoryUsage,
       processingTime: processingTime,
       algorithm: 'argon2',
       format: 'encoded'
