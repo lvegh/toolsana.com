@@ -226,12 +226,12 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       return sendError(res, 'No file provided', 400);
     }
 
-    // Get quality parameter (default to 80)
-    const quality = parseInt(req.body.quality) || 80;
+    // Optional explicit quality; when absent the optimiser picks the lowest
+    // setting that keeps luma SSIM >= 0.99 against the input.
+    const quality = req.body.quality ? parseInt(req.body.quality) : null;
 
-    // Validate quality range (0-100 for WebP)
-    if (quality < 0 || quality > 100) {
-      return sendError(res, 'Quality must be between 0 and 100', 400);
+    if (quality !== null && (Number.isNaN(quality) || quality < 1 || quality > 100)) {
+      return sendError(res, 'Quality must be between 1 and 100', 400);
     }
 
     const originalBuffer = req.file.buffer;
@@ -245,8 +245,9 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       mimetype: req.file.mimetype
     });
 
-    const webpResult = await compressWebp(originalBuffer, { quality });
+    const webpResult = await compressWebp(originalBuffer, quality ? { quality } : {});
     const compressedBuffer = webpResult.buffer;
+    const usedQuality = webpResult.quality;
 
     // Calculate compression statistics
     const compressedSize = compressedBuffer.length;
@@ -262,7 +263,7 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       originalSize,
       compressedSize,
       compressionRatio: `${compressionRatio}%`,
-      quality,
+      quality: usedQuality,
       mode: webpResult.mode
     });
 
@@ -274,7 +275,7 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       'X-Original-Size': originalSize.toString(),
       'X-Compressed-Size': compressedSize.toString(),
       'X-Compression-Ratio': compressionRatio,
-      'X-Quality': quality.toString(),
+      'X-Quality': String(usedQuality),
       'X-Original-Filename': req.file.originalname
     });
 
