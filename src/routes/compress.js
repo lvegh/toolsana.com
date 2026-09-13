@@ -9,6 +9,7 @@ const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurit
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 const pngOptimizer = require('../services/pngOptimizer');
+const { compressJpeg } = require('../services/jpgOptimizer');
 
 const router = express.Router();
 
@@ -71,11 +72,11 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       return sendError(res, 'No file provided', 400);
     }
 
-    // Get quality parameter (default to 75)
-    const quality = parseInt(req.body.quality) || 75;
+    // Optional explicit quality; when absent the optimiser picks the lowest
+    // quality that keeps luma SSIM >= 0.99 against the source.
+    const quality = req.body.quality ? parseInt(req.body.quality) : null;
 
-    // Validate quality range
-    if (quality < 1 || quality > 100) {
+    if (quality !== null && (Number.isNaN(quality) || quality < 1 || quality > 100)) {
       return sendError(res, 'Quality must be between 1 and 100', 400);
     }
 
@@ -90,15 +91,9 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       mimetype: req.file.mimetype
     });
 
-    // Compress JPG with Sharp
-    const compressedBuffer = await sharp(originalBuffer)
-      .rotate() // Auto-rotate based on EXIF orientation
-      .jpeg({
-        quality,
-        chromaSubsampling: '4:2:0',
-        mozjpeg: true, // Use mozjpeg encoder for better compression
-      })
-      .toBuffer();
+    const jpegResult = await compressJpeg(originalBuffer, quality ? { quality } : {});
+    const compressedBuffer = jpegResult.buffer;
+    const usedQuality = jpegResult.quality;
 
     // Calculate compression statistics
     const compressedSize = compressedBuffer.length;
@@ -114,7 +109,8 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       originalSize,
       compressedSize,
       compressionRatio: `${compressionRatio}%`,
-      quality
+      quality: usedQuality,
+      strategy: jpegResult.strategy
     });
 
     // Set response headers
@@ -125,7 +121,7 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       'X-Original-Size': originalSize.toString(),
       'X-Compressed-Size': compressedSize.toString(),
       'X-Compression-Ratio': compressionRatio,
-      'X-Quality': quality.toString(),
+      'X-Quality': String(usedQuality),
       'X-Original-Filename': req.file.originalname
     });
 
@@ -317,9 +313,9 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
       return sendError(res, 'No files provided', 400);
     }
 
-    const quality = parseInt(req.body.quality) || 75;
+    const quality = req.body.quality ? parseInt(req.body.quality) : null;
 
-    if (quality < 1 || quality > 100) {
+    if (quality !== null && (Number.isNaN(quality) || quality < 1 || quality > 100)) {
       return sendError(res, 'Quality must be between 1 and 100', 400);
     }
 
@@ -340,15 +336,7 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
         const originalSize = originalBuffer.length;
         const originalName = file.originalname.replace(/\.[^/.]+$/, '');
 
-        // Compress the image
-        const compressedBuffer = await sharp(originalBuffer)
-          .rotate()
-          .jpeg({
-            quality,
-            chromaSubsampling: '4:2:0',
-            mozjpeg: true,
-          })
-          .toBuffer();
+        const { buffer: compressedBuffer } = await compressJpeg(originalBuffer, quality ? { quality } : {});
 
         const compressedSize = compressedBuffer.length;
         const compressionRatio = (
