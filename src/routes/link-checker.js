@@ -298,15 +298,50 @@ function detectBotProtection(html) {
 }
 
 /**
+ * Resource-hint link types that don't represent a fetchable target the way a
+ * hyperlink or an image does: `preconnect`/`dns-prefetch` often point at a
+ * bare origin, and `prefetch` is advisory. Checking them produces false
+ * "broken link" noise, so they're skipped centrally in `isLinkCheckable`
+ * rather than filtered ad hoc per call site.
+ */
+const SKIP_LINK_TYPES = new Set(['preconnect', 'dns-prefetch', 'prefetch']);
+
+/**
+ * Central gate for every link this route considers checking. Two things
+ * disqualify a URL: a non-http(s) scheme (data:, mailto:, tel:, javascript:,
+ * blob: - none of these are checkable over HTTP) and a resource-hint type
+ * (see SKIP_LINK_TYPES). Previously each extraction call site did its own
+ * ad hoc `startsWith('data:')` check, which is how favicon `data:` URIs and
+ * `<link rel="preconnect">` hints ended up reported as broken - favicon
+ * extraction never had that check, and preconnect/dns-prefetch weren't
+ * filtered by scheme OR type.
+ */
+function isLinkCheckable(url, type) {
+  if (!url) return false;
+  if (SKIP_LINK_TYPES.has(type)) return false;
+
+  let scheme;
+  try {
+    scheme = new URL(url).protocol.replace(':', '').toLowerCase();
+  } catch {
+    return false;
+  }
+
+  return scheme === 'http' || scheme === 'https';
+}
+
+/**
  * Extract links from HTML
  */
 function extractLinks(html, baseUrl, options) {
   const $ = cheerio.load(html);
   const links = new Set();
 
-  // Helper to add link if valid
+  // Helper to add link if valid. Scheme and resource-hint filtering both
+  // happen in isLinkCheckable so every extraction path below gets the same
+  // screening instead of duplicating (and missing) checks per element type.
   const addLink = (url, type) => {
-    if (url) {
+    if (isLinkCheckable(url, type)) {
       links.add(JSON.stringify({ url, type, source: baseUrl }));
     }
   };
@@ -314,7 +349,7 @@ function extractLinks(html, baseUrl, options) {
   // Extract hyperlinks (always)
   $('a[href]').each((_, element) => {
     const href = $(element).attr('href');
-    if (href && !href.startsWith('javascript:') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+    if (href) {
       const absoluteUrl = resolveUrl(baseUrl, href.split('#')[0]); // Remove fragment
       addLink(absoluteUrl, 'hyperlink');
     }
@@ -343,7 +378,7 @@ function extractLinks(html, baseUrl, options) {
   // Iframes (always check - embedded content)
   $('iframe[src]').each((_, element) => {
     const src = $(element).attr('src');
-    if (src && !src.startsWith('data:') && !src.startsWith('javascript:')) {
+    if (src) {
       const absoluteUrl = resolveUrl(baseUrl, src);
       addLink(absoluteUrl, 'iframe');
     }
@@ -372,7 +407,7 @@ function extractLinks(html, baseUrl, options) {
     // Regular images
     $('img[src]').each((_, element) => {
       const src = $(element).attr('src');
-      if (src && !src.startsWith('data:')) {
+      if (src) {
         const absoluteUrl = resolveUrl(baseUrl, src);
         addLink(absoluteUrl, 'image');
       }
@@ -385,7 +420,7 @@ function extractLinks(html, baseUrl, options) {
         // Parse srcset: "url1 1x, url2 2x" or "url1 300w, url2 600w"
         const sources = srcset.split(',').map(s => s.trim().split(/\s+/)[0]);
         sources.forEach(src => {
-          if (src && !src.startsWith('data:')) {
+          if (src) {
             const absoluteUrl = resolveUrl(baseUrl, src);
             addLink(absoluteUrl, 'image-srcset');
           }
@@ -396,7 +431,7 @@ function extractLinks(html, baseUrl, options) {
     // Video sources
     $('video[src]').each((_, element) => {
       const src = $(element).attr('src');
-      if (src && !src.startsWith('data:')) {
+      if (src) {
         const absoluteUrl = resolveUrl(baseUrl, src);
         addLink(absoluteUrl, 'video');
       }
@@ -404,7 +439,7 @@ function extractLinks(html, baseUrl, options) {
 
     $('video source[src]').each((_, element) => {
       const src = $(element).attr('src');
-      if (src && !src.startsWith('data:')) {
+      if (src) {
         const absoluteUrl = resolveUrl(baseUrl, src);
         addLink(absoluteUrl, 'video');
       }
@@ -413,7 +448,7 @@ function extractLinks(html, baseUrl, options) {
     // Audio sources
     $('audio[src]').each((_, element) => {
       const src = $(element).attr('src');
-      if (src && !src.startsWith('data:')) {
+      if (src) {
         const absoluteUrl = resolveUrl(baseUrl, src);
         addLink(absoluteUrl, 'audio');
       }
@@ -421,7 +456,7 @@ function extractLinks(html, baseUrl, options) {
 
     $('audio source[src]').each((_, element) => {
       const src = $(element).attr('src');
-      if (src && !src.startsWith('data:')) {
+      if (src) {
         const absoluteUrl = resolveUrl(baseUrl, src);
         addLink(absoluteUrl, 'audio');
       }
@@ -457,33 +492,11 @@ function extractLinks(html, baseUrl, options) {
       }
     });
 
-    // Prefetch resources
-    $('link[rel="prefetch"][href]').each((_, element) => {
-      const href = $(element).attr('href');
-      if (href) {
-        const absoluteUrl = resolveUrl(baseUrl, href);
-        addLink(absoluteUrl, 'prefetch');
-      }
-    });
-
-    // DNS prefetch
-    $('link[rel="dns-prefetch"][href]').each((_, element) => {
-      const href = $(element).attr('href');
-      if (href) {
-        // dns-prefetch can be just a domain
-        const absoluteUrl = resolveUrl(baseUrl, href);
-        addLink(absoluteUrl, 'dns-prefetch');
-      }
-    });
-
-    // Preconnect
-    $('link[rel="preconnect"][href]').each((_, element) => {
-      const href = $(element).attr('href');
-      if (href) {
-        const absoluteUrl = resolveUrl(baseUrl, href);
-        addLink(absoluteUrl, 'preconnect');
-      }
-    });
+    // Note: prefetch / dns-prefetch / preconnect are intentionally not
+    // extracted. They're resource *hints*, not fetchable link targets -
+    // dns-prefetch/preconnect commonly reference a bare origin with no path,
+    // and prefetch is advisory - so checking them produced false "broken
+    // link" reports. See SKIP_LINK_TYPES / isLinkCheckable above.
   }
 
   // Convert Set back to array of objects
@@ -1133,10 +1146,10 @@ router.get('/info', (req, res) => {
     features: [
       'Single page link checking',
       'Full website crawling (breadth-first)',
-      'Comprehensive link type detection (16 types)',
+      'Comprehensive link type detection (13 types)',
       'Always checked: hyperlinks, favicons, canonical URLs, iframes, RSS/Atom feeds, PWA manifests',
       'Optional media: images, srcset images, video sources, audio sources (with checkImages)',
-      'Optional resources: stylesheets, scripts, preload, prefetch, dns-prefetch, preconnect (with checkCssJs)',
+      'Optional resources: stylesheets, scripts, preload (with checkCssJs)',
       'External links only option',
       'Redirect chain tracking',
       'Response time metrics',
@@ -1188,5 +1201,10 @@ router.get('/info', (req, res) => {
 
   sendSuccess(res, 'Link checker service information', info);
 });
+
+// Exposed for unit testing the pure URL/type filter in isolation (router is
+// an Express function, so attaching to it keeps the default export shape
+// `require('./link-checker')` callers rely on).
+router.isLinkCheckable = isLinkCheckable;
 
 module.exports = router;
