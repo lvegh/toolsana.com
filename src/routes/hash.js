@@ -652,7 +652,7 @@ router.post('/scryptverify', enhancedSecurityWithRateLimit(basicRateLimit), asyn
  * POST /api/hash/blakegenerate
  * Generate BLAKE hash (BLAKE2b, BLAKE2s, or BLAKE3) from input data
  */
-router.post('/blakegenerate', async (req, res) => {
+router.post('/blakegenerate', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { input, algorithm = 'blake2b', keyLength } = req.body;
     if (!input || typeof input !== 'string') return sendError(res, 'Input is required');
@@ -696,7 +696,7 @@ router.post('/blakegenerate', async (req, res) => {
  * POST /api/hash/blakeverify
  * Verify input data against BLAKE hash (BLAKE2b, BLAKE2s, or BLAKE3)
  */
-router.post('/blakeverify', async (req, res) => {
+router.post('/blakeverify', enhancedSecurityWithRateLimit(basicRateLimit), async (req, res) => {
   try {
     const { input, hash, algorithm = 'blake2b', keyLength } = req.body;
     if (!input || typeof input !== 'string') return sendError(res, 'Input is required');
