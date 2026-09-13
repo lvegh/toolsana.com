@@ -868,6 +868,18 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
 /**
  * POST /api/convert/jpg-to-svg
  * Convert JPG/JPEG images to full-color SVG using VTracer (@neplex/vectorizer)
+ *
+ * JPEG specifics (vs the PNG route):
+ *   - JPEG has no alpha channel. vectorizeImageToSvg() runs the upload through
+ *     sharp with ensureAlpha() and re-encodes it to PNG before tracing, so the
+ *     source is always fully opaque. The consequence is user-visible: when the
+ *     four corners agree on a colour it is treated as a deliberate canvas
+ *     background and re-emitted as a full-canvas <rect>, i.e. the background
+ *     becomes a filled shape in the SVG rather than transparency. There is no
+ *     transparency to recover from a JPEG - it must be removed afterwards.
+ *   - JPEG's lossy 8x8 blocking and chroma subsampling add edge ringing that the
+ *     tracer happily turns into extra paths, so a JPEG traces worse (more paths,
+ *     noisier boundaries) than the same artwork saved as PNG.
  */
 router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req, res) => {
   try {
@@ -880,9 +892,15 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
 
     // Simple, engine-agnostic controls from the frontend.
-    const mode = req.body.mode === 'bw' ? 'bw' : 'color';
+    // `detail` and `smoothing` are unchanged; `mode` now also accepts
+    // 'grayscale' (desaturate, then trace in Color mode) alongside
+    // 'color'/'bw', and `colors` optionally overrides the preset's colour
+    // fidelity (VTracer colorPrecision, 1-8 significant bits per channel).
+    const mode = normalizeTraceMode(req.body.mode);
     const detail = SVG_DETAIL_PRESETS[req.body.detail] ? req.body.detail : 'medium';
     const smoothing = req.body.smoothing === 'sharp' ? 'sharp' : 'smooth';
+    const colors = normalizeColorPrecision(req.body.colors);
+    const colorPrecision = colors ?? SVG_DETAIL_PRESETS[detail].colorPrecision;
 
     logger.info('Starting JPG to SVG conversion (VTracer)', {
       originalName: req.file.originalname,
@@ -890,7 +908,8 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       mimetype: req.file.mimetype,
       mode,
       detail,
-      smoothing
+      smoothing,
+      colorPrecision
     });
 
     // Get JPG metadata (for logging + response headers)
@@ -901,11 +920,14 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       height: metadata.height,
       channels: metadata.channels,
       format: metadata.format,
-      colorspace: metadata.space
+      colorspace: metadata.space,
+      chromaSubsampling: metadata.chromaSubsampling
     });
 
-    // Vectorize with VTracer (full-color, handles any image).
-    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing });
+    // Vectorize with VTracer. vectorizeImageToSvg() normalizes the JPEG through
+    // sharp (resize + PNG re-encode) before handing it to the tracer, and runs
+    // the trace under vectorizeWithTimeout()'s 45s abort ceiling.
+    const svgString = await vectorizeImageToSvg(originalBuffer, { mode, detail, smoothing, colors });
 
     // Verify the SVG was generated and is valid.
     if (!svgString || svgString.length === 0) {
@@ -914,6 +936,14 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
     if (!svgString.includes('<svg') || !svgString.includes('</svg>')) {
       throw new Error('Generated SVG is invalid or corrupted');
     }
+
+    // Structural quality check. "Non-empty and contains <svg>" is not success:
+    // a photo can trace down to a single full-canvas rectangle, which passes
+    // that check while being worthless - and on JPEG input that rectangle is
+    // even more likely, because the opaque background is re-emitted as a fill.
+    // The result is still returned (the caller may want it) but it is reported
+    // as degenerate instead of being passed off as a clean conversion.
+    const trace = analyzeTrace(svgString, originalBuffer.length);
 
     const svgBuffer = Buffer.from(svgString, 'utf8');
     const filename = `${originalName}.svg`;
@@ -925,11 +955,25 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       convertedSize: svgBuffer.length,
       compressionRatio: compressionRatio + '%',
       svgLength: svgString.length,
+      tracePaths: trace.paths,
+      traceDegenerate: trace.degenerate,
+      sizeFactor: trace.sizeFactor,
       mode,
       detail,
       smoothing,
+      colorPrecision,
       filename
     });
+
+    if (trace.degenerate) {
+      logger.warn('JPG to SVG produced a degenerate trace', {
+        originalName: req.file.originalname,
+        tracePaths: trace.paths,
+        mode,
+        detail,
+        colorPrecision
+      });
+    }
 
     // Set response headers
     res.set({
@@ -943,11 +987,35 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       'X-Mode': mode,
       'X-Detail': detail,
       'X-Smoothing': smoothing,
+      'X-Color-Precision': colorPrecision.toString(),
+      'X-Trace-Paths': trace.paths.toString(),
       'X-Original-Width': (metadata.width || 'unknown').toString(),
       'X-Original-Height': (metadata.height || 'unknown').toString(),
+      'X-Original-Channels': (metadata.channels || 'unknown').toString(),
       'X-Original-Format': 'JPEG',
-      'X-Engine': 'vtracer'
+      'X-Engine': 'vtracer',
+      // Direct API/SDK callers need the trace stats across origins. (The edge
+      // worker maintains its own allowlist and currently does not forward these
+      // values, so browsers going through it may see none of them - clients must
+      // degrade gracefully and count paths in the returned SVG themselves.)
+      'Access-Control-Expose-Headers': [
+        'Content-Disposition',
+        'X-Original-Size',
+        'X-Converted-Size',
+        'X-Compression-Ratio',
+        'X-Mode',
+        'X-Detail',
+        'X-Smoothing',
+        'X-Color-Precision',
+        'X-Trace-Paths',
+        'X-Trace-Warning',
+        'X-Engine'
+      ].join(', ')
     });
+
+    if (trace.degenerate) {
+      res.set('X-Trace-Warning', 'degenerate');
+    }
 
     // Send the converted SVG
     res.send(svgBuffer);
@@ -960,27 +1028,56 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       fileSize: req.file?.size,
       mode: req.body?.mode,
       detail: req.body?.detail,
-      smoothing: req.body?.smoothing
+      smoothing: req.body?.smoothing,
+      colors: req.body?.colors
     });
 
-    if (error.message.includes('File must be a JPG/JPEG image')) {
+    const message = (error && error.message) || '';
+
+    // Input was rejected before/independently of tracing: no trace diagnostics.
+    if (message.includes('File must be a JPG/JPEG image')) {
       return sendError(res, 'File must be a JPG/JPEG image', 400);
     }
 
-    if (error.message.includes('Vectorization resulted in empty SVG')) {
-      return sendError(res, 'Vectorization failed. The image may be too complex or contain no traceable content.', 500);
-    }
-
-    if (error.message.includes('Generated SVG is invalid')) {
-      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500);
-    }
-
-    if (error.message.includes('unsupported image format') || error.message.includes('Input buffer')) {
+    if (message.includes('unsupported image format') || message.includes('Input buffer')) {
       return sendError(res, 'Image file could not be processed. Please ensure the file is a valid JPG.', 400);
     }
 
+    // Tracing itself failed. Mirror the trace diagnostics onto the failure path
+    // (headers + JSON body) so a client can tell an unusable trace apart from an
+    // infrastructure error and re-run with different settings.
+    const traceDiagnostics = { tracePaths: 0, traceWarning: 'degenerate' };
+    res.set({
+      'X-Trace-Paths': '0',
+      'X-Trace-Warning': 'degenerate',
+      'Access-Control-Expose-Headers': 'X-Trace-Paths, X-Trace-Warning'
+    });
+
+    if (message.includes('Vectorization timed out')) {
+      return sendError(
+        res,
+        'Vectorisation timed out. Try a smaller image or a lower Detail setting.',
+        503,
+        traceDiagnostics
+      );
+    }
+
+    if (message.includes('Vectorization resulted in empty SVG')) {
+      return sendError(
+        res,
+        'Vectorisation produced nothing traceable. Try Detail: High, or a higher-contrast image.',
+        500,
+        traceDiagnostics
+      );
+    }
+
+    if (message.includes('Generated SVG is invalid')) {
+      return sendError(res, 'SVG generation failed - resulting file is corrupted', 500, traceDiagnostics);
+    }
+
     return sendError(res, 'Failed to convert JPG to SVG', 500, {
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      ...traceDiagnostics,
+      details: process.env.NODE_ENV === 'development' ? message : undefined
     });
   }
 });
