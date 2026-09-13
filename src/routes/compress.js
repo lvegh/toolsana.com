@@ -10,6 +10,7 @@ const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 const pngOptimizer = require('../services/pngOptimizer');
 const { compressJpeg } = require('../services/jpgOptimizer');
+const { compressWebp } = require('../services/webpOptimizer');
 
 const router = express.Router();
 
@@ -244,14 +245,8 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       mimetype: req.file.mimetype
     });
 
-    // Compress WebP with Sharp
-    const compressedBuffer = await sharp(originalBuffer)
-      .webp({
-        quality, // 0-100, where 100 is maximum quality
-        effort: 6, // 0-6, where 6 is maximum effort (slower but better compression)
-        lossless: false
-      })
-      .toBuffer();
+    const webpResult = await compressWebp(originalBuffer, { quality });
+    const compressedBuffer = webpResult.buffer;
 
     // Calculate compression statistics
     const compressedSize = compressedBuffer.length;
@@ -267,7 +262,8 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       originalSize,
       compressedSize,
       compressionRatio: `${compressionRatio}%`,
-      quality
+      quality,
+      mode: webpResult.mode
     });
 
     // Set response headers
