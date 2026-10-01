@@ -95,6 +95,61 @@ function normalizeColorPrecision(value) {
 }
 
 /**
+ * Parse an integer encoder option from a form field.
+ *
+ * `parseInt(x) || fallback` treats an explicit 0 as "missing", but 0 is a real
+ * setting (PNG compressionLevel 0, WebP/AVIF effort 0). Missing or non-numeric
+ * values use the fallback; anything else is clamped into the range Sharp
+ * accepts, so an out-of-range slider value can never make the encoder throw.
+ *
+ * @param {string|number|undefined} value raw request value
+ * @param {number} fallback value used when the field is absent or not a number
+ * @param {number} min lowest accepted value
+ * @param {number} max highest accepted value
+ * @returns {number}
+ */
+function intOption(value, fallback, min, max) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+// Sharp's accepted ranges for the encoder options the clients send.
+const QUALITY_RANGE = [1, 100];
+const PNG_LEVEL_RANGE = [0, 9];
+const WEBP_EFFORT_RANGE = [0, 6];
+const AVIF_EFFORT_RANGE = [0, 9];
+
+/**
+ * Boolean form field ("true"/"false" strings from multipart, or JSON booleans).
+ *
+ * @param {unknown} value raw request value
+ * @returns {boolean}
+ */
+function boolOption(value) {
+  return value === true || String(value).trim().toLowerCase() === 'true';
+}
+
+/**
+ * Sharp decodes only the first frame of an animated WebP/GIF unless asked
+ * otherwise. The single-image converters keep that behaviour (PNG/JPEG/AVIF
+ * outputs here are still images) but log it so the loss is visible.
+ *
+ * @param {object} metadata sharp metadata of the input
+ * @param {string} route route name for the log line
+ * @returns {boolean} true when the input had more than one frame
+ */
+function noteAnimatedInput(metadata, route) {
+  const frames = metadata.pages || 1;
+  if (frames > 1) {
+    logger.info('Animated input: only the first frame is converted', { route, frames });
+    return true;
+  }
+  return false;
+}
+
+/**
  * Inspect a traced SVG and report how much structure it actually contains.
  *
  * "Non-empty and contains <svg>" is NOT a success criterion: a photo can trace
@@ -531,20 +586,34 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
       outputFormat: outputFormat || 'auto'
     });
 
-    let base64String = base64Data;
+    if (typeof base64Data !== 'string') {
+      return sendError(res, 'Base64 data must be a string', 400);
+    }
+
+    let base64String = base64Data.trim();
     let detectedMimeType = null;
 
-    // Handle data URL format
-    if (base64Data.startsWith('data:')) {
-      const dataUrlMatch = base64Data.match(/^data:([^;]+);base64,(.+)$/);
-      if (dataUrlMatch) {
-        detectedMimeType = dataUrlMatch[1];
-        base64String = dataUrlMatch[2];
-        logger.info('Detected data URL format', { mimeType: detectedMimeType });
-      } else {
+    // Handle data URL format: data:[<mediatype>][;param=value]*;base64,<data>
+    // Extra parameters (charset=utf-8, name=logo.png) are legal and common, and
+    // pasted data is often wrapped at 76 columns, so neither may be rejected.
+    if (/^data:/i.test(base64String)) {
+      const comma = base64String.indexOf(',');
+      if (comma === -1) {
         return sendError(res, 'Invalid data URL format', 400);
       }
+      const params = base64String.slice(5, comma).split(';').map((p) => p.trim()).filter(Boolean);
+      if (!params.some((p) => p.toLowerCase() === 'base64')) {
+        return sendError(res, 'Only base64-encoded data URLs are supported (data:image/...;base64,...)', 400);
+      }
+      if (params[0] && params[0].includes('/')) {
+        detectedMimeType = params[0].toLowerCase();
+      }
+      base64String = base64String.slice(comma + 1);
+      logger.info('Detected data URL format', { mimeType: detectedMimeType });
     }
+
+    // Line breaks, spaces and tabs inside the payload are not data.
+    base64String = base64String.replace(/\s+/g, '');
 
     // Convert base64 to buffer
     let imageBuffer;
@@ -575,56 +644,66 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
       size: imageBuffer.length
     });
 
-    // Determine output format
-    let targetFormat = outputFormat || metadata.format || 'png';
-    let outputMimeType = `image/${targetFormat}`;
-    let outputBuffer = imageBuffer;
+    // Sharp reports AVIF and HEIC both as 'heif'; the compression tells them apart.
+    const sourceFormat = metadata.format === 'heif'
+      ? (metadata.compression === 'av1' ? 'avif' : 'heic')
+      : metadata.format;
+    const MIME_BY_FORMAT = {
+      jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic',
+      gif: 'image/gif', svg: 'image/svg+xml', tiff: 'image/tiff'
+    };
+    const EXTENSION_BY_FORMAT = { jpeg: 'jpg', svg: 'svg', tiff: 'tif' };
+    const FORMAT_BY_REQUEST = { png: 'png', jpg: 'jpeg', jpeg: 'jpeg', webp: 'webp', avif: 'avif' };
 
-    // Convert if different format requested
-    if (outputFormat && outputFormat !== metadata.format) {
+    const requested = outputFormat ? FORMAT_BY_REQUEST[String(outputFormat).trim().toLowerCase()] : undefined;
+    // Re-encoding into the format the data is already in only loses quality
+    // (JPG -> JPG at q90 is a lossy round trip), so the original bytes are kept.
+    const needsConversion = Boolean(requested) && requested !== sourceFormat;
+
+    let targetFormat = sourceFormat;
+    let outputMimeType = MIME_BY_FORMAT[sourceFormat] || detectedMimeType || `image/${sourceFormat}`;
+    let outputBuffer = imageBuffer;
+    let converted = false;
+
+    if (needsConversion) {
       try {
-        const sharpInstance = sharp(imageBuffer);
-        
-        switch (outputFormat.toLowerCase()) {
+        const sharpInstance = sharp(imageBuffer).rotate(); // bake EXIF orientation; metadata is stripped on encode
+
+        switch (requested) {
           case 'png':
             outputBuffer = await sharpInstance.png().toBuffer();
-            outputMimeType = 'image/png';
             break;
-          case 'jpg':
           case 'jpeg':
-            outputBuffer = await sharpInstance.jpeg({ quality: 90 }).toBuffer();
-            outputMimeType = 'image/jpeg';
-            targetFormat = 'jpg';
+            // JPEG has no alpha channel: without a background, transparent
+            // pixels come out black. Flatten onto white like the other JPG routes.
+            outputBuffer = await sharpInstance
+              .flatten({ background: { r: 255, g: 255, b: 255 } })
+              .jpeg({ quality: 90 })
+              .toBuffer();
             break;
           case 'webp':
             outputBuffer = await sharpInstance.webp({ quality: 90 }).toBuffer();
-            outputMimeType = 'image/webp';
             break;
           case 'avif':
             outputBuffer = await sharpInstance.avif({ quality: 90 }).toBuffer();
-            outputMimeType = 'image/avif';
             break;
-          default:
-            // Keep original format
-            outputBuffer = imageBuffer;
-            outputMimeType = detectedMimeType || `image/${metadata.format}`;
-            targetFormat = metadata.format;
         }
+        targetFormat = requested;
+        outputMimeType = MIME_BY_FORMAT[requested];
+        converted = true;
       } catch (conversionError) {
         logger.error('Format conversion error:', conversionError);
         // Fall back to original format
         outputBuffer = imageBuffer;
-        outputMimeType = detectedMimeType || `image/${metadata.format}`;
-        targetFormat = metadata.format;
       }
-    } else {
-      outputMimeType = detectedMimeType || `image/${metadata.format}`;
     }
+
+    const extension = EXTENSION_BY_FORMAT[targetFormat] || targetFormat;
 
     // Generate filename
     const outputFilename = filename 
-      ? `${filename.replace(/\.[^/.]+$/, '')}.${targetFormat}`
-      : `converted_image.${targetFormat}`;
+      ? `${filename.replace(/\.[^/.]+$/, '')}.${extension}`
+      : `converted_image.${extension}`;
 
     logger.info('Base64 to Image conversion completed', {
       inputBase64Length: base64Data.length,
@@ -632,8 +711,8 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
       outputFormat: targetFormat,
       outputMimeType,
       filename: outputFilename,
-      originalFormat: metadata.format,
-      converted: outputFormat && outputFormat !== metadata.format
+      originalFormat: sourceFormat,
+      converted
     });
 
     // Set response headers
@@ -641,12 +720,12 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
       'Content-Type': outputMimeType,
       'Content-Disposition': `attachment; filename="${outputFilename}"`,
       'Content-Length': outputBuffer.length.toString(),
-      'X-Original-Format': metadata.format,
-      'X-Output-Format': targetFormat,
+      'X-Original-Format': sourceFormat,
+      'X-Output-Format': extension,
       'X-Image-Width': (metadata.width || 'unknown').toString(),
       'X-Image-Height': (metadata.height || 'unknown').toString(),
       'X-Original-Base64-Length': base64Data.length.toString(),
-      'X-Converted': (outputFormat && outputFormat !== metadata.format) ? 'true' : 'false'
+      'X-Converted': converted ? 'true' : 'false'
     });
 
     // Send the converted image
@@ -1095,7 +1174,7 @@ router.post('/svg-to-jpg', basicRateLimit, uploadSvg.single('file'), async (req,
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 90;
+    const quality = intOption(req.body.quality, 90, ...QUALITY_RANGE);
     const backgroundColor = req.body.backgroundColor || '#ffffff';
     const width = parseInt(req.body.width) || null;
     const height = parseInt(req.body.height) || null;
@@ -1285,7 +1364,7 @@ router.post('/svg-to-png', basicRateLimit, uploadSvg.single('file'), async (req,
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const compressionLevel = parseInt(req.body.compressionLevel) || 6;
+    const compressionLevel = intOption(req.body.compressionLevel, 6, ...PNG_LEVEL_RANGE);
     const width = parseInt(req.body.width) || null;
     const height = parseInt(req.body.height) || null;
     const density = parseInt(req.body.density) || 72;
@@ -1460,7 +1539,7 @@ router.post('/avif-to-png', basicRateLimit, uploadAvif.single('file'), async (re
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const compressionLevel = parseInt(req.body.compressionLevel) || 6;
+    const compressionLevel = intOption(req.body.compressionLevel, 6, ...PNG_LEVEL_RANGE);
 
     // Validate compression level parameter
     if (compressionLevel < 0 || compressionLevel > 9) {
@@ -1602,7 +1681,7 @@ router.post('/avif-to-jpg', basicRateLimit, uploadAvif.single('file'), async (re
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 90;
+    const quality = intOption(req.body.quality, 90, ...QUALITY_RANGE);
     const backgroundColor = req.body.backgroundColor || '#ffffff';
 
     // Validate quality parameter
@@ -1761,9 +1840,9 @@ router.post('/avif-to-webp', basicRateLimit, uploadAvif.single('file'), async (r
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 80;
+    const quality = intOption(req.body.quality, 80, ...QUALITY_RANGE);
     const lossless = req.body.lossless === 'true';
-    const effort = parseInt(req.body.effort) || 4;
+    const effort = intOption(req.body.effort, 4, ...WEBP_EFFORT_RANGE);
 
     // Validate quality parameter (only for lossy compression)
     if (!lossless && (quality < 1 || quality > 100)) {
@@ -1918,16 +1997,19 @@ router.post('/jpg-to-png', basicRateLimit, uploadJpg.single('file'), async (req,
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
 
+    const compressionLevel = intOption(req.body.compressionLevel, 6, ...PNG_LEVEL_RANGE);
+
     logger.info('Starting JPG to PNG conversion', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
-      mimetype: req.file.mimetype
+      mimetype: req.file.mimetype,
+      compressionLevel
     });
 
     // Convert JPG to PNG with Sharp
     const pngBuffer = await sharp(originalBuffer)
       .rotate() // Auto-rotate based on EXIF orientation
-      .png() // Convert to PNG format
+      .png({ compressionLevel, adaptiveFiltering: true }) // Lossless either way; the level trades speed for size
       .toBuffer();
 
     // Generate filename
@@ -1947,7 +2029,8 @@ router.post('/jpg-to-png', basicRateLimit, uploadJpg.single('file'), async (req,
       'Content-Length': pngBuffer.length.toString(),
       'X-Original-Filename': req.file.originalname,
       'X-Original-Size': originalBuffer.length.toString(),
-      'X-Converted-Size': pngBuffer.length.toString()
+      'X-Converted-Size': pngBuffer.length.toString(),
+      'X-Compression-Level': compressionLevel.toString()
     });
 
     // Send the converted image
@@ -1984,8 +2067,9 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 80;
+    const quality = intOption(req.body.quality, 80, ...QUALITY_RANGE);
     const compressionType = req.body.compressionType || 'lossy';
+    const effort = intOption(req.body.effort, 4, ...AVIF_EFFORT_RANGE);
 
     // Validate compression type
     if (!['lossy', 'lossless'].includes(compressionType)) {
@@ -2002,7 +2086,8 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
       originalSize: originalBuffer.length,
       mimetype: req.file.mimetype,
       compressionType,
-      quality: compressionType === 'lossy' ? quality : 'N/A (lossless)'
+      quality: compressionType === 'lossy' ? quality : 'N/A (lossless)',
+      effort
     });
 
     // Get image metadata to check for transparency
@@ -2020,7 +2105,7 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
 
     // Configure AVIF options based on compression type and image characteristics
     const avifOptions = {
-      effort: 4, // Encoding effort (0-9, higher = better compression but slower)
+      effort, // Encoding effort (0-9, higher = better compression but slower)
     };
 
     if (compressionType === 'lossless') {
@@ -2102,6 +2187,7 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
       'X-Compression-Type': compressionType,
       'X-Quality': compressionType === 'lossy' ? quality.toString() : 'lossless',
       'X-Has-Alpha': hasAlpha.toString(),
+      'X-Effort': effort.toString(),
       'X-Chroma-Subsampling': compressionType === 'lossless' ? 'none' : (avifOptions.chromaSubsampling || 'none')
     });
 
@@ -2149,10 +2235,16 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 80;
+    const quality = intOption(req.body.quality, 80, ...QUALITY_RANGE);
+    const compressionType = req.body.compressionType || 'lossy';
 
-    // Validate quality parameter
-    if (quality < 10 || quality > 100) {
+    if (!['lossy', 'lossless'].includes(compressionType)) {
+      return sendError(res, 'Compression type must be either "lossy" or "lossless"', 400);
+    }
+    const lossless = compressionType === 'lossless';
+
+    // Validate quality parameter (lossy only; lossless ignores it)
+    if (!lossless && (quality < 10 || quality > 100)) {
       return sendError(res, 'Quality must be between 10 and 100', 400);
     }
 
@@ -2160,7 +2252,8 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       mimetype: req.file.mimetype,
-      quality
+      compressionType,
+      quality: lossless ? 'N/A (lossless)' : quality
     });
 
     // Get image metadata for better conversion handling
@@ -2175,12 +2268,15 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       hasProfile: !!metadata.icc
     });
 
-    // Configure AVIF options
-    const avifOptions = {
-      quality: quality,
-      effort: 4, // Encoding effort (0-9, higher = better compression but slower)
-      chromaSubsampling: '4:2:0' // Good for JPG since it doesn't have transparency
-    };
+    // Configure AVIF options. Lossless AVIF is always 4:4:4 (Sharp ignores
+    // quality and chroma subsampling when lossless is set).
+    const avifOptions = lossless
+      ? { lossless: true, effort: 4 }
+      : {
+        quality: quality,
+        effort: 4, // Encoding effort (0-9, higher = better compression but slower)
+        chromaSubsampling: '4:2:0' // Good for JPG since it doesn't have transparency
+      };
 
     // Convert JPG to AVIF with Sharp
     let sharpInstance = sharp(originalBuffer)
@@ -2224,7 +2320,8 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       originalSize: originalBuffer.length,
       convertedSize: avifBuffer.length,
       compressionRatio: compressionRatio + '%',
-      quality,
+      compressionType,
+      quality: lossless ? 'N/A (lossless)' : quality,
       colorspace: metadata.space,
       filename
     });
@@ -2238,9 +2335,10 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': avifBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
-      'X-Quality': quality.toString(),
+      'X-Quality': lossless ? 'lossless' : quality.toString(),
+      'X-Compression-Type': compressionType,
       'X-Original-Colorspace': metadata.space || 'unknown',
-      'X-Chroma-Subsampling': '4:2:0'
+      'X-Chroma-Subsampling': lossless ? '4:4:4' : '4:2:0'
     });
 
     // Send the converted image
@@ -2252,7 +2350,8 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       stack: error.stack,
       originalName: req.file?.originalname,
       fileSize: req.file?.size,
-      quality: req.body?.quality
+      quality: req.body?.quality,
+      compressionType: req.body?.compressionType
     });
 
     if (error.message.includes('File must be a JPG/JPEG image')) {
@@ -2286,7 +2385,7 @@ router.post('/webp-to-jpg', basicRateLimit, uploadWebp.single('file'), async (re
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 90;
+    const quality = intOption(req.body.quality, 90, ...QUALITY_RANGE);
     const backgroundColor = req.body.backgroundColor || '#ffffff';
 
     // Validate quality parameter
@@ -2309,6 +2408,8 @@ router.post('/webp-to-jpg', basicRateLimit, uploadWebp.single('file'), async (re
 
     // Get image metadata for better conversion handling
     const metadata = await sharp(originalBuffer).metadata();
+    // Only frame 1 of an animated WebP is converted (the output format here is a still image).
+    noteAnimatedInput(metadata, 'webp-to-jpg');
 
     logger.info('Image metadata', {
       width: metadata.width,
@@ -2445,7 +2546,7 @@ router.post('/webp-to-png', basicRateLimit, uploadWebp.single('file'), async (re
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const compressionLevel = parseInt(req.body.compressionLevel) || 6;
+    const compressionLevel = intOption(req.body.compressionLevel, 6, ...PNG_LEVEL_RANGE);
 
     // Validate compression level parameter
     if (compressionLevel < 0 || compressionLevel > 9) {
@@ -2461,6 +2562,8 @@ router.post('/webp-to-png', basicRateLimit, uploadWebp.single('file'), async (re
 
     // Get image metadata for better conversion handling
     const metadata = await sharp(originalBuffer).metadata();
+    // Only frame 1 of an animated WebP is converted (the output format here is a still image).
+    noteAnimatedInput(metadata, 'webp-to-png');
 
     logger.info('Image metadata', {
       width: metadata.width,
@@ -2587,17 +2690,14 @@ router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uplo
 
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
-    const quality = parseInt(req.body.quality) || 50;
-    const speed = parseInt(req.body.speed) || 6;
+    const quality = intOption(req.body.quality, 50, ...QUALITY_RANGE);
+    // The client's "speed" field is Sharp's AVIF `effort` (0-9). Clamp so an
+    // out-of-range value (the old slider went to 10) can't fail every file.
+    const speed = intOption(req.body.speed, 6, ...AVIF_EFFORT_RANGE);
 
     // Validate quality parameter
     if (quality < 1 || quality > 100) {
       return sendError(res, 'Quality must be between 1 and 100', 400);
-    }
-
-    // Validate speed parameter
-    if (speed < 0 || speed > 10) {
-      return sendError(res, 'Speed must be between 0 and 10', 400);
     }
 
     logger.info('Starting WebP to AVIF conversion', {
@@ -2610,6 +2710,8 @@ router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uplo
 
     // Get image metadata for better conversion handling
     const metadata = await sharp(originalBuffer).metadata();
+    // Only frame 1 of an animated WebP is converted (the output format here is a still image).
+    noteAnimatedInput(metadata, 'webp-to-avif');
 
     logger.info('Image metadata', {
       width: metadata.width,
@@ -2624,7 +2726,7 @@ router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uplo
     // Configure AVIF options
     const avifOptions = {
       quality: quality,
-      effort: speed, // Encoding effort (0-10, higher = better compression but slower)
+      effort: speed, // Encoding effort (0-9, higher = better compression but slower)
       chromaSubsampling: metadata.hasAlpha ? '4:4:4' : '4:2:0', // Better subsampling for images with transparency
       lossless: false // Use lossy compression for better file size
     };
@@ -2739,7 +2841,7 @@ router.post('/png-to-jpg', enhancedSecurityWithRateLimit(basicRateLimit), upload
     }
 
     // Get quality parameter (default to 90)
-    const quality = parseInt(req.body.quality) || 90;
+    const quality = intOption(req.body.quality, 90, ...QUALITY_RANGE);
     const backgroundColor = req.body.backgroundColor || '#ffffff';
 
     // Validate quality range
@@ -2834,7 +2936,7 @@ router.post('/png-to-webp', basicRateLimit, uploadPng.single('file'), async (req
     }
 
     // Get quality parameter (default to 80)
-    const quality = parseInt(req.body.quality) || 80;
+    const quality = intOption(req.body.quality, 80, ...QUALITY_RANGE);
     const lossless = req.body.lossless === 'true' || req.body.lossless === true;
 
     // Validate quality range (only applies to lossy compression)
@@ -2995,16 +3097,24 @@ router.post('/jpg-to-webp', basicRateLimit, uploadJpg.single('file'), async (req
     const originalBuffer = req.file.buffer;
     const originalName = req.file.originalname.replace(/\.[^/.]+$/, '');
 
+    const quality = intOption(req.body.quality, 80, ...QUALITY_RANGE);
+    const lossless = boolOption(req.body.lossless);
+    const effort = intOption(req.body.effort, 4, ...WEBP_EFFORT_RANGE);
+
     logger.info('Starting JPG to WebP conversion', {
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
-      mimetype: req.file.mimetype
+      mimetype: req.file.mimetype,
+      quality: lossless ? 'lossless' : quality,
+      lossless,
+      effort
     });
 
     // Convert JPG to WebP with Sharp
+    const webpOptions = lossless ? { lossless: true, effort } : { quality, effort };
     const webpBuffer = await sharp(originalBuffer)
       .rotate() // Auto-rotate based on EXIF orientation
-      .webp({ quality: 80 }) // Convert to WebP format with quality setting
+      .webp(webpOptions)
       .toBuffer();
 
     // Generate filename
@@ -3014,6 +3124,8 @@ router.post('/jpg-to-webp', basicRateLimit, uploadJpg.single('file'), async (req
       originalName: req.file.originalname,
       originalSize: originalBuffer.length,
       convertedSize: webpBuffer.length,
+      quality: lossless ? 'lossless' : quality,
+      effort,
       filename
     });
 
@@ -3024,7 +3136,10 @@ router.post('/jpg-to-webp', basicRateLimit, uploadJpg.single('file'), async (req
       'Content-Length': webpBuffer.length.toString(),
       'X-Original-Filename': req.file.originalname,
       'X-Original-Size': originalBuffer.length.toString(),
-      'X-Converted-Size': webpBuffer.length.toString()
+      'X-Converted-Size': webpBuffer.length.toString(),
+      'X-Quality': lossless ? 'lossless' : quality.toString(),
+      'X-Lossless': lossless ? 'true' : 'false',
+      'X-Effort': effort.toString()
     });
 
     // Send the converted image
@@ -3058,7 +3173,7 @@ router.post('/png-to-jpg-batch', basicRateLimit, uploadPng.array('files', 5), as
       return sendError(res, 'No files provided', 400);
     }
 
-    const quality = parseInt(req.body.quality) || 90;
+    const quality = intOption(req.body.quality, 90, ...QUALITY_RANGE);
     const backgroundColor = req.body.backgroundColor || '#ffffff';
 
     if (quality < 1 || quality > 100) {

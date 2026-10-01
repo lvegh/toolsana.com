@@ -50,7 +50,11 @@ function findRecompressibleImages(pdfDoc) {
  * exactly as it is.
  */
 async function recompressImage(bytes, { quality, maxImageWidth }) {
-  const metadata = await sharp(bytes).metadata();
+  // The image dictionary's /ColorSpace (ICCBased, Separation, Lab, ...) decides
+  // how the samples are rendered, not any ICC profile inside the JPEG. So the
+  // samples must survive unchanged: no ICC -> sRGB transform (ignoreIcc) and
+  // the same number of channels, so the original /ColorSpace stays valid.
+  const metadata = await sharp(bytes, { ignoreIcc: true }).metadata();
 
   // Sharp converts CMYK to sRGB on encode, which would no longer agree with
   // the stream's /DeviceCMYK ColorSpace entry and would shift every colour on
@@ -59,14 +63,27 @@ async function recompressImage(bytes, { quality, maxImageWidth }) {
     return { skipped: 'cmyk' };
   }
 
-  let pipeline = sharp(bytes);
+  if (metadata.channels !== 1 && metadata.channels !== 3) {
+    return { skipped: 'channels' };
+  }
+
+  let pipeline = sharp(bytes, { ignoreIcc: true });
   const shouldResize = Boolean(maxImageWidth) && metadata.width > maxImageWidth;
   if (shouldResize) {
     pipeline = pipeline.resize({ width: maxImageWidth, withoutEnlargement: true });
   }
+  // Sharp writes single-channel input as 3-channel sRGB by default, which would
+  // no longer match a /DeviceGray, /Separation or SMask image. Keep it 1-channel.
+  if (metadata.channels === 1) {
+    pipeline = pipeline.toColourspace('b-w');
+  }
 
   const output = await pipeline.jpeg({ quality, mozjpeg: true }).toBuffer();
-  const outputMeta = await sharp(output).metadata();
+  const outputMeta = await sharp(output, { ignoreIcc: true }).metadata();
+
+  if (outputMeta.channels !== metadata.channels) {
+    return { skipped: 'channels' };
+  }
 
   // Re-encoding can enlarge an image that was already aggressively compressed.
   // Keeping the original is always the better outcome.
@@ -124,10 +141,16 @@ async function compress(inputBuffer, { quality = 75, maxImageWidth = null } = {}
       newDict.set(PDFName.of('Height'), pdfDoc.context.obj(result.height));
       newDict.set(PDFName.of('Length'), pdfDoc.context.obj(result.buffer.length));
       newDict.set(PDFName.of('BitsPerComponent'), pdfDoc.context.obj(8));
-      newDict.set(
-        PDFName.of('ColorSpace'),
-        PDFName.of(result.channels === 1 ? 'DeviceGray' : 'DeviceRGB')
-      );
+      // The samples keep their meaning and channel count, so the original
+      // /ColorSpace (with its ICC profile, spot colour or Lab definition) stays.
+      // Overwriting it with DeviceRGB/DeviceGray dropped ICC profiles and
+      // turned Separation tints into inverted greys.
+      if (!dict.get(PDFName.of('ColorSpace'))) {
+        newDict.set(
+          PDFName.of('ColorSpace'),
+          PDFName.of(result.channels === 1 ? 'DeviceGray' : 'DeviceRGB')
+        );
+      }
       // Any decode parameters described the previous encoding.
       newDict.delete(PDFName.of('DecodeParms'));
 
@@ -148,7 +171,19 @@ async function compress(inputBuffer, { quality = 75, maxImageWidth = null } = {}
   // Object streams pack the document's indirect objects together and compress
   // them, which reclaims some structural overhead independently of the images.
   const outputBytes = await pdfDoc.save({ useObjectStreams: true });
-  const buffer = Buffer.from(outputBytes);
+  let buffer = Buffer.from(outputBytes);
+
+  // Rewriting a PDF can make it larger (text-only files, or ones already
+  // saved compactly). Never hand back a bigger "_compressed" file: return the
+  // original bytes, reported as 0% saved (same convention as the PNG and WebP
+  // compressors, whose clients read equal sizes as "already optimal").
+  const originalKept = buffer.length >= originalSize;
+  if (originalKept) {
+    logger.info('PDF compression kept original (no smaller result)', {
+      originalSize, attemptedSize: buffer.length, imagesRecompressed,
+    });
+    buffer = Buffer.isBuffer(inputBuffer) ? inputBuffer : Buffer.from(inputBuffer);
+  }
 
   return {
     buffer,
@@ -156,10 +191,12 @@ async function compress(inputBuffer, { quality = 75, maxImageWidth = null } = {}
       originalSize,
       compressedSize: buffer.length,
       compressionRatio: Number((((originalSize - buffer.length) / originalSize) * 100).toFixed(1)),
+      originalKept,
       pageCount: pdfDoc.getPageCount(),
       imagesFound: candidates.length,
-      imagesRecompressed,
-      imagesSkipped,
+      // Nothing was changed in the file that is returned when it was kept.
+      imagesRecompressed: originalKept ? 0 : imagesRecompressed,
+      imagesSkipped: originalKept ? candidates.length : imagesSkipped,
       imageBytesBefore,
       imageBytesAfter,
     },

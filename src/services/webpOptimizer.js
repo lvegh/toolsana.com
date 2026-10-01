@@ -25,6 +25,20 @@ function isLosslessWebp(buffer) {
     const size = buffer.readUInt32LE(offset + 4);
     if (chunk === 'VP8L') return true;
     if (chunk === 'VP8 ') return false;
+    if (chunk === 'ANMF') {
+      // Animated: each ANMF frame carries its own bitstream after a 16-byte
+      // frame header (optionally preceded by an ALPH chunk). Judge by frame 1.
+      let inner = offset + 8 + 16;
+      const end = Math.min(offset + 8 + size, buffer.length);
+      while (inner + 8 <= end) {
+        const tag = buffer.toString('latin1', inner, inner + 4);
+        if (tag === 'VP8L') return true;
+        if (tag === 'VP8 ') return false;
+        const innerSize = buffer.readUInt32LE(inner + 4);
+        inner += 8 + innerSize + (innerSize & 1);
+      }
+      return false;
+    }
     offset += 8 + size + (size & 1);
   }
   return false;
@@ -92,19 +106,25 @@ function ssim(a, b) {
   return n ? total / n : 1;
 }
 
-const encodeLossy = (buffer, quality, effort) =>
-  sharp(buffer).rotate().webp({ quality, effort }).toBuffer();
-const encodeNearLossless = (buffer, quality, effort) =>
-  sharp(buffer).rotate().webp({ nearLossless: true, quality, effort }).toBuffer();
-const encodeLossless = (buffer, effort) =>
-  sharp(buffer).rotate().webp({ lossless: true, effort }).toBuffer();
+// `animated` re-encodes every frame (Sharp keeps the delays and loop count).
+// Without it Sharp decodes only frame 1, which silently turned an animation
+// into a still image that then "saved 90%". The quality searches below still
+// run on frame 1 alone (a cheap, representative proxy); only the final encode
+// needs every frame.
+const input = (buffer, animated) => (animated ? sharp(buffer, { animated: true }) : sharp(buffer).rotate());
+const encodeLossy = (buffer, quality, effort, animated = false) =>
+  input(buffer, animated).webp({ quality, effort }).toBuffer();
+const encodeNearLossless = (buffer, quality, effort, animated = false) =>
+  input(buffer, animated).webp({ nearLossless: true, quality, effort }).toBuffer();
+const encodeLossless = (buffer, effort, animated = false) =>
+  input(buffer, animated).webp({ lossless: true, effort }).toBuffer();
 
 /**
  * Automatic mode: the lowest setting that still measures visually equivalent
  * (luma SSIM >= 0.99) to the input, searched at a lower effort, then encoded
  * once at full effort.
  */
-async function autoLossy(buffer) {
+async function autoLossy(buffer, animated) {
   const source = await lumaPlane(buffer);
   const cache = new Map();
   const tryQ = async (q) => {
@@ -133,10 +153,10 @@ async function autoLossy(buffer) {
     quality = LOSSY_Q_FALLBACK;
     score = await tryQ(quality);
   }
-  return { out: await encodeLossy(buffer, quality, FINAL_EFFORT), quality, ssim: score, mode: 'lossy' };
+  return { out: await encodeLossy(buffer, quality, FINAL_EFFORT, animated), quality, ssim: score, mode: 'lossy' };
 }
 
-async function autoLossless(buffer) {
+async function autoLossless(buffer, animated) {
   const source = await lumaPlane(buffer);
   let chosen = null;
   for (const level of NEAR_LOSSLESS_LEVELS) {
@@ -147,9 +167,9 @@ async function autoLossless(buffer) {
       break;
     }
   }
-  const pure = await encodeLossless(buffer, FINAL_EFFORT);
+  const pure = await encodeLossless(buffer, FINAL_EFFORT, animated);
   if (!chosen) return { out: pure, quality: 100, ssim: 1, mode: 'lossless' };
-  const near = await encodeNearLossless(buffer, chosen.quality, FINAL_EFFORT);
+  const near = await encodeNearLossless(buffer, chosen.quality, FINAL_EFFORT, animated);
   return pure.length <= near.length
     ? { out: pure, quality: 100, ssim: 1, mode: 'lossless' }
     : { out: near, quality: chosen.quality, ssim: chosen.ssim, mode: 'near-lossless' };
@@ -158,28 +178,39 @@ async function autoLossless(buffer) {
 /**
  * @param {Buffer} buffer  source WebP
  * @param {{quality?: number}} [options]  explicit quality disables the search
- * @returns {Promise<{buffer: Buffer, quality: number, ssim: number|null, mode: string, originalKept: boolean}>}
+ * @returns {Promise<{buffer: Buffer, quality: number, ssim: number|null, mode: string, originalKept: boolean, animated: boolean, frames: number}>}
  */
 async function compressWebp(buffer, options = {}) {
   const started = Date.now();
   const lossless = isLosslessWebp(buffer);
+  const { pages } = await sharp(buffer).metadata();
+  const animated = (pages || 1) > 1;
   let result;
 
   if (options.quality) {
     const quality = options.quality;
     if (lossless) {
       const [near, pure] = await Promise.all([
-        encodeNearLossless(buffer, quality, FINAL_EFFORT),
-        encodeLossless(buffer, FINAL_EFFORT)
+        encodeNearLossless(buffer, quality, FINAL_EFFORT, animated),
+        encodeLossless(buffer, FINAL_EFFORT, animated)
       ]);
       result = pure.length <= near.length
         ? { out: pure, quality: 100, ssim: null, mode: 'lossless' }
         : { out: near, quality, ssim: null, mode: 'near-lossless' };
     } else {
-      result = { out: await encodeLossy(buffer, quality, FINAL_EFFORT), quality, ssim: null, mode: 'lossy' };
+      result = { out: await encodeLossy(buffer, quality, FINAL_EFFORT, animated), quality, ssim: null, mode: 'lossy' };
     }
   } else {
-    result = lossless ? await autoLossless(buffer) : await autoLossy(buffer);
+    result = lossless ? await autoLossless(buffer, animated) : await autoLossy(buffer, animated);
+  }
+
+  // Belt and braces: an animation must never come back as fewer frames.
+  if (animated) {
+    const outPages = (await sharp(result.out).metadata()).pages || 1;
+    if (outPages !== pages) {
+      logger.warn('WebP compression dropped animation frames; keeping original', { pages, outPages });
+      return { buffer, quality: result.quality, ssim: null, mode: 'original-kept', originalKept: true, animated, frames: pages };
+    }
   }
 
   const ms = Date.now() - started;
@@ -188,14 +219,14 @@ async function compressWebp(buffer, options = {}) {
     logger.info('WebP compression kept original (no smaller result)', {
       originalSize: buffer.length, attemptedSize: out.length, quality, mode, ms
     });
-    return { buffer, quality, ssim: score, mode: 'original-kept', originalKept: true };
+    return { buffer, quality, ssim: score, mode: 'original-kept', originalKept: true, animated, frames: pages || 1 };
   }
 
   logger.info('WebP compression completed', {
-    originalSize: buffer.length, compressedSize: out.length, quality, mode,
+    originalSize: buffer.length, compressedSize: out.length, quality, mode, animated, frames: pages || 1,
     ssim: score === null ? undefined : Number(score.toFixed(4)), ms
   });
-  return { buffer: out, quality, ssim: score, mode, originalKept: false };
+  return { buffer: out, quality, ssim: score, mode, originalKept: false, animated, frames: pages || 1 };
 }
 
 module.exports = { compressWebp, isLosslessWebp, SSIM_TARGET };
