@@ -4,6 +4,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const { classifyInputError } = require('../utils/inputErrors');
 const pdfOptimizer = require('../services/pdfOptimizer');
 
 const router = express.Router();
@@ -112,11 +113,9 @@ router.post('/compress', enhancedSecurityWithRateLimit(basicRateLimit), uploadPd
       fileSize: req.file?.size
     });
 
-    if (/encrypt/i.test(error.message)) {
-      return sendError(res, 'This PDF is password-protected. Remove the protection before compressing it.', 400);
-    }
-    if (/Failed to parse|Expected instance of PDFDict|No PDF header/i.test(error.message)) {
-      return sendError(res, 'This file is not a valid PDF, or it is corrupted.', 400);
+    const inputError = classifyInputError(error, 'pdf');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
     }
     if (error.message.includes('File must be a PDF')) {
       return sendError(res, 'File must be a PDF', 400);

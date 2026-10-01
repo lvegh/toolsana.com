@@ -5,6 +5,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
+const { classifyInputError } = require('../utils/inputErrors');
 const { vectorize, ColorMode, Hierarchical, PathSimplifyMode } = require('@neplex/vectorizer');
 
 const router = express.Router();
@@ -554,6 +555,11 @@ router.post('/image-to-base64', basicRateLimit, uploadAnyImage.single('file'), a
       copyFormat: req.body?.copyFormat
     });
 
+    const inputError = classifyInputError(error, 'image');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be an image')) {
       return sendError(res, 'File must be an image', 400);
     }
@@ -740,6 +746,11 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
       outputFormat: req.body?.outputFormat
     });
 
+    const inputError = classifyInputError(error, 'base64');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     return sendError(res, 'Failed to convert Base64 to image', 500, {
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
@@ -893,6 +904,11 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
       smoothing: req.body?.smoothing,
       colors: req.body?.colors
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     const message = (error && error.message) || '';
 
@@ -1110,6 +1126,11 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
       smoothing: req.body?.smoothing,
       colors: req.body?.colors
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     const message = (error && error.message) || '';
 
@@ -1329,6 +1350,11 @@ router.post('/svg-to-jpg', basicRateLimit, uploadSvg.single('file'), async (req,
       density: req.body?.density
     });
 
+    const inputError = classifyInputError(error, 'svg');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be an SVG image')) {
       return sendError(res, 'File must be an SVG image', 400);
     }
@@ -1504,6 +1530,11 @@ router.post('/svg-to-png', basicRateLimit, uploadSvg.single('file'), async (req,
       density: req.body?.density
     });
 
+    const inputError = classifyInputError(error, 'svg');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be an SVG image')) {
       return sendError(res, 'File must be an SVG image', 400);
     }
@@ -1649,6 +1680,11 @@ router.post('/avif-to-png', basicRateLimit, uploadAvif.single('file'), async (re
       fileSize: req.file?.size,
       compressionLevel: req.body?.compressionLevel
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'AVIF' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     if (error.message.includes('File must be an AVIF image')) {
       return sendError(res, 'File must be an AVIF image', 400);
@@ -1809,6 +1845,11 @@ router.post('/avif-to-jpg', basicRateLimit, uploadAvif.single('file'), async (re
       backgroundColor: req.body?.backgroundColor
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'AVIF' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be an AVIF image')) {
       return sendError(res, 'File must be an AVIF image', 400);
     }
@@ -1965,6 +2006,11 @@ router.post('/avif-to-webp', basicRateLimit, uploadAvif.single('file'), async (r
       effort: req.body?.effort
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'AVIF' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be an AVIF image')) {
       return sendError(res, 'File must be an AVIF image', 400);
     }
@@ -2043,6 +2089,11 @@ router.post('/jpg-to-png', basicRateLimit, uploadJpg.single('file'), async (req,
       originalName: req.file?.originalname,
       fileSize: req.file?.size
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     if (error.message.includes('File must be a JPG/JPEG image')) {
       return sendError(res, 'File must be a JPG/JPEG image', 400);
@@ -2204,6 +2255,11 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
       quality: req.body?.quality
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a PNG image')) {
       return sendError(res, 'File must be a PNG image', 400);
     }
@@ -2353,6 +2409,11 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
       quality: req.body?.quality,
       compressionType: req.body?.compressionType
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     if (error.message.includes('File must be a JPG/JPEG image')) {
       return sendError(res, 'File must be a JPG/JPEG image', 400);
@@ -2515,6 +2576,11 @@ router.post('/webp-to-jpg', basicRateLimit, uploadWebp.single('file'), async (re
       backgroundColor: req.body?.backgroundColor
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'WEBP' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a WebP image')) {
       return sendError(res, 'File must be a WebP image', 400);
     }
@@ -2658,6 +2724,11 @@ router.post('/webp-to-png', basicRateLimit, uploadWebp.single('file'), async (re
       fileSize: req.file?.size,
       compressionLevel: req.body?.compressionLevel
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'WEBP' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     if (error.message.includes('File must be a WebP image')) {
       return sendError(res, 'File must be a WebP image', 400);
@@ -2811,6 +2882,11 @@ router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uplo
       speed: req.body?.speed
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'WEBP' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a WebP image')) {
       return sendError(res, 'File must be a WebP image', 400);
     }
@@ -2914,6 +2990,11 @@ router.post('/png-to-jpg', enhancedSecurityWithRateLimit(basicRateLimit), upload
       fileSize: req.file?.size
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a PNG image')) {
       return sendError(res, 'File must be a PNG image', 400);
     }
@@ -2997,6 +3078,11 @@ router.post('/png-to-webp', basicRateLimit, uploadPng.single('file'), async (req
       fileSize: req.file?.size
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a PNG image')) {
       return sendError(res, 'File must be a PNG image', 400);
     }
@@ -3049,7 +3135,7 @@ router.post('/jpg-to-png-batch', basicRateLimit, uploadJpg.array('files', 5), as
       } catch (error) {
         errors.push({
           filename: file.originalname,
-          error: error.message
+          error: classifyInputError(error, 'image', { format: 'JPG' })?.message || error.message
         });
       }
     }
@@ -3076,6 +3162,11 @@ router.post('/jpg-to-png-batch', basicRateLimit, uploadJpg.array('files', 5), as
       stack: error.stack,
       fileCount: req.files?.length
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     return sendError(res, 'Failed to process batch conversion', 500, {
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
@@ -3153,6 +3244,11 @@ router.post('/jpg-to-webp', basicRateLimit, uploadJpg.single('file'), async (req
       fileSize: req.file?.size
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a JPG/JPEG image')) {
       return sendError(res, 'File must be a JPG/JPEG image', 400);
     }
@@ -3229,7 +3325,7 @@ router.post('/png-to-jpg-batch', basicRateLimit, uploadPng.array('files', 5), as
       } catch (error) {
         errors.push({
           filename: file.originalname,
-          error: error.message
+          error: classifyInputError(error, 'image', { format: 'PNG' })?.message || error.message
         });
       }
     }
@@ -3260,6 +3356,11 @@ router.post('/png-to-jpg-batch', basicRateLimit, uploadPng.array('files', 5), as
       stack: error.stack,
       fileCount: req.files?.length
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     return sendError(res, 'Failed to process batch conversion', 500, {
       details: process.env.NODE_ENV === 'development' ? error.message : undefined

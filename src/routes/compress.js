@@ -8,6 +8,7 @@ const { basicRateLimit } = require('../middleware/rateLimit');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const { classifyInputError } = require('../utils/inputErrors');
 const pngOptimizer = require('../services/pngOptimizer');
 const { compressJpeg } = require('../services/jpgOptimizer');
 const { compressWebp } = require('../services/webpOptimizer');
@@ -137,6 +138,11 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
       fileSize: req.file?.size
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'JPG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a JPG/JPEG image')) {
       return sendError(res, 'File must be a JPG/JPEG image', 400);
     }
@@ -204,6 +210,11 @@ router.post('/png', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.sin
       originalName: req.file?.originalname,
       fileSize: req.file?.size
     });
+
+    const inputError = classifyInputError(error, 'image', { format: 'PNG' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     if (error.message.includes('File must be a PNG image')) {
       return sendError(res, 'File must be a PNG image', 400);
@@ -290,6 +301,11 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
       fileSize: req.file?.size
     });
 
+    const inputError = classifyInputError(error, 'image', { format: 'WEBP' });
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
+
     if (error.message.includes('File must be a WebP image')) {
       return sendError(res, 'File must be a WebP image', 400);
     }
@@ -352,7 +368,7 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
       } catch (error) {
         errors.push({
           filename: file.originalname,
-          error: error.message
+          error: classifyInputError(error, 'image')?.message || error.message
         });
       }
     }
@@ -381,6 +397,11 @@ router.post('/batch', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.a
       stack: error.stack,
       fileCount: req.files?.length
     });
+
+    const inputError = classifyInputError(error, 'image');
+    if (inputError) {
+      return sendError(res, inputError.message, inputError.status);
+    }
 
     return sendError(res, 'Failed to process batch compression', 500, {
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
