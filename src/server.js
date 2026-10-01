@@ -8,7 +8,7 @@ dotenv.config();
 // Import core modules
 const logger = require('./utils/logger');
 const { connectRedis } = require('./config/redis');
-const { sendSuccess, sendError } = require('./middleware/errorHandler');
+const { sendSuccess, sendError, apiErrorHandler } = require('./middleware/errorHandler');
 const { createUploadsDir } = require('./utils/fileSystem');
 const securityMiddleware = require('./middleware/security');
 const { getCorsMiddleware, corsErrorHandler } = require('./middleware/cors');
@@ -38,9 +38,19 @@ app.use(getCorsMiddleware());
 // direct hit is turned away before it reaches any handler.
 app.use(createEdgeProxyGuard());
 
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Body parsing middleware.
+//
+// The webhook receiver (/webhook/:id) is skipped here: it records the exact
+// bytes a third-party sender delivered (any content type, malformed JSON
+// included, so signatures can be checked against the raw payload), and it
+// installs its own raw parser. If these parsers ran first they would consume
+// the stream, 400 a malformed JSON delivery before it was recorded, and leave
+// only a re-serialised copy.
+const isWebhookDelivery = (req) => req.path.startsWith('/webhook/');
+const skipForWebhook = (parser) => (req, res, next) =>
+  (isWebhookDelivery(req) ? next() : parser(req, res, next));
+app.use(skipForWebhook(express.json({ limit: '10mb' })));
+app.use(skipForWebhook(express.urlencoded({ extended: true, limit: '10mb' })));
 
 // Compression middleware
 const compression = require('compression');
@@ -74,13 +84,13 @@ app.get('/health', (req, res) => {
 try {
   const healthRoutes = require('./routes/health');
   const apiRoutes = require('./routes');
-  const { webhookReceiver } = require('./routes/webhook');
+  const { webhookReceiver, webhookRawBody } = require('./routes/webhook');
 
   // Health check routes
   app.use(healthRoutes);
 
   // Webhook receiver route (not under /api prefix)
-  app.all('/webhook/:id', webhookReceiver);
+  app.all('/webhook/:id', webhookRawBody, webhookReceiver);
 
   // API routes
   const API_PREFIX = process.env.API_PREFIX || '/api';
@@ -100,16 +110,11 @@ app.use('*', (req, res) => {
 // as unexpected server errors.
 app.use(corsErrorHandler);
 
-// Basic error handler
-app.use((err, req, res, next) => {
-  logger.error('Server error:', err);
-  
-  if (res.headersSent) {
-    return next(err);
-  }
-  
-  sendError(res, 'Internal server error', 500);
-});
+// Terminal error handler. Maps known client errors (multer size/type
+// rejections, malformed JSON, oversized bodies, errors carrying a 4xx status)
+// to their real status and a safe message; everything else is a generic 500.
+// Never sends stacks or internal details. See classifyError in errorHandler.js.
+app.use(apiErrorHandler);
 
 // Graceful shutdown handler
 const gracefulShutdown = (server) => (signal) => {

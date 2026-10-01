@@ -1,6 +1,6 @@
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
-const { redisUtils } = require('../config/redis');
+const { redisUtils, getRedisClient } = require('../config/redis');
 // These used to use verifyApiKey, which checks VALID_API_KEY — a second secret
 // that happened to hold the same value as API_SECRET_TOKEN. The Worker only
 // ever sends API_SECRET_TOKEN (as x-api-key), so the two were coupled by
@@ -24,9 +24,104 @@ const MAX_REQUEST_SIZE = 1024 * 1024; // 1MB
 const getMetadataKey = (id) => `webhook:${id}:metadata`;
 
 /**
- * Helper: Generate webhook requests key
+ * Helper: legacy requests key. Before the list-based log below, every
+ * delivery re-wrote one JSON array stored under this key (read-append-write,
+ * so concurrent deliveries overwrote each other). It is still read so a
+ * webhook created before the deploy keeps its history until it expires (1 h),
+ * but nothing writes to it any more.
  */
 const getRequestsKey = (id) => `webhook:${id}:requests`;
+
+/**
+ * Helper: Redis LIST holding one JSON-encoded record per delivery. Appended
+ * atomically by APPEND_SCRIPT, so simultaneous deliveries are all kept.
+ */
+const getLogKey = (id) => `webhook:${id}:log`;
+
+/**
+ * Atomic append with the per-webhook cap. Check-then-push has to happen in one
+ * step, otherwise two deliveries racing at 99 would both pass the check.
+ *   KEYS[1] = log list
+ *   ARGV[1] = record JSON, ARGV[2] = max records, ARGV[3] = expiry (unix ms)
+ * Returns the new length, or -1 when the cap is reached.
+ */
+const APPEND_SCRIPT = `
+if redis.call('LLEN', KEYS[1]) >= tonumber(ARGV[2]) then
+  return -1
+end
+local n = redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('PEXPIREAT', KEYS[1], ARGV[3])
+return n
+`;
+
+/**
+ * Read every stored delivery for a webhook, oldest first.
+ */
+const readRequests = async (id) => {
+  const client = getRedisClient();
+  if (!client) return [];
+
+  const legacy = (await redisUtils.get(getRequestsKey(id))) || [];
+  let entries = [];
+  try {
+    entries = await client.lRange(getLogKey(id), 0, -1);
+  } catch (error) {
+    logger.error('Redis LRANGE error for webhook log:', error);
+    entries = [];
+  }
+
+  const records = [];
+  for (const entry of entries) {
+    try {
+      records.push(JSON.parse(entry));
+    } catch {
+      // A corrupt entry must not hide the rest of the history.
+    }
+  }
+  return [...(Array.isArray(legacy) ? legacy : []), ...records];
+};
+
+/**
+ * Decode the raw request body without losing information.
+ *
+ * The receiver stores exactly what the sender delivered: `body` is the UTF-8
+ * text when the bytes are valid UTF-8 (so an HMAC over it matches the
+ * sender's), otherwise `body` is null and `bodyBase64` carries the bytes.
+ * `bodyJsonValid` tells the viewer whether the text parses as JSON; the parsed
+ * view is built client-side from the raw text rather than stored twice.
+ */
+const describeBody = (buffer) => {
+  if (!buffer || buffer.length === 0) {
+    return { body: null, bodyBase64: null, bodyEncoding: null, bodySize: 0, bodyJsonValid: false };
+  }
+
+  let text = null;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
+  } catch {
+    text = null;
+  }
+
+  if (text === null) {
+    return {
+      body: null,
+      bodyBase64: buffer.toString('base64'),
+      bodyEncoding: 'base64',
+      bodySize: buffer.length,
+      bodyJsonValid: false,
+    };
+  }
+
+  let bodyJsonValid = false;
+  try {
+    JSON.parse(text);
+    bodyJsonValid = true;
+  } catch {
+    bodyJsonValid = false;
+  }
+
+  return { body: text, bodyBase64: null, bodyEncoding: 'utf8', bodySize: buffer.length, bodyJsonValid };
+};
 
 /**
  * Helper: Validate webhook ID format
@@ -51,6 +146,7 @@ const getWebhookMetadata = async (id) => {
       // Clean up expired webhook
       await redisUtils.del(getMetadataKey(id));
       await redisUtils.del(getRequestsKey(id));
+      await redisUtils.del(getLogKey(id));
       return null;
     }
 
@@ -91,12 +187,8 @@ router.post('/create', enhancedSecurity, async (req, res) => {
       return sendError(res, 'Failed to create webhook. Please try again.', 500);
     }
 
-    // Initialize empty requests array
-    await redisUtils.setex(
-      getRequestsKey(webhookId),
-      WEBHOOK_TTL,
-      []
-    );
+    // No request log to initialise: the list is created by the first
+    // delivery (see APPEND_SCRIPT), with its expiry pinned to expiresAt.
 
     // Construct webhook URL
     const baseUrl = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
@@ -140,7 +232,7 @@ router.get('/:id/requests', enhancedSecurity, async (req, res) => {
     }
 
     // Get requests from Redis
-    const requests = await redisUtils.get(getRequestsKey(webhookId)) || [];
+    const requests = await readRequests(webhookId);
 
     sendSuccess(res, 'Requests retrieved successfully', {
       webhookId: webhookId,
@@ -174,13 +266,9 @@ router.delete('/:id/requests', enhancedSecurity, async (req, res) => {
       return sendError(res, 'Webhook not found or expired', 404);
     }
 
-    // Clear requests (reset to empty array with same TTL)
-    const remainingTTL = Math.ceil((metadata.expiresAt - Date.now()) / 1000);
-    await redisUtils.setex(
-      getRequestsKey(webhookId),
-      Math.max(remainingTTL, 1), // At least 1 second
-      []
-    );
+    // Clear requests (both the list log and any pre-deploy legacy array)
+    await redisUtils.del(getLogKey(webhookId));
+    await redisUtils.del(getRequestsKey(webhookId));
 
     logger.info('Webhook requests cleared', { webhookId, ip: req.ip });
 
@@ -193,6 +281,42 @@ router.delete('/:id/requests', enhancedSecurity, async (req, res) => {
     sendError(res, 'Internal server error', 500);
   }
 });
+
+/**
+ * Raw body parser for the webhook receiver.
+ *
+ * Mounted on /webhook/:id only; server.js skips the global JSON/urlencoded
+ * parsers for that path so this sees the untouched stream. Every content type
+ * (and a missing Content-Type) is read as bytes, so text/plain, XML,
+ * multipart and malformed JSON are all recorded exactly as sent.
+ * Over-limit and undecodable bodies get a webhook-style JSON error.
+ */
+const rawParser = express.raw({ type: () => true, limit: MAX_REQUEST_SIZE });
+
+const webhookRawBody = (req, res, next) => {
+  rawParser(req, res, (err) => {
+    if (!err) return next();
+
+    if (err.type === 'entity.too.large') {
+      logger.warn('Webhook request too large', { webhookId: req.params.id, length: err.length });
+      return res.status(413).json({
+        success: false,
+        message: 'Request body too large (max 1 MB)'
+      });
+    }
+    if (err.type === 'encoding.unsupported') {
+      return res.status(415).json({
+        success: false,
+        message: 'Unsupported Content-Encoding'
+      });
+    }
+    logger.warn('Webhook body could not be read', { webhookId: req.params.id, type: err.type });
+    return res.status(400).json({
+      success: false,
+      message: 'Request body could not be read'
+    });
+  });
+};
 
 /**
  * ALL /webhook/:id
@@ -220,37 +344,24 @@ const webhookReceiver = async (req, res) => {
       });
     }
 
-    // Get existing requests
-    const requests = await redisUtils.get(getRequestsKey(webhookId)) || [];
-
-    // Check max requests limit
-    if (requests.length >= MAX_REQUESTS_PER_WEBHOOK) {
-      logger.warn('Webhook request limit reached', { webhookId });
-      return res.status(429).json({
+    const client = getRedisClient();
+    if (!client) {
+      return res.status(503).json({
         success: false,
-        message: 'Webhook request limit reached'
+        message: 'Webhook storage unavailable'
       });
     }
 
-    // Prepare request data
-    let body = null;
-    let bodySize = 0;
+    // Raw bytes from webhookRawBody; body-parser leaves `{}` when there is no body.
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const bodyInfo = describeBody(rawBuffer);
 
-    // Capture request body
-    if (req.body && Object.keys(req.body).length > 0) {
-      body = JSON.stringify(req.body);
-      bodySize = Buffer.byteLength(body, 'utf8');
-    } else if (req.rawBody) {
-      body = req.rawBody.toString();
-      bodySize = req.rawBody.length;
-    }
-
-    // Check request size
-    if (bodySize > MAX_REQUEST_SIZE) {
-      logger.warn('Webhook request too large', { webhookId, size: bodySize });
+    // Defensive: the raw parser already enforces this limit.
+    if (bodyInfo.bodySize > MAX_REQUEST_SIZE) {
+      logger.warn('Webhook request too large', { webhookId, size: bodyInfo.bodySize });
       return res.status(413).json({
         success: false,
-        message: 'Request body too large'
+        message: 'Request body too large (max 1 MB)'
       });
     }
 
@@ -259,30 +370,41 @@ const webhookReceiver = async (req, res) => {
       id: uuidv4(),
       method: req.method,
       headers: req.headers,
-      body: body,
+      ...bodyInfo,
       queryParams: req.query || {},
       contentType: req.get('content-type') || 'unknown',
       timestamp: Date.now(),
-      ip: req.ip || req.connection.remoteAddress
+      // /webhook/ is exempt from the edge guard (third-party senders hit the
+      // origin directly), so this is req.ip as derived from X-Forwarded-For
+      // under `trust proxy` = 1. The viewer labels it accordingly.
+      ip: req.ip || req.socket?.remoteAddress,
+      ipSource: 'x-forwarded-for'
     };
 
-    // Add request to array
-    requests.push(requestRecord);
+    // Atomic capped append; expiry pinned to the webhook's own expiry.
+    const newLength = await client.eval(APPEND_SCRIPT, {
+      keys: [getLogKey(webhookId)],
+      arguments: [
+        JSON.stringify(requestRecord),
+        String(MAX_REQUESTS_PER_WEBHOOK),
+        String(Math.max(metadata.expiresAt, Date.now() + 1000))
+      ]
+    });
 
-    // Store updated requests with remaining TTL
-    const remainingTTL = Math.ceil((metadata.expiresAt - Date.now()) / 1000);
-    await redisUtils.setex(
-      getRequestsKey(webhookId),
-      Math.max(remainingTTL, 1),
-      requests
-    );
+    if (Number(newLength) < 0) {
+      logger.warn('Webhook request limit reached', { webhookId });
+      return res.status(429).json({
+        success: false,
+        message: 'Webhook request limit reached'
+      });
+    }
 
     logger.info('Webhook request received', {
       webhookId,
       method: req.method,
       contentType: requestRecord.contentType,
-      bodySize: bodySize,
-      requestCount: requests.length
+      bodySize: bodyInfo.bodySize,
+      requestCount: Number(newLength)
     });
 
     // Send success response
@@ -305,5 +427,9 @@ const webhookReceiver = async (req, res) => {
 // Export router and webhook receiver
 module.exports = {
   router,
-  webhookReceiver
+  webhookReceiver,
+  webhookRawBody,
+  // exported for tests
+  describeBody,
+  APPEND_SCRIPT
 };

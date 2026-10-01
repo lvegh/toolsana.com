@@ -1,3 +1,4 @@
+const http = require('http');
 const logger = require('../utils/logger');
 
 /**
@@ -211,6 +212,145 @@ const errorHandler = (err, req, res, next) => {
 };
 
 /**
+ * Terminal error handler used by server.js.
+ *
+ * The `errorHandler` above is not mounted: its development branch serialises
+ * the raw error and stack into the response, it maps CORS by substring, and it
+ * answers multer's size limit with 400. This handler replaces the old
+ * "every error is a 500" behaviour with a narrow allowlist of errors whose
+ * status and message are known to be safe to show a caller. Anything else
+ * stays a 500 with a generic message; details go to the log only.
+ */
+
+// Upload limits per route prefix. Multer does not put the configured limit on
+// its LIMIT_FILE_SIZE error, so the message is built from this table. Keep in
+// sync with the `limits.fileSize` values in routes/ai.js, format.js, pdf.js;
+// every other upload route (compress, convert) uses 10 MB.
+const UPLOAD_LIMIT_MB_BY_PREFIX = [
+  ['/api/ai/', 20],
+  ['/api/format/', 5],
+  ['/api/pdf/', 25],
+];
+const DEFAULT_UPLOAD_LIMIT_MB = 10;
+
+const uploadLimitMb = (req) => {
+  const url = (req && (req.originalUrl || req.url)) || '';
+  const hit = UPLOAD_LIMIT_MB_BY_PREFIX.find(([prefix]) => url.startsWith(prefix));
+  return hit ? hit[1] : DEFAULT_UPLOAD_LIMIT_MB;
+};
+
+// Multer's own messages for its limit codes are fixed strings, but spell them
+// out so a future multer version cannot change what reaches the client.
+const MULTER_MESSAGES = {
+  LIMIT_PART_COUNT: 'Too many parts in the upload',
+  LIMIT_FILE_COUNT: 'Too many files',
+  LIMIT_FIELD_KEY: 'Field name too long',
+  LIMIT_FIELD_VALUE: 'Field value too long',
+  LIMIT_FIELD_COUNT: 'Too many fields',
+  LIMIT_UNEXPECTED_FILE: 'Unexpected file field',
+  MISSING_FIELD_NAME: 'Upload field name missing',
+};
+
+// fileFilter rejections in the routes are plain `new Error('File must be a PNG
+// image')` / `new Error('Only PNG, JPEG, and WebP files are allowed.')`. They
+// carry no status, so they are recognised by their (server-authored) wording.
+const FILE_TYPE_REJECTION = /^(File must be |Only [A-Za-z0-9 ,.-]+ files are allowed)/;
+
+// busboy (multer's parser) errors for a malformed multipart body.
+const MALFORMED_MULTIPART = /^(Multipart: |Unexpected end of form|Malformed part header|Malformed urlencoded form)/;
+
+// body-parser sets `type` on every error it raises.
+const BODY_PARSER_MESSAGES = {
+  'entity.parse.failed': [400, 'Invalid JSON in request body'],
+  'entity.verify.failed': [403, 'Request body verification failed'],
+  'request.aborted': [400, 'Request aborted before the body was received'],
+  'request.size.invalid': [400, 'Request size did not match Content-Length'],
+  'encoding.unsupported': [415, 'Unsupported content encoding'],
+  'charset.unsupported': [415, 'Unsupported charset'],
+  'parameters.too.many': [413, 'Too many parameters in request body'],
+};
+
+const formatMb = (bytes) => {
+  const mb = bytes / (1024 * 1024);
+  return Number.isInteger(mb) ? String(mb) : mb.toFixed(1);
+};
+
+/**
+ * Map an error to `{ status, message }` that is safe to send to a client.
+ * Exported for tests.
+ */
+const classifyError = (err, req) => {
+  const fallback = { status: 500, message: 'Internal server error' };
+  if (!err || typeof err !== 'object') return fallback;
+
+  // multer limit errors
+  if (err.name === 'MulterError') {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return { status: 413, message: `File too large (max ${uploadLimitMb(req)} MB)` };
+    }
+    return { status: 400, message: MULTER_MESSAGES[err.code] || 'File upload error' };
+  }
+
+  const message = typeof err.message === 'string' ? err.message : '';
+
+  // fileFilter rejections (wrong file type)
+  if (FILE_TYPE_REJECTION.test(message) && !err.status && !err.statusCode) {
+    return { status: 415, message: message.slice(0, 200) };
+  }
+
+  if (MALFORMED_MULTIPART.test(message) && !err.status && !err.statusCode) {
+    return { status: 400, message: 'Malformed multipart upload' };
+  }
+
+  // body-parser (express.json / urlencoded / raw)
+  if (typeof err.type === 'string') {
+    if (err.type === 'entity.too.large') {
+      const limit = typeof err.limit === 'number' && err.limit > 0 ? ` (max ${formatMb(err.limit)} MB)` : '';
+      return { status: 413, message: `Request body too large${limit}` };
+    }
+    if (BODY_PARSER_MESSAGES[err.type]) {
+      const [status, msg] = BODY_PARSER_MESSAGES[err.type];
+      return { status, message: msg };
+    }
+  }
+
+  // Anything that explicitly declares a client-error status (http-errors,
+  // AppError, hand-built errors). `expose === false` means the author marked
+  // the message as internal, so fall back to the standard reason phrase.
+  const declared = Number(err.status || err.statusCode);
+  if (Number.isInteger(declared) && declared >= 400 && declared < 500) {
+    const reason = http.STATUS_CODES[declared] || 'Request error';
+    const safeMessage = err.expose === false || !message ? reason : message.slice(0, 200);
+    return { status: declared, message: safeMessage };
+  }
+
+  return fallback;
+};
+
+const apiErrorHandler = (err, req, res, next) => {
+  const { status, message } = classifyError(err, req);
+
+  if (status >= 500) {
+    logger.error('Server error:', err);
+  } else {
+    logger.warn('Request error', {
+      status,
+      message,
+      code: err && err.code,
+      type: err && err.type,
+      url: req.originalUrl,
+      method: req.method,
+    });
+  }
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  return sendError(res, message, status);
+};
+
+/**
  * Handle 404 Errors (Route Not Found)
  */
 const notFoundHandler = (req, res, next) => {
@@ -306,6 +446,8 @@ module.exports = {
   AppError,
   asyncHandler,
   errorHandler,
+  apiErrorHandler,
+  classifyError,
   notFoundHandler,
   handleUnhandledRejection,
   handleUncaughtException,
