@@ -1,88 +1,75 @@
 const express = require('express');
-const https = require('https');
-const http = require('http');
 const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
-const { checkPublicHostname, pinnedLookup } = require('../utils/ssrfGuard');
+const { safeFetch, GENERIC_PRIVATE_ERROR } = require('../utils/ssrfGuard');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
-// Fetch HTTP headers from target URL
-const fetchHeaders = (targetUrl) => {
-  // eslint-disable-next-line no-async-promise-executor -- checkPublicHostname never rejects
-  return new Promise(async (resolve, reject) => {
-    try {
-      const urlObj = new URL(targetUrl);
+const MAX_REDIRECTS = 5;
+const FETCH_TIMEOUT_MS = 10000;
 
-      // Screen the resolved host against private/reserved ranges
-      const guard = await checkPublicHostname(urlObj.hostname);
-      if (!guard.valid) {
-        reject(new Error('Domain not allowed for security reasons'));
-        return;
-      }
+// Servers that refuse HEAD answer one of these; retry the same URL with GET.
+const HEAD_REJECTED_STATUSES = new Set([405, 501]);
 
-      const startTime = Date.now();
-
-      const options = {
-        hostname: urlObj.hostname,
-        // Dial the address checkPublicHostname already vetted. Connecting by
-        // name would re-resolve and reopen the DNS-rebinding window the check
-        // above exists to close. hostname stays set so SNI/Host/cert checks
-        // still see the real name.
-        lookup: pinnedLookup(guard.addresses[0]),
-
-        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-        path: urlObj.pathname + urlObj.search,
-        method: 'HEAD',
-        headers: {
-          'User-Agent': 'ToolzyHub-HeaderChecker/1.0 (+https://toolsana.com)',
-          'Accept': '*/*',
-          'Connection': 'close'
-        },
-        timeout: 10000
-      };
-
-      const httpModule = urlObj.protocol === 'https:' ? https : http;
-
-      const req = httpModule.request(options, (res) => {
-        const responseTime = Date.now() - startTime;
-
-        // Collect response headers
-        const responseHeaders = {};
-
-        // Convert header names to lowercase for consistent access
-        Object.keys(res.headers).forEach(key => {
-          responseHeaders[key.toLowerCase()] = res.headers[key];
-        });
-
-        resolve({
-          statusCode: res.statusCode,
-          statusText: res.statusMessage || 'OK',
-          headers: responseHeaders,
-          responseTime
-        });
-
-        // Consume response body to avoid hanging
-        res.on('data', () => {});
-        res.on('end', () => {});
-      });
-
-      req.on('error', (error) => {
-        reject(error);
-      });
-
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Request timeout'));
-      });
-
-      req.end();
-
-    } catch (error) {
-      reject(error);
-    }
+/** Headers -> plain object with lowercase names; set-cookie stays an array. */
+const headersToObject = (headers) => {
+  const out = {};
+  headers.forEach((value, key) => {
+    out[key.toLowerCase()] = value;
   });
+  const cookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : [];
+  if (cookies.length > 0) {
+    out['set-cookie'] = cookies;
+  }
+  return out;
+};
+
+// Fetch HTTP headers from target URL, following redirects so the headers
+// scored are the final page's, not a 301's. safeFetch re-screens every hop
+// against private/reserved ranges and pins the screened address.
+const fetchHeaders = async (targetUrl) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const startTime = Date.now();
+
+  const request = async (method) => {
+    const result = await safeFetch(targetUrl, {
+      method,
+      headers: {
+        'User-Agent': 'ToolzyHub-HeaderChecker/1.0 (+https://toolsana.com)',
+        'Accept': '*/*'
+      },
+      signal: controller.signal
+    }, { maxRedirects: MAX_REDIRECTS });
+    // Only the headers are needed; don't download a GET body.
+    if (result.response.body) {
+      await result.response.body.cancel().catch(() => {});
+    }
+    return result;
+  };
+
+  try {
+    let method = 'HEAD';
+    let result = await request(method);
+    if (HEAD_REJECTED_STATUSES.has(result.response.status)) {
+      method = 'GET';
+      result = await request(method);
+    }
+
+    const { response, redirectChain, finalUrl } = result;
+    return {
+      statusCode: response.status,
+      statusText: response.statusText || '',
+      headers: headersToObject(response.headers),
+      responseTime: Date.now() - startTime,
+      finalUrl,
+      redirectChain,
+      method
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
 // POST /api/http-headers/check
@@ -115,7 +102,11 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     const response = await fetchHeaders(validatedUrl.toString());
 
     const result = {
-      url: validatedUrl.toString(),
+      // Final URL after redirects: the response whose headers are reported.
+      url: response.finalUrl,
+      requestedUrl: validatedUrl.toString(),
+      redirectChain: response.redirectChain,
+      method: response.method,
       status: response.statusCode,
       statusText: response.statusText,
       headers: response.headers,
@@ -134,25 +125,40 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     let errorMessage = 'Failed to fetch headers';
     let statusCode = 500;
 
-    if (error.message.includes('Domain not allowed')) {
-      statusCode = 403;
-      errorMessage = 'Domain not allowed for security reasons';
-    } else if (error.message.includes('timeout')) {
+    // undici wraps network failures as TypeError('fetch failed', { cause }).
+    const code = error.code || (error.cause && error.cause.code);
+
+    if (error.code === 'SSRF_BLOCKED') {
+      if (error.message === GENERIC_PRIVATE_ERROR) {
+        statusCode = 403;
+        errorMessage = 'Domain not allowed for security reasons';
+      } else if (error.message === 'Host could not be resolved') {
+        statusCode = 404;
+        errorMessage = 'Domain not found';
+      } else {
+        statusCode = 400;
+        errorMessage = error.message;
+      }
+    } else if (error.code === 'TOO_MANY_REDIRECTS') {
+      statusCode = 502;
+      errorMessage = `Too many redirects (more than ${MAX_REDIRECTS})`;
+    } else if (error.name === 'AbortError' || error.name === 'TimeoutError' || error.message.includes('timeout')) {
       statusCode = 408;
       errorMessage = 'Request timeout - server took too long to respond';
-    } else if (error.code === 'ENOTFOUND') {
+    } else if (code === 'ENOTFOUND') {
       statusCode = 404;
       errorMessage = 'Domain not found';
-    } else if (error.code === 'ECONNREFUSED') {
+    } else if (code === 'ECONNREFUSED') {
       statusCode = 502;
       errorMessage = 'Connection refused by server';
-    } else if (error.code === 'ECONNRESET') {
+    } else if (code === 'ECONNRESET') {
       statusCode = 502;
       errorMessage = 'Connection reset by server';
-    } else if (error.code === 'CERT_HAS_EXPIRED') {
+    } else if (code === 'CERT_HAS_EXPIRED') {
       statusCode = 495;
       errorMessage = 'SSL certificate has expired';
-    } else if (error.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+    } else if (code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+               code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
       statusCode = 495;
       errorMessage = 'SSL certificate verification failed';
     }

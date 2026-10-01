@@ -38,6 +38,14 @@ async function getSSLCertificate(hostname, port = 443, timeout = 10000, pinnedAd
         const cert = socket.getPeerCertificate(true);
         const protocol = socket.getProtocol();
         const cipher = socket.getCipher();
+        // rejectUnauthorized:false lets the handshake finish so the certificate
+        // can be inspected, but Node still runs full chain verification against
+        // its CA store and records the outcome here. It must be read: without
+        // it a self-signed or untrusted-root certificate looked "valid".
+        const authorized = socket.authorized === true;
+        const authorizationError = socket.authorizationError
+          ? String(socket.authorizationError.code || socket.authorizationError)
+          : null;
         
         socket.destroy();
         
@@ -49,7 +57,9 @@ async function getSSLCertificate(hostname, port = 443, timeout = 10000, pinnedAd
         resolve({
           certificate: cert,
           protocol: protocol,
-          cipher: cipher
+          cipher: cipher,
+          authorized,
+          authorizationError
         });
       } catch (error) {
         socket.destroy();
@@ -103,6 +113,65 @@ function parseCertificateChain(cert, depth = 0, maxDepth = 10) {
   }
 
   return certificates;
+}
+
+/**
+ * Human-readable explanations for OpenSSL chain-verification codes. Node
+ * reports only the first failure it hits, walking up from the leaf.
+ */
+const TRUST_ERROR_MESSAGES = {
+  DEPTH_ZERO_SELF_SIGNED_CERT: 'Certificate is self-signed (not issued by a trusted certificate authority)',
+  SELF_SIGNED_CERT_IN_CHAIN: 'Certificate chain ends in an untrusted root (self-signed root not in the trusted CA store)',
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: 'Certificate chain could not be verified: the issuer is not a trusted certificate authority, or the server did not send its intermediate certificate',
+  UNABLE_TO_GET_ISSUER_CERT: 'Certificate chain could not be verified: issuer certificate not found',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'Incomplete certificate chain: the server did not send the intermediate certificate needed to reach a trusted root',
+  CERT_HAS_EXPIRED: 'A certificate in the chain has expired',
+  CERT_NOT_YET_VALID: 'A certificate in the chain is not yet valid',
+  CERT_REVOKED: 'Certificate has been revoked',
+  CERT_SIGNATURE_FAILURE: 'Certificate signature is invalid',
+  CERT_UNTRUSTED: 'Certificate is not trusted',
+  CERT_REJECTED: 'Certificate was rejected',
+  INVALID_CA: 'A certificate in the chain is not a valid certificate authority',
+  PATH_LENGTH_EXCEEDED: 'Certificate chain is longer than the issuer allows',
+  INVALID_PURPOSE: 'Certificate is not valid for TLS server authentication',
+  ERR_TLS_CERT_ALTNAME_INVALID: 'Certificate does not match the hostname',
+};
+
+/**
+ * Classify chain trust from the TLS socket result.
+ * Returns { trusted, code, reason, selfSigned }.
+ */
+function describeTrust(authorized, authorizationError) {
+  // Node sets authorizationError to ERR_TLS_CERT_ALTNAME_INVALID when the
+  // chain verified but the hostname did not match. That is a hostname
+  // problem, reported separately, not a trust problem.
+  if (authorized || authorizationError === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+    return { trusted: true, code: null, reason: null, selfSigned: false };
+  }
+  const code = authorizationError || 'UNKNOWN';
+  return {
+    trusted: false,
+    code,
+    reason: TRUST_ERROR_MESSAGES[code] || `Certificate chain is not trusted (${code})`,
+    selfSigned: code === 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  };
+}
+
+/**
+ * Check the certificate against the hostname the user asked about (SAN, with
+ * CN fallback only when there is no SAN, wildcard rules per RFC 6125) using
+ * the same function Node uses for HTTPS. Returns { matches, error }.
+ */
+function checkHostname(hostname, cert) {
+  try {
+    const err = tls.checkServerIdentity(hostname, cert);
+    if (err) {
+      return { matches: false, error: err.reason || err.message || 'Hostname does not match certificate' };
+    }
+    return { matches: true, error: null };
+  } catch (error) {
+    return { matches: false, error: error.message || 'Hostname check failed' };
+  }
 }
 
 /**
@@ -179,9 +248,16 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     const cert = sslInfo.certificate;
     
     // Calculate days remaining
+    const now = new Date();
     const daysRemaining = calculateDaysRemaining(cert.valid_to);
-    const isExpired = daysRemaining < 0;
-    const isExpiringSoon = daysRemaining <= 30 && daysRemaining > 0;
+    const isExpired = !cert.valid_to || now > new Date(cert.valid_to);
+    const isNotYetValid = !!cert.valid_from && now < new Date(cert.valid_from);
+    const isExpiringSoon = !isExpired && daysRemaining <= 30;
+    const withinDates = !isExpired && !isNotYetValid;
+
+    // Chain trust (from the handshake) and hostname match (checked here).
+    const trust = describeTrust(sslInfo.authorized, sslInfo.authorizationError);
+    const hostnameCheck = checkHostname(cleanDomain, cert);
     
     // Extract alternative names
     const altNames = extractAltNames(cert);
@@ -200,6 +276,20 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     if (isExpired) {
       errors.push('Certificate has expired');
     }
+
+    if (isNotYetValid) {
+      errors.push('Certificate is not valid yet (its start date is in the future)');
+    }
+
+    // Avoid repeating "expired" when the chain failure is just the leaf's expiry.
+    if (!trust.trusted && !(trust.code === 'CERT_HAS_EXPIRED' && isExpired) &&
+        !(trust.code === 'CERT_NOT_YET_VALID' && isNotYetValid)) {
+      errors.push(trust.reason);
+    }
+
+    if (!hostnameCheck.matches) {
+      errors.push(`Hostname mismatch: ${hostnameCheck.error}`);
+    }
     
     // Check key size
     const keySize = cert.bits || 0;
@@ -215,7 +305,20 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     // Build response
     const certificateInfo = {
       domain: cleanDomain,
-      valid: !isExpired && cert.valid_to && new Date() <= new Date(cert.valid_to),
+      // Valid means what a browser would accept: a trusted chain, a
+      // certificate issued for this hostname, and today within its dates.
+      valid: trust.trusted && hostnameCheck.matches && withinDates,
+      trust: {
+        trusted: trust.trusted,
+        selfSigned: trust.selfSigned,
+        code: trust.code,
+        reason: trust.reason
+      },
+      hostname: {
+        checked: cleanDomain,
+        matches: hostnameCheck.matches,
+        error: hostnameCheck.error
+      },
       issuer: {
         organization: cert.issuer?.O || cert.issuer?.organizationName,
         country: cert.issuer?.C || cert.issuer?.countryName,
@@ -233,6 +336,7 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
         notAfter: cert.valid_to,
         daysRemaining: daysRemaining,
         isExpired: isExpired,
+        isNotYetValid: isNotYetValid,
         isExpiringSoon: isExpiringSoon
       },
       protocol: {

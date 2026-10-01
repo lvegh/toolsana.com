@@ -1,15 +1,34 @@
 const express = require('express');
-const https = require('https');
-const http = require('http');
 const { URL } = require('url');
 const { basicRateLimit } = require('../middleware/rateLimit');
-const { checkPublicHostname, pinnedLookup } = require('../utils/ssrfGuard');
+const { safeFetch, GENERIC_PRIVATE_ERROR } = require('../utils/ssrfGuard');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 
 const router = express.Router();
 
+const MAX_REDIRECTS = 5;
+const MAX_HTML_BYTES = 1024 * 1024; // 1MB
+const FETCH_TIMEOUT_MS = 10000;
+
+// Decode the HTML character references that can appear in an attribute value.
+// A canonical href like `/p?a=1&amp;b=2` means `/p?a=1&b=2`.
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+const decodeHtmlAttribute = (value) => value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, ref) => {
+  if (ref[0] === '#') {
+    const code = ref[1] === 'x' || ref[1] === 'X' ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+    if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return match;
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return match;
+    }
+  }
+  const key = ref.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, key) ? NAMED_ENTITIES[key] : match;
+});
+
 // Extract canonical URL from HTML
-const extractCanonicalUrl = (html, baseUrl) => {
+const extractCanonicalUrl = (html, pageUrl) => {
   try {
     // Look for canonical link tag (case insensitive)
     const canonicalRegex = /<link[^>]*rel\s*=\s*["']canonical["'][^>]*href\s*=\s*["']([^"']+)["'][^>]*>/i;
@@ -21,21 +40,22 @@ const extractCanonicalUrl = (html, baseUrl) => {
       return null;
     }
     
-    let canonicalUrl = match[1];
-    
-    // Handle relative URLs
-    if (canonicalUrl.startsWith('//')) {
-      const baseUrlObj = new URL(baseUrl);
-      canonicalUrl = `${baseUrlObj.protocol}${canonicalUrl}`;
-    } else if (canonicalUrl.startsWith('/')) {
-      const baseUrlObj = new URL(baseUrl);
-      canonicalUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}${canonicalUrl}`;
-    } else if (!canonicalUrl.startsWith('http')) {
-      const baseUrlObj = new URL(baseUrl);
-      canonicalUrl = `${baseUrlObj.protocol}//${baseUrlObj.host}/${canonicalUrl}`;
+    const href = decodeHtmlAttribute(match[1].trim());
+
+    // Relative hrefs resolve like any other link: against <base href> when the
+    // page has one, otherwise against the page's own (final, post-redirect)
+    // URL. "page.html" on /blog/post/ is /blog/post/page.html, not /page.html.
+    let base = pageUrl;
+    const baseMatch = html.match(/<base[^>]*href\s*=\s*["']([^"']+)["'][^>]*>/i);
+    if (baseMatch) {
+      try {
+        base = new URL(decodeHtmlAttribute(baseMatch[1].trim()), pageUrl).toString();
+      } catch {
+        base = pageUrl;
+      }
     }
-    
-    return canonicalUrl;
+
+    return new URL(href, base).toString();
   } catch (error) {
     console.error('Error extracting canonical URL:', error);
     return null;
@@ -114,86 +134,58 @@ const analyzeCanonical = (canonicalUrl, originalUrl) => {
   }
 };
 
-// Fetch webpage and extract canonical URL
-const fetchCanonicalUrl = (url) => {
-  // eslint-disable-next-line no-async-promise-executor -- checkPublicHostname never rejects
-  return new Promise(async (resolve, reject) => {
-    try {
-      const urlObj = new URL(url);
+// Fetch the page, following redirects the way a crawler does. safeFetch
+// re-screens every hop against private/reserved ranges and pins the screened
+// address into the connection. Returns { html, finalUrl, redirectChain, status }.
+const fetchCanonicalUrl = async (url) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-      // Screen the resolved host against private/reserved ranges
-      const guard = await checkPublicHostname(urlObj.hostname);
-      if (!guard.valid) {
-        reject(new Error('Domain not allowed for security reasons'));
-        return;
-      }
+  try {
+    const { response, redirectChain, finalUrl } = await safeFetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'ToolzyHub-CanonicalChecker/1.0 (+https://toolzyhub.app)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'DNT': '1'
+      },
+      signal: controller.signal
+    }, { maxRedirects: MAX_REDIRECTS });
 
-      const options = {
-        hostname: urlObj.hostname,
-        // Dial the address checkPublicHostname already vetted. Connecting by
-        // name would re-resolve and reopen the DNS-rebinding window the check
-        // above exists to close. hostname stays set so SNI/Host/cert checks
-        // still see the real name.
-        lookup: pinnedLookup(guard.addresses[0]),
-
-        port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
-        path: urlObj.pathname + urlObj.search,
-        method: 'GET',
-        headers: {
-          'User-Agent': 'ToolzyHub-CanonicalChecker/1.0 (+https://toolzyhub.app)',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'identity',
-          'DNT': '1',
-          'Connection': 'close'
-        },
-        timeout: 10000
-      };
-      
-      const httpModule = urlObj.protocol === 'https:' ? https : http;
-      
-      const req = httpModule.request(options, (res) => {
-        let data = '';
-        let contentLength = 0;
-        const maxSize = 1024 * 1024; // 1MB limit
-        
-        res.on('data', (chunk) => {
-          contentLength += chunk.length;
-          if (contentLength > maxSize) {
-            req.destroy();
-            reject(new Error('Response too large'));
-            return;
-          }
-          data += chunk;
-        });
-        
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(data);
-          } else if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            // Handle redirects (limit to prevent infinite loops)
-            reject(new Error(`Redirect to ${res.headers.location}`));
-          } else {
-            reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
-          }
-        });
-      });
-      
-      req.on('error', (error) => {
-        reject(error);
-      });
-      
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Request timeout'));
-      });
-      
-      req.end();
-      
-    } catch (error) {
-      reject(error);
+    if (response.status < 200 || response.status >= 300) {
+      if (response.body) await response.body.cancel().catch(() => {});
+      const err = new Error(`HTTP ${response.status}: ${response.statusText || ''}`.trim());
+      err.httpStatus = response.status;
+      throw err;
     }
-  });
+
+    // Read at most MAX_HTML_BYTES; the canonical tag lives in <head>.
+    const chunks = [];
+    let total = 0;
+    if (response.body) {
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_HTML_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new Error('Response too large');
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+
+    return {
+      html: Buffer.concat(chunks).toString('utf8'),
+      finalUrl,
+      redirectChain,
+      status: response.status
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
 // POST /api/canonical/check
@@ -222,18 +214,26 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
       });
     }
     
-    // Fetch webpage HTML
-    const html = await fetchCanonicalUrl(validatedUrl.toString());
+    // Fetch webpage HTML (following redirects)
+    const page = await fetchCanonicalUrl(validatedUrl.toString());
     
-    // Extract canonical URL
-    const canonicalUrl = extractCanonicalUrl(html, validatedUrl.toString());
+    // Extract canonical URL, resolved against the page it was found on
+    const canonicalUrl = extractCanonicalUrl(page.html, page.finalUrl);
     
-    // Analyze canonical URL
-    const analysis = analyzeCanonical(canonicalUrl, validatedUrl.toString());
+    // Analyze against the final URL: that is the page whose canonical was read.
+    const analysis = analyzeCanonical(canonicalUrl, page.finalUrl);
+
+    if (page.redirectChain.length > 0) {
+      analysis.issues.push(
+        `The URL you entered redirects (${page.redirectChain.length} hop${page.redirectChain.length === 1 ? '' : 's'}); the canonical tag was read from the final page ${page.finalUrl}`
+      );
+    }
     
     const result = {
       ...analysis,
-      currentUrl: validatedUrl.toString(),
+      requestedUrl: validatedUrl.toString(),
+      currentUrl: page.finalUrl,
+      redirectChain: page.redirectChain,
       timestamp: new Date().toISOString()
     };
     
@@ -248,9 +248,31 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     let errorMessage = 'Failed to check canonical URL';
     let statusCode = 500;
     
-    if (error.message.includes('Domain not allowed')) {
-      statusCode = 403;
-      errorMessage = 'Domain not allowed for security reasons';
+    const causeCode = error.cause && error.cause.code;
+
+    if (error.code === 'SSRF_BLOCKED') {
+      if (error.message === GENERIC_PRIVATE_ERROR) {
+        statusCode = 403;
+        errorMessage = 'Domain not allowed for security reasons';
+      } else if (error.message === 'Host could not be resolved') {
+        statusCode = 404;
+        errorMessage = 'Domain not found';
+      } else {
+        statusCode = 400;
+        errorMessage = error.message;
+      }
+    } else if (error.code === 'TOO_MANY_REDIRECTS') {
+      statusCode = 502;
+      errorMessage = `Too many redirects (more than ${MAX_REDIRECTS})`;
+    } else if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+      statusCode = 408;
+      errorMessage = 'Request timeout - server took too long to respond';
+    } else if (causeCode === 'ENOTFOUND') {
+      statusCode = 404;
+      errorMessage = 'Domain not found';
+    } else if (causeCode === 'ECONNREFUSED') {
+      statusCode = 502;
+      errorMessage = 'Connection refused by server';
     } else if (error.message.includes('timeout')) {
       statusCode = 408;
       errorMessage = 'Request timeout - server took too long to respond';
@@ -276,3 +298,6 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
 });
 
 module.exports = router;
+// exported for tests
+module.exports.extractCanonicalUrl = extractCanonicalUrl;
+module.exports.decodeHtmlAttribute = decodeHtmlAttribute;
