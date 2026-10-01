@@ -368,9 +368,18 @@ router.post('/check', enhancedSecurityWithRateLimit(basicRateLimit), async (req,
     let errorMessage = 'Failed to check SSL certificate';
     let statusCode = 500;
     
-    if (error.message.includes('timeout')) {
+    const code = error && error.code;
+    if (!error || typeof error.message !== 'string') {
+      // fall through to the generic 500
+    } else if (error.message.includes('timeout')) {
       errorMessage = 'Connection timeout - domain may be unreachable';
       statusCode = 408;
+    } else if (['ECONNRESET', 'EPIPE', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN'].includes(code)
+      || /socket disconnected|ECONNRESET|EAI_AGAIN/.test(error.message)) {
+      // The remote host dropped the handshake or DNS hiccuped: an upstream,
+      // usually transient condition, not a fault in this service.
+      errorMessage = 'The server closed the connection during the TLS handshake - try again in a moment';
+      statusCode = 502;
     } else if (error.message.includes('ENOTFOUND')) {
       errorMessage = 'Domain not found';
       statusCode = 404;
