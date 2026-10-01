@@ -1,14 +1,28 @@
-const dns = require('dns').promises;
+const dnsPromises = require('dns').promises;
+const net = require('net');
 const logger = require('../utils/logger');
 
 /**
  * SPF Parser Service
- * Implements RFC 7208 - Sender Policy Framework (SPF)
+ * Implements the evaluation-limit rules of RFC 7208 (Sender Policy Framework).
+ *
+ * What receivers count (RFC 7208 §4.6.4) and what this parser therefore counts:
+ * - Every `include`, `a`, `mx`, `ptr` and `exists` mechanism and every
+ *   `redirect=` modifier costs one DNS lookup, in the record itself AND in every
+ *   record reached through include/redirect, recursively.
+ * - The address lookups for the hosts returned by an `mx` query do NOT count
+ *   against the 10-lookup limit, but an `mx` returning more than 10 hosts is a
+ *   permerror.
+ * - More than 2 "void" lookups (NXDOMAIN or an empty answer) is a permerror.
+ * - `redirect=` is only followed when the record has no `all` mechanism, and
+ *   is evaluated after all mechanisms.
+ *
+ * The count keeps going past 10 (receivers stop there with permerror), so the
+ * user sees how far over the limit the record is. To bound the work per
+ * request, nested records are only fetched while the count is at most
+ * RESOLVE_CAP; beyond that the count is reported as a lower bound.
  */
 
-/**
- * SPF Mechanism Types according to RFC 7208
- */
 const SPF_MECHANISMS = {
   ALL: 'all',
   A: 'a',
@@ -20,551 +34,435 @@ const SPF_MECHANISMS = {
   PTR: 'ptr'
 };
 
-/**
- * SPF Qualifiers
- */
 const SPF_QUALIFIERS = {
-  PASS: '+',      // Pass
-  FAIL: '-',      // Fail
-  SOFTFAIL: '~',  // SoftFail
-  NEUTRAL: '?'    // Neutral
+  PASS: '+',
+  FAIL: '-',
+  SOFTFAIL: '~',
+  NEUTRAL: '?'
 };
 
-/**
- * SPF Modifiers
- */
 const SPF_MODIFIERS = {
   REDIRECT: 'redirect',
   EXP: 'exp'
 };
 
-/**
- * Maximum DNS lookups allowed per RFC 7208 (Section 4.6.4)
- */
 const MAX_DNS_LOOKUPS = 10;
+const MAX_VOID_LOOKUPS = 2;
+const MAX_MX_HOSTS = 10;
+const RESOLVE_CAP = 30;
+const MAX_DEPTH = 10;
+
+const DNS_TERMS = new Set(['include', 'a', 'mx', 'ptr', 'exists']);
+// NXDOMAIN / NOERROR-with-no-answer
+const VOID_CODES = new Set(['ENOTFOUND', 'ENODATA']);
+
+const MECHANISM_RE = /^(all|include|a|mx|ptr|ip4|ip6|exists)(?:([:/])(.*))?$/i;
+const MODIFIER_RE = /^([a-z][a-z0-9_.-]*)=(.*)$/i;
+
+function defaultResolver() {
+  // Bounded timeouts: the default c-ares settings can take ~20 s per failing
+  // query, which multiplies across nested includes.
+  const r = new dnsPromises.Resolver({ timeout: 3000, tries: 2 });
+  return r;
+}
+
+function getQualifierName(qualifier) {
+  switch (qualifier) {
+    case '+': return 'Pass';
+    case '-': return 'Fail';
+    case '~': return 'SoftFail';
+    case '?': return 'Neutral';
+    default: return 'Unknown';
+  }
+}
 
 /**
- * SPF Parser Class
+ * Parse one SPF term (after "v=spf1").
+ * @returns {{kind:'modifier', name, value} | {kind:'mechanism', type, qualifier, value, domain, cidr} | {kind:'invalid', reason}}
  */
+function parseTerm(term) {
+  let qualifier = '+';
+  let body = term;
+  if ('+-~?'.includes(term[0])) {
+    qualifier = term[0];
+    body = term.slice(1);
+  }
+
+  const mod = MODIFIER_RE.exec(body);
+  if (mod && qualifier === '+' && term[0] !== '+') {
+    return { kind: 'modifier', name: mod[1].toLowerCase(), value: mod[2] };
+  }
+
+  const m = MECHANISM_RE.exec(body);
+  if (!m) return { kind: 'invalid', reason: `Unknown or malformed term "${term}"` };
+
+  const type = m[1].toLowerCase();
+  const sep = m[2] || null;
+  const rest = m[3] !== undefined ? m[3] : null;
+  // Keep the historic `value` shape: everything after the first colon.
+  const value = sep === ':' ? rest : null;
+
+  let domain = null;
+  let cidr = null;
+  if (type === 'a' || type === 'mx') {
+    if (sep === ':') {
+      const slash = rest.indexOf('/');
+      domain = slash >= 0 ? rest.slice(0, slash) : rest;
+      cidr = slash >= 0 ? rest.slice(slash) : null;
+      if (!domain) return { kind: 'invalid', reason: `Empty domain in "${term}"` };
+    } else if (sep === '/') {
+      cidr = '/' + rest;
+    }
+  } else if (type === 'include' || type === 'exists') {
+    if (sep !== ':' || !rest) return { kind: 'invalid', reason: `"${type}" requires a domain (${type}:example.com)` };
+    domain = rest;
+  } else if (type === 'ptr') {
+    if (sep === '/') return { kind: 'invalid', reason: `Malformed term "${term}"` };
+    domain = sep === ':' ? rest : null;
+  } else if (type === 'ip4' || type === 'ip6') {
+    if (sep !== ':' || !rest) return { kind: 'invalid', reason: `"${type}" requires an address (${type}:...)` };
+  } else if (type === 'all') {
+    if (sep) return { kind: 'invalid', reason: `"all" takes no argument ("${term}")` };
+  }
+
+  return { kind: 'mechanism', type, qualifier, value, domain, cidr };
+}
+
+function validIpRange(range, family) {
+  const slash = range.indexOf('/');
+  const addr = slash >= 0 ? range.slice(0, slash) : range;
+  const prefix = slash >= 0 ? range.slice(slash + 1) : null;
+  if (net.isIP(addr) !== family) return false;
+  if (prefix === null) return true;
+  if (!/^\d{1,3}$/.test(prefix)) return false;
+  const n = Number(prefix);
+  return family === 4 ? n <= 32 : n <= 128;
+}
+
 class SPFParser {
-  constructor() {
+  constructor(options = {}) {
+    this.resolver = options.resolver || defaultResolver();
+    this.reset();
+  }
+
+  reset() {
     this.dnsLookupCount = 0;
-    this.visitedDomains = new Set();
+    this.voidLookupCount = 0;
+    this.lookupCountIsLowerBound = false;
+    this.limitExceededAt = null;
     this.allowedIPv4 = [];
     this.allowedIPv6 = [];
-    this.mechanisms = [];
-    this.modifiers = {};
+    this.mechanisms = []; // top-level record only
+    this.modifiers = {}; // top-level record only
+    this.lookupBreakdown = []; // top-level DNS terms and what each cost, nested included
     this.issues = [];
     this.warnings = [];
+    this.txtCache = new Map();
+  }
+
+  addIssue(severity, message, recommendation) {
+    this.issues.push({ severity, message, recommendation });
+  }
+
+  addWarning(severity, message, recommendation) {
+    this.warnings.push({ severity, message, recommendation });
+  }
+
+  addIPs(list, ips) {
+    for (const ip of ips) if (!list.includes(ip)) list.push(ip);
   }
 
   /**
-   * Parse SPF record and extract all information
+   * Count one DNS-querying term. Returns true while nested resolution is still
+   * allowed (bounded work), false once RESOLVE_CAP is passed.
    */
-  async parseSPFRecord(domain, record, isInclude = false) {
-    if (!isInclude) {
-      // Reset for main domain
-      this.dnsLookupCount = 0;
-      this.visitedDomains = new Set();
-      this.allowedIPv4 = [];
-      this.allowedIPv6 = [];
-      this.mechanisms = [];
-      this.modifiers = {};
-      this.issues = [];
-      this.warnings = [];
+  countLookup(term, where, chain) {
+    this.dnsLookupCount++;
+    if (this.dnsLookupCount === MAX_DNS_LOOKUPS + 1 && !this.limitExceededAt) {
+      this.limitExceededAt = { term, inRecordOf: where, via: chain.slice() };
     }
-
-    // Prevent infinite loops
-    if (this.visitedDomains.has(domain)) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `Circular reference detected: ${domain}`,
-        recommendation: 'Remove circular includes to prevent infinite loops'
-      });
-      return;
-    }
-
-    this.visitedDomains.add(domain);
-
-    // Validate SPF version
-    if (!record.startsWith('v=spf1')) {
-      this.issues.push({
-        severity: 'high',
-        message: 'Invalid SPF record: Must start with "v=spf1"',
-        recommendation: 'Ensure SPF record starts with "v=spf1"'
-      });
-      return;
-    }
-
-    // Split record into terms
-    const terms = record.split(/\s+/).filter(term => term.length > 0);
-
-    // Skip the version identifier
-    for (let i = 1; i < terms.length; i++) {
-      const term = terms[i];
-      await this.parseTerm(term, domain);
-    }
+    return this.dnsLookupCount <= RESOLVE_CAP;
   }
 
   /**
-   * Parse individual SPF term
+   * Fetch and classify the SPF TXT record of a domain (memoised per request).
+   * @returns {Promise<{status:'found'|'multiple'|'none'|'error', record?, count?, void?, code?, error?}>}
    */
-  async parseTerm(term, domain) {
-    // Extract qualifier (default is '+' for pass)
-    let qualifier = '+';
-    let mechanism = term;
+  fetchSpf(domain) {
+    const key = domain.toLowerCase();
+    if (!this.txtCache.has(key)) {
+      this.txtCache.set(key, (async () => {
+        try {
+          const txt = await this.resolver.resolveTxt(key);
+          const records = (txt || [])
+            .map((r) => (Array.isArray(r) ? r.join('') : String(r)).trim())
+            .filter((r) => /^v=spf1(\s|$)/i.test(r));
+          if (records.length === 0) return { status: 'none', void: !txt || txt.length === 0 };
+          if (records.length > 1) return { status: 'multiple', record: records[0], count: records.length };
+          return { status: 'found', record: records[0] };
+        } catch (error) {
+          if (VOID_CODES.has(error.code)) return { status: 'none', void: true, code: error.code, error };
+          return { status: 'error', code: error.code || 'DNS_ERROR', error };
+        }
+      })());
+    }
+    return this.txtCache.get(key);
+  }
 
-    if (['+', '-', '~', '?'].includes(term[0])) {
-      qualifier = term[0];
-      mechanism = term.substring(1);
+  async resolveAddresses(host) {
+    const [v4, v6] = await Promise.allSettled([this.resolver.resolve4(host), this.resolver.resolve6(host)]);
+    const ipv4 = v4.status === 'fulfilled' ? v4.value : [];
+    const ipv6 = v6.status === 'fulfilled' ? v6.value : [];
+    const errors = [v4, v6].filter((r) => r.status === 'rejected').map((r) => r.reason && r.reason.code);
+    const hardError = errors.find((c) => c && !VOID_CODES.has(c)) || null;
+    return { ipv4, ipv6, empty: ipv4.length === 0 && ipv6.length === 0, hardError };
+  }
+
+  /**
+   * Evaluate one SPF record.
+   * ctx: { depth, chain: string[] (terms leading here), ancestry: string[] (domains on the stack), viaInclude }
+   */
+  async evaluateRecord(domain, record, ctx) {
+    const isTop = ctx.depth === 0;
+    const terms = record.trim().split(/\s+/).slice(1);
+    let redirectTarget = null;
+    let hasAll = false;
+
+    for (const term of terms) {
+      const parsed = parseTerm(term);
+
+      if (parsed.kind === 'invalid') {
+        this.addIssue('critical', `${parsed.reason}${isTop ? '' : ` (in the SPF record of ${domain})`} - receivers return permerror`, 'Fix the term syntax according to RFC 7208');
+        continue;
+      }
+
+      if (parsed.kind === 'modifier') {
+        if (isTop) this.modifiers[parsed.name] = parsed.value;
+        if (parsed.name === SPF_MODIFIERS.REDIRECT) {
+          if (redirectTarget !== null) {
+            this.addIssue('critical', `More than one redirect= modifier in the SPF record of ${domain} - receivers return permerror`, 'Keep a single redirect= modifier');
+          } else {
+            redirectTarget = parsed.value;
+          }
+        } else if (parsed.name === SPF_MODIFIERS.EXP) {
+          // exp= is only fetched on failure and does not count toward the limit.
+        } else if (isTop) {
+          this.addWarning('low', `Unknown modifier "${parsed.name}" is ignored by receivers`, 'Remove it or check the spelling');
+        }
+        continue;
+      }
+
+      if (parsed.type === 'all') hasAll = true;
+      if (isTop) {
+        this.mechanisms.push({
+          type: parsed.type,
+          value: parsed.value,
+          qualifier: parsed.qualifier,
+          qualifierName: getQualifierName(parsed.qualifier),
+          original: term
+        });
+      }
+
+      const before = this.dnsLookupCount;
+      await this.evaluateMechanism(parsed, term, domain, ctx);
+      if (isTop && DNS_TERMS.has(parsed.type)) {
+        this.lookupBreakdown.push({ term, lookups: this.dnsLookupCount - before });
+      }
     }
 
-    // Check if it's a modifier (contains '=')
-    if (mechanism.includes('=') && !mechanism.startsWith('ip4:') && !mechanism.startsWith('ip6:')) {
-      await this.parseModifier(mechanism, domain);
-      return;
+    if (redirectTarget !== null) {
+      if (hasAll) {
+        if (isTop) {
+          this.addWarning('low', `redirect=${redirectTarget} is ignored because the record also has an "all" mechanism`, 'Remove either the redirect= modifier or the all mechanism');
+        }
+      } else {
+        const before = this.dnsLookupCount;
+        await this.followNested('redirect', `redirect=${redirectTarget}`, redirectTarget, domain, ctx);
+        if (isTop) this.lookupBreakdown.push({ term: `redirect=${redirectTarget}`, lookups: this.dnsLookupCount - before });
+      }
     }
 
-    // Parse mechanism
-    const mechanismType = mechanism.split(':')[0].split('/')[0].toLowerCase();
-    // Split on the FIRST colon only — IPv6 mechanism values contain colons
-    // themselves (e.g. ip6:2a01:111:f400::/48), so split(':')[1] truncates them.
-    const colonIdx = mechanism.indexOf(':');
-    const mechanismValue = colonIdx >= 0 ? mechanism.substring(colonIdx + 1) : null;
+    return { hasAll, redirect: redirectTarget };
+  }
 
-    const mechanismData = {
-      type: mechanismType,
-      value: mechanismValue,
-      qualifier: qualifier,
-      qualifierName: this.getQualifierName(qualifier),
-      original: term
-    };
-
-    this.mechanisms.push(mechanismData);
-
-    // Process mechanism based on type
-    switch (mechanismType) {
-      case SPF_MECHANISMS.ALL:
-        await this.handleAll(qualifier);
-        break;
-
-      case SPF_MECHANISMS.A:
-        await this.handleA(mechanismValue || domain, domain);
-        break;
-
-      case SPF_MECHANISMS.MX:
-        await this.handleMX(mechanismValue || domain, domain);
-        break;
+  async evaluateMechanism(parsed, term, domain, ctx) {
+    const where = domain;
+    switch (parsed.type) {
+      case SPF_MECHANISMS.ALL: {
+        if (!ctx.viaInclude) {
+          if (parsed.qualifier === '+') {
+            this.addIssue('critical', 'Using "+all" allows every server on the internet to pass SPF for this domain', 'Change to "-all" (hard fail) or "~all" (soft fail)');
+          } else if (parsed.qualifier === '?') {
+            this.addWarning('medium', 'Using "?all" provides no protection (neutral result for unlisted senders)', 'Change to "-all" (hard fail) or "~all" (soft fail)');
+          }
+        } else if (parsed.qualifier === '+') {
+          this.addIssue('critical', `The SPF record of ${domain} ends in "+all", so the include that reaches it matches every sender`, 'Remove that include or ask the provider to fix its record');
+        }
+        return;
+      }
 
       case SPF_MECHANISMS.IP4:
-        this.handleIP4(mechanismValue);
-        break;
+      case SPF_MECHANISMS.IP6: {
+        const family = parsed.type === 'ip4' ? 4 : 6;
+        if (!validIpRange(parsed.value, family)) {
+          this.addIssue('critical', `Invalid ${parsed.type} value "${parsed.value}"${ctx.depth ? ` (in the SPF record of ${domain})` : ''} - receivers return permerror`, family === 4 ? 'Use ip4:192.0.2.0/24 format' : 'Use ip6:2001:db8::/32 format');
+          return;
+        }
+        this.addIPs(family === 4 ? this.allowedIPv4 : this.allowedIPv6, [parsed.value]);
+        return;
+      }
 
-      case SPF_MECHANISMS.IP6:
-        this.handleIP6(mechanismValue);
-        break;
+      case SPF_MECHANISMS.A: {
+        const target = parsed.domain || domain;
+        const mayResolve = this.countLookup(term, where, ctx.chain);
+        if (!mayResolve || target.includes('%')) return;
+        const res = await this.resolveAddresses(target);
+        if (res.empty && !res.hardError) {
+          this.voidLookupCount++;
+          this.addWarning('medium', `"${term}" found no A/AAAA records for ${target} (void lookup)`, 'Remove the mechanism or publish the address records');
+        } else if (res.empty && res.hardError) {
+          this.addWarning('medium', `DNS lookup for "${term}" failed (${res.hardError}) - receivers would return temperror`, 'Check the DNS servers for that name');
+        }
+        this.addIPs(this.allowedIPv4, res.ipv4);
+        this.addIPs(this.allowedIPv6, res.ipv6);
+        return;
+      }
 
-      case SPF_MECHANISMS.INCLUDE:
-        await this.handleInclude(mechanismValue, qualifier);
-        break;
+      case SPF_MECHANISMS.MX: {
+        const target = parsed.domain || domain;
+        const mayResolve = this.countLookup(term, where, ctx.chain);
+        if (!mayResolve || target.includes('%')) return;
+        let mxRecords;
+        try {
+          mxRecords = await this.resolver.resolveMx(target);
+        } catch (error) {
+          if (VOID_CODES.has(error.code)) {
+            this.voidLookupCount++;
+            this.addWarning('medium', `"${term}" found no MX records for ${target} (void lookup)`, 'Remove the mechanism or publish MX records');
+          } else {
+            this.addWarning('medium', `DNS lookup for "${term}" failed (${error.code || 'error'}) - receivers would return temperror`, 'Check the DNS servers for that name');
+          }
+          return;
+        }
+        if (!mxRecords || mxRecords.length === 0) {
+          this.voidLookupCount++;
+          return;
+        }
+        if (mxRecords.length > MAX_MX_HOSTS) {
+          this.addIssue('critical', `"${term}" returns ${mxRecords.length} MX hosts; more than ${MAX_MX_HOSTS} is a permerror (RFC 7208 section 4.6.4)`, 'Use ip4/ip6 ranges instead of mx for this domain');
+        }
+        // Address lookups of the MX hosts do not count toward the 10-lookup limit.
+        const hosts = mxRecords.slice(0, MAX_MX_HOSTS).map((mx) => mx.exchange).filter(Boolean);
+        const resolved = await Promise.all(hosts.map((h) => this.resolveAddresses(h)));
+        for (const r of resolved) {
+          this.addIPs(this.allowedIPv4, r.ipv4);
+          this.addIPs(this.allowedIPv6, r.ipv6);
+        }
+        return;
+      }
 
-      case SPF_MECHANISMS.EXISTS:
-        await this.handleExists(mechanismValue);
-        break;
+      case SPF_MECHANISMS.PTR: {
+        this.countLookup(term, where, ctx.chain);
+        this.addWarning('medium', `"${term}": the ptr mechanism is deprecated (RFC 7208 section 5.5)`, 'Replace ptr with explicit ip4/ip6 or include mechanisms');
+        return;
+      }
 
-      case SPF_MECHANISMS.PTR:
-        this.handlePTR(mechanismValue, qualifier);
-        break;
+      case SPF_MECHANISMS.EXISTS: {
+        this.countLookup(term, where, ctx.chain);
+        this.addWarning('info', `exists mechanism used: ${parsed.domain}`, 'Ensure macro expansion is correctly configured');
+        return;
+      }
+
+      case SPF_MECHANISMS.INCLUDE: {
+        await this.followNested('include', term, parsed.domain, domain, ctx);
+        return;
+      }
 
       default:
-        this.warnings.push({
-          severity: 'low',
-          message: `Unknown mechanism: ${mechanismType}`,
-          recommendation: 'Verify mechanism syntax according to RFC 7208'
-        });
+        return;
     }
   }
 
   /**
-   * Parse SPF modifier
+   * Shared include / redirect handling.
    */
-  async parseModifier(modifier, domain) {
-    const [name, value] = modifier.split('=');
-
-    if (name === SPF_MODIFIERS.REDIRECT) {
-      this.modifiers.redirect = value;
-
-      // Follow redirect
-      if (this.dnsLookupCount < MAX_DNS_LOOKUPS) {
-        try {
-          const redirectedRecord = await this.lookupSPFRecord(value);
-          if (redirectedRecord) {
-            await this.parseSPFRecord(value, redirectedRecord, true);
-          }
-        } catch (error) {
-          this.warnings.push({
-            severity: 'high',
-            message: `Failed to resolve redirect domain: ${value}`,
-            recommendation: 'Verify redirect domain is valid and has an SPF record'
-          });
-        }
-      }
-    } else if (name === SPF_MODIFIERS.EXP) {
-      this.modifiers.exp = value;
-    } else {
-      this.warnings.push({
-        severity: 'low',
-        message: `Unknown modifier: ${name}`,
-        recommendation: 'Verify modifier syntax according to RFC 7208'
-      });
+  async followNested(kind, term, target, fromDomain, ctx) {
+    const mayResolve = this.countLookup(term, fromDomain, ctx.chain);
+    if (!target) return;
+    if (target.includes('%')) {
+      this.lookupCountIsLowerBound = true;
+      this.addWarning('info', `"${term}" uses SPF macros, so its nested lookups cannot be counted here`, 'Count the lookups of the expanded record manually');
+      return;
     }
-  }
-
-  /**
-   * Handle 'all' mechanism
-   */
-  async handleAll(qualifier) {
-    if (qualifier === '+') {
-      this.issues.push({
-        severity: 'critical',
-        message: 'Using "+all" allows all senders (extremely insecure)',
-        recommendation: 'Change to "-all" (hard fail) or "~all" (soft fail)'
-      });
-    } else if (qualifier === '?') {
-      this.warnings.push({
-        severity: 'medium',
-        message: 'Using "?all" provides no protection',
-        recommendation: 'Change to "-all" (hard fail) or "~all" (soft fail)'
-      });
+    if (!mayResolve || ctx.depth >= MAX_DEPTH) {
+      this.lookupCountIsLowerBound = true;
+      return;
     }
-  }
-
-  /**
-   * Handle 'a' mechanism - lookup A/AAAA records
-   */
-  async handleA(targetDomain, baseDomain) {
-    if (this.dnsLookupCount >= MAX_DNS_LOOKUPS) return;
-
-    this.dnsLookupCount++;
-
-    try {
-      // Lookup A records (IPv4)
-      const addresses = await dns.resolve4(targetDomain);
-      addresses.forEach(ip => {
-        if (!this.allowedIPv4.includes(ip)) {
-          this.allowedIPv4.push(ip);
-        }
-      });
-
-      // Try AAAA records (IPv6)
-      try {
-        const ipv6Addresses = await dns.resolve6(targetDomain);
-        ipv6Addresses.forEach(ip => {
-          if (!this.allowedIPv6.includes(ip)) {
-            this.allowedIPv6.push(ip);
-          }
-        });
-      } catch (ipv6Error) {
-        // IPv6 not available, ignore
-      }
-    } catch (error) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `Failed to resolve A record for ${targetDomain}: ${error.code}`,
-        recommendation: 'Verify domain exists and has A records'
-      });
-    }
-  }
-
-  /**
-   * Handle 'mx' mechanism - lookup MX records then their A records
-   */
-  async handleMX(targetDomain, baseDomain) {
-    if (this.dnsLookupCount >= MAX_DNS_LOOKUPS) return;
-
-    this.dnsLookupCount++;
-
-    try {
-      const mxRecords = await dns.resolveMx(targetDomain);
-
-      for (const mx of mxRecords) {
-        if (this.dnsLookupCount >= MAX_DNS_LOOKUPS) break;
-
-        // Lookup A records for each MX host
-        await this.handleA(mx.exchange, targetDomain);
-      }
-    } catch (error) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `Failed to resolve MX record for ${targetDomain}: ${error.code}`,
-        recommendation: 'Verify domain exists and has MX records'
-      });
-    }
-  }
-
-  /**
-   * Handle 'ip4' mechanism - add IPv4 address/range
-   */
-  handleIP4(ipRange) {
-    if (!ipRange) {
-      this.warnings.push({
-        severity: 'medium',
-        message: 'ip4 mechanism missing IP address',
-        recommendation: 'Specify IP address in format: ip4:192.0.2.0/24'
-      });
+    const targetKey = target.toLowerCase();
+    if (ctx.ancestry.includes(targetKey)) {
+      this.addIssue('critical', `"${term}" loops back to ${target}, which is already being evaluated - receivers return permerror`, 'Remove the circular include/redirect');
       return;
     }
 
-    // Validate IPv4 format
-    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
-    if (!ipv4Regex.test(ipRange)) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `Invalid IPv4 format: ${ipRange}`,
-        recommendation: 'Use valid IPv4 address or CIDR notation'
-      });
+    const fetched = await this.fetchSpf(targetKey);
+    if (fetched.status === 'error') {
+      this.lookupCountIsLowerBound = true;
+      this.addWarning('high', `DNS lookup for "${term}" failed (${fetched.code}) - receivers would return temperror`, 'Try again later or check the DNS servers of that domain');
       return;
     }
-
-    if (!this.allowedIPv4.includes(ipRange)) {
-      this.allowedIPv4.push(ipRange);
-    }
-  }
-
-  /**
-   * Handle 'ip6' mechanism - add IPv6 address/range
-   */
-  handleIP6(ipRange) {
-    if (!ipRange) {
-      this.warnings.push({
-        severity: 'medium',
-        message: 'ip6 mechanism missing IP address',
-        recommendation: 'Specify IP address in format: ip6:2001:db8::/32'
-      });
+    if (fetched.status === 'none') {
+      if (fetched.void) this.voidLookupCount++;
+      this.addIssue('critical', `"${term}" points to ${target}, which has no SPF record - receivers return permerror (RFC 7208 section ${kind === 'include' ? '5.2' : '6.1'})`, 'Fix or remove this ' + kind);
       return;
     }
-
-    // Basic IPv6 validation
-    const ipv6Regex = /^[0-9a-fA-F:]+(:\/\d{1,3})?$/;
-    if (!ipv6Regex.test(ipRange)) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `Invalid IPv6 format: ${ipRange}`,
-        recommendation: 'Use valid IPv6 address or CIDR notation'
-      });
-      return;
+    if (fetched.status === 'multiple') {
+      this.addIssue('critical', `${target} publishes ${fetched.count} SPF records - receivers return permerror`, 'Consolidate them into a single SPF record');
     }
 
-    if (!this.allowedIPv6.includes(ipRange)) {
-      this.allowedIPv6.push(ipRange);
-    }
-  }
-
-  /**
-   * Handle 'include' mechanism - recursively parse included domain
-   */
-  async handleInclude(includeDomain, qualifier) {
-    if (!includeDomain) {
-      this.warnings.push({
-        severity: 'high',
-        message: 'include mechanism missing domain',
-        recommendation: 'Specify domain in format: include:_spf.example.com'
-      });
-      return;
-    }
-
-    if (this.dnsLookupCount >= MAX_DNS_LOOKUPS) {
-      this.issues.push({
-        severity: 'high',
-        message: `DNS lookup limit reached before processing include:${includeDomain}`,
-        recommendation: 'Reduce number of includes and DNS-dependent mechanisms'
-      });
-      return;
-    }
-
-    this.dnsLookupCount++;
-
-    try {
-      const includedRecord = await this.lookupSPFRecord(includeDomain);
-
-      if (includedRecord) {
-        // Recursively parse included SPF record
-        await this.parseSPFRecord(includeDomain, includedRecord, true);
-      }
-    } catch (error) {
-      this.warnings.push({
-        severity: 'high',
-        message: `Failed to resolve include domain ${includeDomain}: ${error.code}`,
-        recommendation: 'Verify included domain exists and has valid SPF record'
-      });
-    }
-  }
-
-  /**
-   * Handle 'exists' mechanism
-   */
-  async handleExists(domain) {
-    if (!domain) {
-      this.warnings.push({
-        severity: 'medium',
-        message: 'exists mechanism missing domain',
-        recommendation: 'Specify domain in format: exists:%{ir}.%{l1r+-}._spf.%{d}'
-      });
-      return;
-    }
-
-    if (this.dnsLookupCount >= MAX_DNS_LOOKUPS) return;
-
-    this.dnsLookupCount++;
-
-    // Note: exists mechanism is complex with macro expansion
-    // For basic implementation, we just note it's present
-    this.warnings.push({
-      severity: 'info',
-      message: `exists mechanism used: ${domain}`,
-      recommendation: 'Ensure macro expansion is correctly configured'
+    await this.evaluateRecord(targetKey, fetched.record, {
+      depth: ctx.depth + 1,
+      chain: [...ctx.chain, term],
+      ancestry: [...ctx.ancestry, targetKey],
+      viaInclude: kind === 'include' ? true : ctx.viaInclude
     });
   }
 
-  /**
-   * Handle 'ptr' mechanism (deprecated)
-   */
-  handlePTR(domain, qualifier) {
-    this.warnings.push({
-      severity: 'medium',
-      message: 'ptr mechanism is deprecated per RFC 7208',
-      recommendation: 'Replace ptr mechanism with explicit ip4/ip6 or include mechanisms'
-    });
-
-    if (this.dnsLookupCount < MAX_DNS_LOOKUPS) {
-      this.dnsLookupCount++;
-    }
-  }
-
-  /**
-   * Lookup SPF record for a domain
-   */
-  async lookupSPFRecord(domain) {
-    try {
-      const txtRecords = await dns.resolveTxt(domain);
-
-      // Find SPF records (must start with v=spf1)
-      const spfRecords = txtRecords
-        .map(record => Array.isArray(record) ? record.join('') : record)
-        .filter(record => record.startsWith('v=spf1'));
-
-      if (spfRecords.length === 0) {
-        this.warnings.push({
-          severity: 'high',
-          message: `No SPF record found for ${domain}`,
-          recommendation: 'Add SPF record to domain TXT records'
-        });
-        return null;
-      }
-
-      if (spfRecords.length > 1) {
-        this.issues.push({
-          severity: 'critical',
-          message: `Multiple SPF records found for ${domain} (RFC violation)`,
-          recommendation: 'Consolidate into a single SPF record'
-        });
-        // Use the first one
-        return spfRecords[0];
-      }
-
-      return spfRecords[0];
-    } catch (error) {
-      if (error.code === 'ENOTFOUND') {
-        this.warnings.push({
-          severity: 'high',
-          message: `Domain not found: ${domain}`,
-          recommendation: 'Verify domain name is correct'
-        });
-      } else if (error.code === 'ENODATA') {
-        this.warnings.push({
-          severity: 'high',
-          message: `No TXT records found for ${domain}`,
-          recommendation: 'Add SPF record to domain TXT records'
-        });
-      } else {
-        this.warnings.push({
-          severity: 'high',
-          message: `DNS lookup failed for ${domain}: ${error.message}`,
-          recommendation: 'Check DNS configuration and network connectivity'
-        });
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Get qualifier name from symbol
-   */
-  getQualifierName(qualifier) {
-    switch (qualifier) {
-      case '+': return 'Pass';
-      case '-': return 'Fail';
-      case '~': return 'SoftFail';
-      case '?': return 'Neutral';
-      default: return 'Unknown';
-    }
-  }
-
-  /**
-   * Validate SPF record structure and check for common issues
-   */
-  validateSPFRecord(record) {
-    // Check DNS lookup limit
+  finalize(record, topResult) {
     if (this.dnsLookupCount > MAX_DNS_LOOKUPS) {
-      this.issues.push({
-        severity: 'critical',
-        message: `Exceeded maximum DNS lookups (${this.dnsLookupCount}/${MAX_DNS_LOOKUPS})`,
-        recommendation: 'Reduce includes, MX, A, and EXISTS mechanisms to stay under 10 lookups'
-      });
+      let where = '';
+      if (this.limitExceededAt) {
+        const path = [...this.limitExceededAt.via, this.limitExceededAt.term];
+        where = ` The 11th lookup is ${path.join(' -> ')}.`;
+      }
+      this.addIssue(
+        'critical',
+        `Too many DNS lookups: ${this.lookupCountIsLowerBound ? 'at least ' : ''}${this.dnsLookupCount} (limit ${MAX_DNS_LOOKUPS}, counted through nested includes). Receivers stop at the 11th lookup and return permerror.${where}`,
+        'Reduce includes, a, mx, ptr and exists mechanisms, or replace some includes with ip4/ip6 ranges'
+      );
     } else if (this.dnsLookupCount === MAX_DNS_LOOKUPS) {
-      this.warnings.push({
-        severity: 'high',
-        message: `Reached maximum DNS lookups (${MAX_DNS_LOOKUPS})`,
-        recommendation: 'Consider reducing includes to avoid hitting the limit'
-      });
+      this.addWarning('high', `At the DNS lookup limit (${MAX_DNS_LOOKUPS}/${MAX_DNS_LOOKUPS}); one more include or a provider change will break SPF`, 'Consider replacing some includes with ip4/ip6 ranges');
+    } else if (this.dnsLookupCount >= 8) {
+      this.addWarning('medium', `DNS lookup count is high: ${this.dnsLookupCount} of ${MAX_DNS_LOOKUPS}`, 'Leave headroom: providers can add lookups to their include records at any time');
     }
 
-    // Check if record has proper termination
-    const hasTermination = this.mechanisms.some(m => m.type === 'all');
-    if (!hasTermination) {
-      this.warnings.push({
-        severity: 'medium',
-        message: 'SPF record does not have an "all" mechanism',
-        recommendation: 'Add "-all" or "~all" at the end of your SPF record'
-      });
+    if (this.voidLookupCount > MAX_VOID_LOOKUPS) {
+      this.addIssue('critical', `${this.voidLookupCount} void lookups (names with no records); more than ${MAX_VOID_LOOKUPS} is a permerror (RFC 7208 section 4.6.4)`, 'Remove mechanisms that point to names without records');
     }
 
-    // Check record length (DNS TXT record limit)
+    if (!topResult.hasAll && !topResult.redirect) {
+      this.addWarning('medium', 'SPF record has no "all" mechanism and no redirect= modifier, so unlisted senders get a neutral result', 'End the record with "-all" or "~all"');
+    }
+
     if (record.length > 255) {
-      this.warnings.push({
-        severity: 'high',
-        message: `SPF record length (${record.length}) exceeds single DNS string limit (255)`,
-        recommendation: 'Split into multiple strings or use includes to reduce length'
-      });
+      this.addWarning('low', `SPF record is ${record.length} characters; it must be published as several strings of at most 255 characters each`, 'Most DNS providers split long TXT values automatically; verify yours does');
     }
 
-    // Check for too many includes
-    const includeCount = this.mechanisms.filter(m => m.type === 'include').length;
+    const includeCount = this.mechanisms.filter((m) => m.type === 'include').length;
     if (includeCount > 5) {
-      this.warnings.push({
-        severity: 'medium',
-        message: `High number of includes (${includeCount}) may cause performance issues`,
-        recommendation: 'Consider consolidating includes or using direct IP addresses'
-      });
+      this.addWarning('low', `High number of top-level includes (${includeCount})`, 'Consider consolidating includes or using direct IP addresses');
     }
-
-    // Check for void lookups (mechanisms that don't return results)
-    // This is a simplification - full implementation would track actual DNS responses
   }
 
-  /**
-   * Get parsing results
-   */
   getResults() {
     return {
       mechanisms: this.mechanisms,
@@ -574,58 +472,75 @@ class SPFParser {
         ipv6: this.allowedIPv6
       },
       dnsLookups: this.dnsLookupCount,
+      dnsLookupsIsLowerBound: this.lookupCountIsLowerBound,
+      voidLookups: this.voidLookupCount,
+      limitExceededAt: this.limitExceededAt,
+      lookupBreakdown: this.lookupBreakdown,
       issues: this.issues,
       warnings: this.warnings,
-      valid: this.issues.filter(i => i.severity === 'critical').length === 0
+      valid: this.issues.filter((i) => i.severity === 'critical').length === 0
     };
   }
 }
 
 /**
- * Parse and analyze SPF record
+ * Parse and analyze the SPF record of a domain.
+ * Throws the DNS error (with .code) when the domain itself does not resolve
+ * (ENOTFOUND / ENODATA) or the lookup fails (ESERVFAIL / ETIMEOUT ...).
  */
-async function analyzeSPFRecord(domain) {
-  const parser = new SPFParser();
+async function analyzeSPFRecord(domain, options = {}) {
+  const parser = new SPFParser(options);
 
   try {
-    // Lookup SPF record
-    const record = await parser.lookupSPFRecord(domain);
+    const top = await parser.fetchSpf(domain);
 
-    if (!record) {
+    if (top.status === 'error' || (top.status === 'none' && top.error)) {
+      throw top.error;
+    }
+
+    if (top.status === 'none') {
+      parser.addWarning('high', `No SPF record found for ${domain}`, 'Add an SPF record (a TXT record starting with v=spf1)');
       return {
         domain,
         record: null,
         valid: false,
         mechanisms: [],
+        modifiers: {},
         allowedIPs: { ipv4: [], ipv6: [] },
-        dnsLookups: parser.dnsLookupCount,
+        dnsLookups: 0,
+        dnsLookupsIsLowerBound: false,
+        voidLookups: 0,
+        limitExceededAt: null,
+        lookupBreakdown: [],
         issues: parser.issues,
         warnings: parser.warnings
       };
     }
 
-    // Parse the record
-    await parser.parseSPFRecord(domain, record, false);
+    if (top.status === 'multiple') {
+      parser.addIssue('critical', `Multiple SPF records found for ${domain} (${top.count}) - receivers return permerror`, 'Consolidate into a single SPF record');
+    }
 
-    // Validate
-    parser.validateSPFRecord(record);
+    const topResult = await parser.evaluateRecord(domain.toLowerCase(), top.record, {
+      depth: 0,
+      chain: [],
+      ancestry: [domain.toLowerCase()],
+      viaInclude: false
+    });
 
-    // Get results
-    const results = parser.getResults();
+    parser.finalize(top.record, topResult);
 
     return {
       domain,
-      record,
-      ...results
+      record: top.record,
+      ...parser.getResults()
     };
-
   } catch (error) {
     logger.error('SPF analysis error:', {
       domain,
       error: error.message,
       code: error.code
     });
-
     throw error;
   }
 }
@@ -633,6 +548,7 @@ async function analyzeSPFRecord(domain) {
 module.exports = {
   SPFParser,
   analyzeSPFRecord,
+  parseTerm,
   SPF_MECHANISMS,
   SPF_QUALIFIERS,
   SPF_MODIFIERS,

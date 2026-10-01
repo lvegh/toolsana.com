@@ -5,6 +5,7 @@ const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { redisUtils } = require('../config/redis');
 const logger = require('../utils/logger');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
+const { validatePublicDomain } = require('../utils/dnsNames');
 
 const router = express.Router();
 
@@ -27,54 +28,28 @@ const dnsRateLimit = createCustomRateLimit({
 });
 
 /**
- * Validate domain name format
+ * Validate domain name format.
+ *
+ * Delegates to utils/dnsNames.validatePublicDomain: the old substring patterns
+ * (/10\./, /127\./, /localhost/) rejected legitimate names such as top10.com,
+ * mail.web10.net and site127.io, and the alphabetic-TLD rule rejected punycode
+ * TLDs. The shared rules only match IP literals and whole labels.
  */
 function validateDomain(domain) {
-  if (!domain || typeof domain !== 'string') {
-    return { valid: false, error: 'Domain is required' };
+  const result = validatePublicDomain(domain);
+  if (!result.valid) {
+    return { valid: false, error: result.reason === 'private' ? 'Suspicious domain detected' : result.error };
   }
-
-  // Clean domain
-  let cleanDomain = domain.trim().toLowerCase();
-
-  // Remove protocol if present
-  cleanDomain = cleanDomain.replace(/^https?:\/\//, '');
-
-  // Remove path if present
-  cleanDomain = cleanDomain.replace(/\/.*$/, '');
-
-  // Remove port if present
-  cleanDomain = cleanDomain.replace(/:.*$/, '');
-
-  // Basic domain validation regex
-  // Allows: domain.com, subdomain.domain.com, etc.
-  const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?(\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?)*\.[a-zA-Z]{2,}$/;
-
-  if (!domainRegex.test(cleanDomain)) {
-    return { valid: false, error: 'Invalid domain format' };
-  }
-
-  // Check for potential DNS rebinding attack patterns
-  const suspiciousPatterns = [
-    /localhost/i,
-    /127\./,
-    /0\.0\.0\.0/,
-    /169\.254\./,  // Link-local
-    /192\.168\./,  // Private network
-    /10\./,        // Private network
-    /172\.(1[6-9]|2[0-9]|3[0-1])\./, // Private network
-    /\.\./,        // Path traversal
-    /[<>'"]/       // XSS attempts
-  ];
-
-  for (const pattern of suspiciousPatterns) {
-    if (pattern.test(cleanDomain)) {
-      return { valid: false, error: 'Suspicious domain detected' };
-    }
-  }
-
-  return { valid: true, cleanDomain };
+  return { valid: true, cleanDomain: result.cleanDomain };
 }
+
+// Lookups are cached briefly so repeated checks do not hammer resolvers.
+// Responses served from cache say so (cached, cachedAt, cacheAgeSeconds), and
+// { fresh: true } in the body (or ?fresh=1) bypasses the cache. The rate
+// limiter runs before the handler either way.
+const DNS_CACHE_TTL_SECONDS = 300;
+const wantsFresh = (req) => req.body?.fresh === true || req.query?.fresh === '1' || req.query?.fresh === 'true';
+const cacheAgeSeconds = (iso) => (iso ? Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000)) : null);
 
 /**
  * Resolve nameserver hostname to IP addresses
@@ -141,15 +116,18 @@ router.post('/mx-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (re
 
     const cleanDomain = validation.cleanDomain;
 
-    // Check Redis cache (24 hour TTL)
-    const cacheKey = `mx-lookup:${cleanDomain}`;
-    const cached = await redisUtils.get(cacheKey);
+    // Check Redis cache (short TTL; bypass with fresh)
+    const cacheKey = `mx-lookup:v2:${cleanDomain}`;
+    const cached = wantsFresh(req) ? null : await redisUtils.get(cacheKey);
 
     if (cached) {
       logger.info('MX lookup served from cache', { domain: cleanDomain });
       return sendSuccess(res, 'MX records retrieved from cache', {
         ...cached,
         cached: true,
+        cachedAt: cached.checkedAt || null,
+        cacheAgeSeconds: cacheAgeSeconds(cached.checkedAt),
+        cacheTtlSeconds: DNS_CACHE_TTL_SECONDS,
         timestamp: new Date().toISOString()
       });
     }
@@ -226,11 +204,12 @@ router.post('/mx-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (re
       mxRecords: resolvedMxRecords,
       count: resolvedMxRecords.length,
       totalResponseTime: totalTime,
-      cached: false
+      cached: false,
+      cachedAt: null,
+      checkedAt: new Date().toISOString()
     };
 
-    // Cache result for 24 hours (86400 seconds)
-    await redisUtils.setex(cacheKey, 86400, result);
+    await redisUtils.setex(cacheKey, DNS_CACHE_TTL_SECONDS, result);
 
     logger.info('MX lookup completed', {
       domain: cleanDomain,
@@ -279,15 +258,18 @@ router.post('/ns-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (re
 
     const cleanDomain = validation.cleanDomain;
 
-    // Check Redis cache (24 hour TTL)
-    const cacheKey = `ns-lookup:${cleanDomain}`;
-    const cached = await redisUtils.get(cacheKey);
+    // Check Redis cache (short TTL; bypass with fresh)
+    const cacheKey = `ns-lookup:v2:${cleanDomain}`;
+    const cached = wantsFresh(req) ? null : await redisUtils.get(cacheKey);
 
     if (cached) {
       logger.info('NS lookup served from cache', { domain: cleanDomain });
       return sendSuccess(res, 'NS records retrieved from cache', {
         ...cached,
         cached: true,
+        cachedAt: cached.checkedAt || null,
+        cacheAgeSeconds: cacheAgeSeconds(cached.checkedAt),
+        cacheTtlSeconds: DNS_CACHE_TTL_SECONDS,
         timestamp: new Date().toISOString()
       });
     }
@@ -359,11 +341,12 @@ router.post('/ns-lookup', enhancedSecurityWithRateLimit(dnsRateLimit), async (re
       nameservers: resolvedNameservers,
       count: resolvedNameservers.length,
       totalResponseTime: totalTime,
-      cached: false
+      cached: false,
+      cachedAt: null,
+      checkedAt: new Date().toISOString()
     };
 
-    // Cache result for 24 hours (86400 seconds)
-    await redisUtils.setex(cacheKey, 86400, result);
+    await redisUtils.setex(cacheKey, DNS_CACHE_TTL_SECONDS, result);
 
     logger.info('NS lookup completed', {
       domain: cleanDomain,
@@ -405,7 +388,7 @@ router.get('/info', basicRateLimit, (req, res) => {
       'MX priority sorting',
       'IPv4 and IPv6 support',
       'Response time measurement',
-      'Redis caching with 24-hour TTL',
+      'Redis caching with a 5-minute TTL (send { fresh: true } to bypass)',
       'Rate limiting protection',
       'DNS rebinding attack prevention',
       'Comprehensive error handling'
@@ -454,7 +437,8 @@ router.get('/info', basicRateLimit, (req, res) => {
     },
     caching: {
       enabled: true,
-      ttl: '24 hours',
+      ttl: '5 minutes',
+      bypass: '{ "fresh": true } in the request body or ?fresh=1',
       backend: 'Redis'
     },
     security: {

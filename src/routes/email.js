@@ -2,6 +2,7 @@ const express = require('express');
 const { simpleParser } = require('mailparser');
 const geoip = require('geoip-lite');
 const dns = require('dns').promises;
+const net = require('net');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const { createCustomRateLimit, ipKey } = require('../middleware/rateLimit');
@@ -13,6 +14,23 @@ const logger = require('../utils/logger');
 const { body, validationResult } = require('express-validator');
 const { redisUtils } = require('../config/redis');
 const { analyzeSPFRecord } = require('../services/spfParser');
+const { validatePublicDomain, organizationalDomain } = require('../utils/dnsNames');
+const {
+  parseAuthenticationResults,
+  calculateSpamScore,
+  authenticationWarnings,
+  classifyIP,
+  extractHopIP,
+  extractTimestamp,
+  computeTimings,
+  reverseIPForDnsbl,
+  classifyDnsblAnswer,
+} = require('../services/emailTrace');
+
+// SPF results are cached briefly; callers can bypass the cache with
+// { fresh: true } in the body or ?fresh=1 (rate limiting still applies).
+const SPF_CACHE_TTL_SECONDS = 300;
+const wantsFresh = (req) => req.body?.fresh === true || req.query?.fresh === '1' || req.query?.fresh === 'true';
 
 const router = express.Router();
 
@@ -111,21 +129,8 @@ const spfCheckerValidation = [
     .withMessage('Domain is required')
     .isLength({ max: 255 })
     .withMessage('Domain must not exceed 255 characters')
-    .matches(/^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$/)
-    .withMessage('Invalid domain format')
-    .customSanitizer(value => {
-      // Clean the domain
-      let clean = value.toLowerCase();
-      // Remove protocol if present
-      clean = clean.replace(/^https?:\/\//, '');
-      // Remove www. prefix if present
-      clean = clean.replace(/^www\./, '');
-      // Remove path if present
-      clean = clean.replace(/\/.*$/, '');
-      // Remove port if present
-      clean = clean.replace(/:.*$/, '');
-      return clean;
-    })
+  // Format and private-name checks run in the handler via validatePublicDomain
+  // (anchored rules; accepts punycode TLDs).
 ];
 
 /**
@@ -140,7 +145,10 @@ const handleValidationErrors = (req, res, next) => {
       url: req.originalUrl
     });
 
-    return sendError(res, 'Validation failed', 400, errors.array().map(err => ({
+    // Put the first specific reason in `message` (what clients display).
+    const first = errors.array()[0];
+    const message = first && typeof first.msg === 'string' && first.msg !== 'Invalid value' ? first.msg : 'Validation failed';
+    return sendError(res, message, 400, errors.array().map(err => ({
       field: err.path,
       message: err.msg,
       value: typeof err.value === 'string' ? err.value.substring(0, 50) + '...' : err.value
@@ -148,36 +156,6 @@ const handleValidationErrors = (req, res, next) => {
   }
   next();
 };
-
-/**
- * Extract IP addresses from a string
- */
-function extractIPs(str) {
-  if (!str) return [];
-
-  // IPv4 pattern
-  const ipv4Pattern = /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
-
-  // IPv6 pattern (simplified)
-  const ipv6Pattern = /\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b|\b::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b/g;
-
-  const ipv4s = str.match(ipv4Pattern) || [];
-  const ipv6s = str.match(ipv6Pattern) || [];
-
-  // Filter out private IPs from IPv4
-  const publicIpv4s = ipv4s.filter(ip => {
-    const parts = ip.split('.').map(Number);
-    if (parts[0] === 10) return false; // 10.0.0.0/8
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false; // 172.16.0.0/12
-    if (parts[0] === 192 && parts[1] === 168) return false; // 192.168.0.0/16
-    if (parts[0] === 127) return false; // 127.0.0.0/8
-    if (parts[0] === 0) return false; // 0.0.0.0/8
-    if (parts[0] >= 224) return false; // Multicast and reserved
-    return true;
-  });
-
-  return [...new Set([...publicIpv4s, ...ipv6s])]; // Remove duplicates
-}
 
 /**
  * Parse Received headers to build email route
@@ -218,22 +196,6 @@ function parseReceivedHeaders(headers) {
   }
 
   return receivedHeaders.reverse(); // Reverse to get chronological order
-}
-
-/**
- * Extract timestamp from Received header
- */
-function extractTimestamp(receivedHeader) {
-  // Look for date patterns
-  const dateMatch = receivedHeader.match(/;\s*(.+?)(?:\s*\(|$)/);
-  if (dateMatch) {
-    try {
-      return new Date(dateMatch[1].trim()).toISOString();
-    } catch (e) {
-      // Invalid date
-    }
-  }
-  return null;
 }
 
 /**
@@ -410,8 +372,11 @@ async function getRDAPInfo(ip) {
  */
 async function getASNInfo(ip) {
   try {
-    const reversedIP = ip.split('.').reverse().join('.');
-    const originQuery = `${reversedIP}.origin.asn.cymru.com`;
+    // IPv4: 4.3.2.1.origin.asn.cymru.com; IPv6: nibble-reversed under origin6.
+    const reversedIP = reverseIPForDnsbl(ip);
+    if (!reversedIP) return { asn: null, isp: null };
+    const originZone = net.isIP(ip) === 6 ? 'origin6.asn.cymru.com' : 'origin.asn.cymru.com';
+    const originQuery = `${reversedIP}.${originZone}`;
     const originTxt = await dns.resolveTxt(originQuery);
     if (!originTxt || originTxt.length === 0) {
       return { asn: null, isp: null };
@@ -449,93 +414,53 @@ async function getASNInfo(ip) {
 }
 
 /**
- * Parse Authentication-Results header
+ * DNSBL zones checked for sending IPs. Only zones that publish IPv6 data are
+ * queried for IPv6 addresses.
  */
-function parseAuthenticationResults(headers) {
-  const authLine = headers.match(/^Authentication-Results:(.+?)(?=\n\S|\n$)/mis);
+const TRACE_DNSBLS = [
+  { host: 'zen.spamhaus.org', ipv6: true },
+  { host: 'bl.spamcop.net', ipv6: false },
+  { host: 'dnsbl.sorbs.net', ipv6: false }
+];
 
-  if (!authLine) {
-    return {
-      spf: { pass: null, domain: null },
-      dkim: { pass: null, selector: null },
-      dmarc: { pass: null, policy: null }
-    };
-  }
-
-  const authText = authLine[1];
-
-  // Parse SPF
-  const spfMatch = authText.match(/spf=(\w+)(?:.*?smtp\.mailfrom=([^\s;]+))?/i);
-  const spf = {
-    pass: spfMatch?.[1]?.toLowerCase() === 'pass',
-    domain: spfMatch?.[2] || null
-  };
-
-  // Parse DKIM
-  const dkimMatch = authText.match(/dkim=(\w+)(?:.*?header\.d=([^\s;]+))?(?:.*?header\.s=([^\s;]+))?/i);
-  const dkim = {
-    pass: dkimMatch?.[1]?.toLowerCase() === 'pass',
-    selector: dkimMatch?.[3] || null
-  };
-
-  // Parse DMARC
-  const dmarcMatch = authText.match(/dmarc=(\w+)(?:.*?header\.from=([^\s;]+))?(?:.*?policy\.(\w+)=([^\s;]+))?/i);
-  const dmarc = {
-    pass: dmarcMatch?.[1]?.toLowerCase() === 'pass',
-    policy: dmarcMatch?.[4] || null
-  };
-
-  return { spf, dkim, dmarc };
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error('TIMEOUT'), { code: 'ETIMEOUT' })), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
 }
 
 /**
- * Calculate spam score based on indicators
- */
-function calculateSpamScore(authentication, warnings) {
-  let score = 0;
-
-  // Authentication failures
-  if (authentication.spf.pass === false) score += 2.5;
-  if (authentication.dkim.pass === false) score += 2.0;
-  if (authentication.dmarc.pass === false) score += 3.0;
-
-  // Missing authentication
-  if (authentication.spf.pass === null) score += 1.0;
-  if (authentication.dkim.pass === null) score += 1.0;
-  if (authentication.dmarc.pass === null) score += 1.5;
-
-  // Warnings contribute to score
-  score += warnings.length * 1.5;
-
-  return parseFloat(score.toFixed(1));
-}
-
-/**
- * Check IP against DNSBL (basic check, not comprehensive)
+ * Check one IP against the trace DNSBLs.
+ * Only 127.0.0.x answers count as listings; 127.255.255.x answers (Spamhaus
+ * "public resolver" / rate-limit codes) and lookup failures are reported as
+ * "unavailable", never as listed.
+ * @returns {Promise<{ ip, listedOn: string[], unavailable: string[] }>}
  */
 async function checkBlacklist(ip) {
-  const blacklists = [
-    'zen.spamhaus.org',
-    'bl.spamcop.net',
-    'dnsbl.sorbs.net'
-  ];
-
+  const reversed = reverseIPForDnsbl(ip);
+  const isV6 = net.isIP(ip) === 6;
+  const zones = TRACE_DNSBLS.filter((z) => !isV6 || z.ipv6);
   const listedOn = [];
+  const unavailable = [];
+  if (!reversed) return { ip, listedOn, unavailable };
 
-  for (const bl of blacklists) {
+  await Promise.all(zones.map(async (zone) => {
     try {
-      const reversedIP = ip.split('.').reverse().join('.');
-      const query = `${reversedIP}.${bl}`;
-
-      await dns.resolve4(query);
-      // If resolve succeeds, IP is listed
-      listedOn.push(bl);
+      const answers = await withTimeout(dns.resolve4(`${reversed}.${zone.host}`), 5000);
+      const verdict = classifyDnsblAnswer(answers);
+      if (verdict === 'listed') listedOn.push(zone.host);
+      else if (verdict === 'unavailable') unavailable.push(zone.host);
     } catch (error) {
-      // IP not listed on this blacklist (NXDOMAIN is expected)
+      // NXDOMAIN / NODATA = not listed. Anything else = we could not check.
+      if (error.code !== 'ENOTFOUND' && error.code !== 'ENODATA') unavailable.push(zone.host);
     }
-  }
+  }));
 
-  return listedOn;
+  return { ip, listedOn, unavailable };
 }
 
 /**
@@ -583,11 +508,17 @@ router.post('/trace-email',
         from: parsedEmail?.from?.text || fromMatch?.[1]?.trim() || null,
         to: parsedEmail?.to?.text || toMatch?.[1]?.trim() || null,
         subject: parsedEmail?.subject || subjectMatch?.[1]?.trim() || null,
-        date: parsedEmail?.date?.toISOString() || (dateMatch ? new Date(dateMatch[1]).toISOString() : null),
+        // An unparseable Date header must not turn the whole trace into a 500.
+        date: (() => {
+          const d = parsedEmail?.date instanceof Date && !Number.isNaN(parsedEmail.date.getTime())
+            ? parsedEmail.date
+            : (dateMatch ? new Date(dateMatch[1]) : null);
+          return d && !Number.isNaN(d.getTime()) ? d.toISOString() : (dateMatch ? dateMatch[1].trim() : null);
+        })(),
         messageId: parsedEmail?.messageId || messageIdMatch?.[1]?.trim() || null
       };
 
-      // Parse Received headers to build route
+      // Parse Received headers to build route (chronological order)
       const receivedHeaders = parseReceivedHeaders(rawHeaders);
 
       logger.info('Parsing email route', {
@@ -595,34 +526,54 @@ router.post('/trace-email',
         receivedHeaderCount: receivedHeaders.length
       });
 
-      // Build route with geolocation
-      const route = [];
-      const allIPs = new Set();
-
-      for (const receivedHeader of receivedHeaders) {
-        const timestamp = extractTimestamp(receivedHeader);
-        const server = extractServer(receivedHeader);
-        const ips = extractIPs(receivedHeader);
-
-        // Process first public IP found in this hop
-        const ip = ips[0];
-
-        if (ip && !allIPs.has(ip)) {
-          allIPs.add(ip);
-
-          const [location, asnInfo, hostname, whois] = await Promise.all([
+      // Every Received header is a hop. Private / reserved addresses (internal
+      // relays, 10.x, 192.168.x, loopback) are kept and marked, but not sent to
+      // geolocation / WHOIS / blacklist lookups.
+      const MAX_ENRICHED_IPS = 15;
+      const enrichment = new Map();
+      const enrich = (ip) => {
+        if (!enrichment.has(ip)) {
+          enrichment.set(ip, Promise.all([
             geolocateIP(ip),
             getASNInfo(ip),
             getReverseDNS(ip),
             getRDAPInfo(ip),
-          ]);
+          ]));
+        }
+        return enrichment.get(ip);
+      };
 
-          route.push({
-            timestamp,
-            server,
-            ip,
-            hostname,
-            location: {
+      const route = [];
+      const allIPs = new Set();
+      const publicIPs = [];
+
+      for (const receivedHeader of receivedHeaders) {
+        const timestamp = extractTimestamp(receivedHeader);
+        const server = extractServer(receivedHeader);
+        const ip = extractHopIP(receivedHeader);
+        const ipType = ip ? classifyIP(ip) : null;
+        const isPrivate = ipType === 'private';
+
+        const hop = {
+          timestamp,
+          server,
+          ip,
+          private: isPrivate,
+          hostname: null,
+          location: { country: null, region: null, city: null, lat: null, lon: null, postalCode: null, timezone: null },
+          isp: null,
+          asn: null,
+          whois: null,
+        };
+
+        if (ip) allIPs.add(ip);
+
+        if (ip && ipType === 'public') {
+          if (!publicIPs.includes(ip)) publicIPs.push(ip);
+          if (enrichment.has(ip) || enrichment.size < MAX_ENRICHED_IPS) {
+            const [location, asnInfo, hostname, whois] = await enrich(ip);
+            hop.hostname = hostname;
+            hop.location = {
               country: location.country,
               region: location.region,
               city: location.city,
@@ -630,10 +581,10 @@ router.post('/trace-email',
               lon: location.lon,
               postalCode: location.postalCode || null,
               timezone: location.timezone || null,
-            },
-            isp: asnInfo.isp,
-            asn: asnInfo.asn,
-            whois: {
+            };
+            hop.isp = asnInfo.isp;
+            hop.asn = asnInfo.asn;
+            hop.whois = {
               organization: whois.organization,
               abuseContact: whois.abuseContact,
               networkRange: whois.networkRange,
@@ -641,38 +592,43 @@ router.post('/trace-email',
               registrationDate: whois.registrationDate,
               registry: whois.registry,
               raw: whois.raw,
-            },
+            };
+          }
+        }
+
+        route.push(hop);
+      }
+
+      // Per-hop delay and total transit time from the Received timestamps.
+      const timing = computeTimings(route);
+
+      // Parse authentication results (status per method; see services/emailTrace)
+      const authentication = parseAuthenticationResults(rawHeaders);
+
+      // Check the first public sending IPs against blacklists.
+      const warningDetails = [];
+      const blacklistResults = await Promise.all(publicIPs.slice(0, 3).map((ip) => checkBlacklist(ip)));
+      let listedIpCount = 0;
+      for (const r of blacklistResults) {
+        if (r.listedOn.length > 0) {
+          listedIpCount++;
+          warningDetails.push({
+            severity: 'high',
+            message: `IP ${r.ip} is listed on ${r.listedOn.length} blacklist(s): ${r.listedOn.join(', ')}`
+          });
+        }
+        if (r.unavailable.length > 0) {
+          warningDetails.push({
+            severity: 'low',
+            message: `Blacklist check unavailable for ${r.ip} on ${r.unavailable.join(', ')} (the list did not answer our query); this is not a listing`
           });
         }
       }
 
-      // Parse authentication results
-      const authentication = parseAuthenticationResults(rawHeaders);
+      warningDetails.push(...authenticationWarnings(authentication));
 
-      // Check sending IPs against blacklists
-      const warnings = [];
-      const sendingIPs = Array.from(allIPs).slice(0, 3); // Check first 3 IPs
-
-      for (const ip of sendingIPs) {
-        const blacklists = await checkBlacklist(ip);
-        if (blacklists.length > 0) {
-          warnings.push(`IP ${ip} is listed on ${blacklists.length} blacklist(s): ${blacklists.join(', ')}`);
-        }
-      }
-
-      // Add authentication warnings
-      if (authentication.spf.pass === false) {
-        warnings.push('SPF check failed - sender domain may not be authorized');
-      }
-      if (authentication.dkim.pass === false) {
-        warnings.push('DKIM signature verification failed - message may be tampered');
-      }
-      if (authentication.dmarc.pass === false) {
-        warnings.push('DMARC policy check failed - message may be spoofed');
-      }
-
-      // Calculate spam score
-      const spamScore = calculateSpamScore(authentication, warnings);
+      // Toolsana heuristic score: each auth method counted once, plus listed IPs.
+      const spamScore = calculateSpamScore(authentication, listedIpCount);
 
       const responseTime = Date.now() - startTime;
 
@@ -681,11 +637,17 @@ router.post('/trace-email',
         route,
         authentication,
         spamScore,
-        warnings,
+        spamScoreSource: 'toolsana-heuristic',
+        warnings: warningDetails.map((w) => w.message),
+        warningDetails,
+        blacklists: blacklistResults,
         statistics: {
           totalHops: route.length,
           uniqueIPs: allIPs.size,
+          privateHops: route.filter((h) => h.private).length,
           countries: [...new Set(route.map(r => r.location.country).filter(Boolean))],
+          totalTime: timing.totalTime,
+          totalTimeSeconds: timing.totalSeconds,
           responseTime
         }
       };
@@ -737,44 +699,36 @@ router.post('/spf-checker',
     const requestId = `spf-check-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     try {
-      const { domain } = req.body;
+      // Anchored validation: rejects IP literals, localhost, *.local, *.internal
+      // (and other private-only names) without rejecting top10.com or site127.io.
+      const validation = validatePublicDomain(req.body.domain);
+      if (!validation.valid) {
+        if (validation.reason === 'private') {
+          logger.securityLog('Suspicious domain in SPF check', {
+            requestId,
+            domain: req.body.domain,
+            ip: req.ip,
+            userAgent: req.get('User-Agent')
+          });
+          return sendError(res, `${validation.error} for security reasons`, 403);
+        }
+        return sendError(res, validation.error, 400);
+      }
+      // Historic behaviour: the checker looks at the apex, not www.
+      const domain = validation.cleanDomain.replace(/^www\./, '');
+      const fresh = wantsFresh(req);
 
       logger.info('SPF checker request received', {
         requestId,
         domain,
+        fresh,
         ip: req.ip,
         userAgent: req.get('User-Agent')
       });
 
-      // Additional security check: prevent checking local/private networks
-      const suspiciousDomains = [
-        /localhost/i,
-        /127\./,
-        /0\.0\.0\.0/,
-        /169\.254\./, // Link-local
-        /192\.168\./, // Private network
-        /10\./, // Private network
-        /172\.(1[6-9]|2[0-9]|3[0-1])\./, // Private network
-        /\.local$/i, // mDNS
-        /\.internal$/i // Internal domains
-      ];
-
-      for (const pattern of suspiciousDomains) {
-        if (pattern.test(domain)) {
-          logger.securityLog('Suspicious domain in SPF check', {
-            requestId,
-            domain,
-            ip: req.ip,
-            userAgent: req.get('User-Agent')
-          });
-
-          return sendError(res, 'Checking local or private network domains is not allowed for security reasons', 403);
-        }
-      }
-
-      // Check Redis cache (24 hour TTL)
-      const cacheKey = `spf-check:${domain}`;
-      const cached = await redisUtils.get(cacheKey);
+      // Short-lived Redis cache (key versioned: v2 changed the lookup counting).
+      const cacheKey = `spf-check:v2:${domain}`;
+      const cached = fresh ? null : await redisUtils.get(cacheKey);
 
       if (cached) {
         logger.info('SPF check served from cache', {
@@ -782,9 +736,12 @@ router.post('/spf-checker',
           domain
         });
 
+        const cachedAt = cached.analyzedAt || null;
         return sendSuccess(res, 'SPF record retrieved from cache', {
           ...cached,
           cached: true,
+          cachedAt,
+          cacheAgeSeconds: cachedAt ? Math.max(0, Math.round((Date.now() - Date.parse(cachedAt)) / 1000)) : null,
           timestamp: new Date().toISOString()
         });
       }
@@ -840,17 +797,24 @@ router.post('/spf-checker',
           qualifierName: m.qualifierName,
           original: m.original
         })),
+        modifiers: spfResults.modifiers || {},
         allowedIPs: spfResults.allowedIPs,
+        // Counted recursively through include/redirect, the way receivers count.
         totalDnsLookups: spfResults.dnsLookups,
+        dnsLookupsIsLowerBound: spfResults.dnsLookupsIsLowerBound || false,
+        maxDnsLookups: 10,
+        voidLookups: spfResults.voidLookups || 0,
+        limitExceededAt: spfResults.limitExceededAt || null,
+        lookupBreakdown: spfResults.lookupBreakdown || [],
         issues: spfResults.issues,
         warnings: spfResults.warnings,
         lookupTime: totalTime,
         cached: false,
+        cachedAt: null,
         analyzedAt: new Date().toISOString()
       };
 
-      // Cache result for 24 hours (86400 seconds)
-      await redisUtils.setex(cacheKey, 86400, responseData);
+      await redisUtils.setex(cacheKey, SPF_CACHE_TTL_SECONDS, responseData);
 
       logger.info('SPF check completed', {
         requestId,
@@ -897,7 +861,7 @@ router.get('/info', async (req, res) => {
         path: '/api/email/spf-checker',
         description: 'Check and analyze SPF (Sender Policy Framework) records for email authentication',
         rateLimit: '30 requests per hour per user',
-        caching: '24 hours',
+        caching: '5 minutes (send { fresh: true } to bypass)',
         requestBody: {
           domain: 'string (required, domain name to check)'
         },
@@ -1447,18 +1411,23 @@ function detectRSAKeyLength(base64Key) {
   }
 }
 
+/**
+ * @returns {Promise<{ raw: string|null, status: 'found'|'not_found'|'lookup_failed', errorCode?: string }>}
+ * NXDOMAIN / NODATA mean "no record"; SERVFAIL, timeouts and refusals mean the
+ * lookup itself failed and says nothing about whether the record exists.
+ */
 async function lookupDKIMSelector(domain, selector) {
   const host = `${selector}._domainkey.${domain}`;
   try {
     const txt = await dns.resolveTxt(host);
-    if (!txt || txt.length === 0) return null;
+    if (!txt || txt.length === 0) return { raw: null, status: 'not_found' };
     // TXT records may be split into multiple strings; join them
     const raw = txt.map((arr) => arr.join('')).join('');
-    if (!raw) return null;
-    return raw;
+    if (!raw) return { raw: null, status: 'not_found' };
+    return { raw, status: 'found' };
   } catch (e) {
-    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return null;
-    return null;
+    if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return { raw: null, status: 'not_found' };
+    return { raw: null, status: 'lookup_failed', errorCode: e.code || 'DNS_ERROR' };
   }
 }
 
@@ -1516,14 +1485,20 @@ router.post(
     // Run lookups in parallel for auto-discovery, sequentially when single selector
     const rawResults = await Promise.all(
       candidateSelectors.map(async (sel) => {
-        const raw = await lookupDKIMSelector(domain, sel);
-        return { selector: sel, raw };
+        const lookup = await lookupDKIMSelector(domain, sel);
+        return { selector: sel, raw: lookup.raw, status: lookup.status, errorCode: lookup.errorCode };
       })
     );
 
     for (const item of rawResults) {
       if (!item.raw) {
-        results.push({ selector: item.selector, found: false });
+        results.push({
+          selector: item.selector,
+          found: false,
+          // not_found = NXDOMAIN/NODATA; lookup_failed = SERVFAIL/timeout (unknown, retry)
+          lookupStatus: item.status,
+          lookupError: item.errorCode || null,
+        });
         continue;
       }
       const tags = parseDKIMRecord(item.raw);
@@ -1534,7 +1509,8 @@ router.post(
       const flags = (tags['t'] || '').split(':').filter(Boolean);
       const note = tags['n'] || null;
       const publicKey = tags['p'] || '';
-      const revoked = publicKey.length === 0 && Object.prototype.hasOwnProperty.call(tags, 'p');
+      const hasPTag = Object.prototype.hasOwnProperty.call(tags, 'p');
+      const revoked = publicKey.length === 0 && hasPTag;
       let keyLength = null;
       if (keyType === 'rsa' && publicKey && !revoked) {
         keyLength = detectRSAKeyLength(publicKey);
@@ -1543,7 +1519,9 @@ router.post(
       if (version && version !== 'DKIM1') {
         issues.push({ severity: 'warning', message: `Unexpected DKIM version: ${version} (expected DKIM1)` });
       }
-      if (revoked) {
+      if (!hasPTag) {
+        issues.push({ severity: 'error', message: 'Record has no p= tag. The public key tag is required (RFC 6376 section 3.6.1), so receivers cannot verify signatures for this selector' });
+      } else if (revoked) {
         issues.push({ severity: 'error', message: 'Public key is empty — this selector has been revoked' });
       }
       if (keyType !== 'rsa' && keyType !== 'ed25519') {
@@ -1578,12 +1556,13 @@ router.post(
         keyLength,
         revoked,
         issues,
-        valid: issues.filter((i) => i.severity === 'error').length === 0 && !revoked,
+        valid: issues.filter((i) => i.severity === 'error').length === 0 && !revoked && hasPTag,
       });
     }
 
     const foundCount = results.filter((r) => r.found).length;
     const validCount = results.filter((r) => r.found && r.valid).length;
+    const failedCount = results.filter((r) => !r.found && r.lookupStatus === 'lookup_failed').length;
     const response = {
       domain,
       timestamp: new Date().toISOString(),
@@ -1591,17 +1570,19 @@ router.post(
       selectorsChecked: candidateSelectors,
       foundCount,
       validCount,
+      failedCount,
       results,
       lookupTime: Date.now() - startTime,
       cached: false,
     };
 
-    if (foundCount > 0) {
+    // Never cache a result that contains failed (retryable) lookups.
+    if (foundCount > 0 && failedCount === 0) {
       await redisUtils.setex(cacheKey, 3600, response);
     }
 
     logger.info('DKIM check completed', { requestId, domain, foundCount, validCount, lookupTime: response.lookupTime });
-    return sendSuccess(res, foundCount > 0 ? 'DKIM records analyzed successfully' : 'No DKIM records found for the checked selectors', response);
+    return sendSuccess(res, foundCount > 0 ? 'DKIM records analyzed successfully' : failedCount > 0 ? 'DNS lookup failed for some selectors - try again' : 'No DKIM records found for the checked selectors', response);
   }
 );
 
@@ -1683,6 +1664,37 @@ async function fetchDMARCRecord(domain) {
     if (e.code === 'ENOTFOUND' || e.code === 'ENODATA') return null;
     throw e;
   }
+}
+
+/**
+ * Find the DMARC record that applies to `domain`: its own _dmarc record or,
+ * when there is none, the nearest parent record, walking up label by label and
+ * stopping at the organizational (registrable) domain. The organizational
+ * domain comes from a small public-suffix heuristic (utils/dnsNames).
+ * Throws on DNS failures (SERVFAIL / timeout).
+ */
+async function resolveApplicableDMARC(domain) {
+  const orgDomain = organizationalDomain(domain);
+  const orgLabels = orgDomain.split('.').length;
+  let current = domain;
+  for (let i = 0; i < 10; i++) {
+    const raw = await fetchDMARCRecord(current);
+    if (raw) {
+      return { raw, recordDomain: current, inherited: current !== domain, orgDomain };
+    }
+    if (current === orgDomain) break;
+    const next = current.slice(current.indexOf('.') + 1);
+    if (!next || next === current || next.split('.').length < orgLabels) break;
+    current = next;
+  }
+  return { raw: null, recordDomain: null, inherited: false, orgDomain };
+}
+
+/** Policy that applies to `domain`: sp= (falling back to p=) when inherited. */
+function effectiveDMARCPolicy(tags, inherited) {
+  if (!tags) return null;
+  if (inherited && tags.sp) return tags.sp;
+  return tags.p || null;
 }
 
 function validateDMARCTags(tags) {
@@ -1796,15 +1808,18 @@ router.post(
     const startTime = Date.now();
     const { domain } = req.body;
 
-    const cacheKey = `dmarc-check:${domain}`;
+    // v2: results now include the organizational-domain fallback.
+    const cacheKey = `dmarc-check:v2:${domain}`;
     const cached = await redisUtils.get(cacheKey);
     if (cached) {
       return sendSuccess(res, 'DMARC record retrieved from cache', { ...cached, cached: true });
     }
 
     let raw;
+    let applicable;
     try {
-      raw = await fetchDMARCRecord(domain);
+      applicable = await resolveApplicableDMARC(domain);
+      raw = applicable.raw;
     } catch (e) {
       logger.error('DMARC lookup failed', { requestId, domain, error: e.message, code: e.code });
       return sendError(res, e.code === 'ENOTFOUND' ? 'Domain not found' : 'DNS lookup failed', e.code === 'ENOTFOUND' ? 404 : 500, {
@@ -1825,12 +1840,17 @@ router.post(
             message:
               'No DMARC record found at _dmarc.' +
               domain +
+              (applicable.orgDomain && applicable.orgDomain !== domain ? ' or at the organizational domain _dmarc.' + applicable.orgDomain : '') +
               '. Bulk senders to Gmail / Yahoo (2024 requirements) must publish at least v=DMARC1; p=none; rua=mailto:dmarc@yourdomain.com',
           },
         ],
         rua: [],
         ruf: [],
         compliant2024: false,
+        recordDomain: null,
+        inherited: false,
+        organizationalDomain: applicable.orgDomain,
+        effectivePolicy: null,
         lookupTime: Date.now() - startTime,
         cached: false,
       };
@@ -1840,6 +1860,14 @@ router.post(
 
     const tags = parseDMARCRecord(raw);
     const { issues, rua, ruf, compliant2024 } = validateDMARCTags(tags);
+    const effectivePolicy = effectiveDMARCPolicy(tags, applicable.inherited);
+    if (applicable.inherited) {
+      issues.unshift({
+        severity: 'info',
+        message: `No record at _dmarc.${domain}; the record at _dmarc.${applicable.recordDomain} applies to it` +
+          (tags.sp ? ` with its subdomain policy sp=${tags.sp}.` : ` (no sp= tag, so p=${tags.p || '?'} applies to subdomains too).`),
+      });
+    }
 
     const response = {
       domain,
@@ -1852,6 +1880,10 @@ router.post(
       ruf,
       compliant2024,
       valid: issues.filter((i) => i.severity === 'error').length === 0,
+      recordDomain: applicable.recordDomain,
+      inherited: applicable.inherited,
+      organizationalDomain: applicable.orgDomain,
+      effectivePolicy,
       lookupTime: Date.now() - startTime,
       cached: false,
     };
@@ -2084,12 +2116,14 @@ function validateSVGTinyPS(svgText, fullByteLength) {
 
 async function fetchDMARCForBIMI(domain) {
   try {
-    const raw = await fetchDMARCRecord(domain);
+    const applicable = await resolveApplicableDMARC(domain);
+    const raw = applicable.raw;
     if (!raw) return { found: false, eligible: false, raw: null, tags: null };
     const tags = parseDMARCRecord(raw);
     const pct = tags.pct === undefined ? 100 : Number(tags.pct);
-    const eligible = (tags.p === 'quarantine' || tags.p === 'reject') && pct === 100;
-    return { found: true, eligible, raw, tags };
+    const policy = effectiveDMARCPolicy(tags, applicable.inherited);
+    const eligible = (policy === 'quarantine' || policy === 'reject') && pct === 100;
+    return { found: true, eligible, raw, tags, recordDomain: applicable.recordDomain, inherited: applicable.inherited, effectivePolicy: policy };
   } catch {
     return { found: false, eligible: false, raw: null, tags: null };
   }
@@ -2114,7 +2148,7 @@ router.post(
     const startTime = Date.now();
     const { domain } = req.body;
 
-    const cacheKey = `bimi-check:${domain}`;
+    const cacheKey = `bimi-check:v2:${domain}`;
     const cached = await redisUtils.get(cacheKey);
     if (cached) {
       return sendSuccess(res, 'BIMI record retrieved from cache', { ...cached, cached: true });
@@ -2171,6 +2205,36 @@ router.post(
       issues.push({ severity: 'error', message: `Unexpected version: ${tags.v} (must be BIMI1)` });
     }
 
+    // Declination record: an empty l= (with no certificate) is how a domain
+    // explicitly opts out of BIMI. It is valid, not an error, and the logo /
+    // DMARC-enforcement prerequisites do not apply.
+    const declined = Object.prototype.hasOwnProperty.call(tags, 'l') && tags.l === '' && !tags.a;
+    if (declined && tags.v === 'BIMI1') {
+      const response = {
+        domain,
+        timestamp: new Date().toISOString(),
+        found: true,
+        declined: true,
+        record: raw,
+        tags,
+        logo: null,
+        vmc: null,
+        dmarc,
+        issues: [
+          {
+            severity: 'info',
+            message: 'This is a BIMI declination record (empty l=): the domain has opted out of showing a brand logo. No logo will be displayed, by design.',
+          },
+        ],
+        valid: true,
+        clientCompatibility: null,
+        lookupTime: Date.now() - startTime,
+        cached: false,
+      };
+      await redisUtils.setex(cacheKey, 3600, response);
+      return sendSuccess(res, 'BIMI declination record found', response);
+    }
+
     // DMARC prerequisite
     if (!dmarc.found) {
       issues.push({
@@ -2181,7 +2245,7 @@ router.post(
       const pct = dmarc.tags.pct === undefined ? 100 : Number(dmarc.tags.pct);
       issues.push({
         severity: 'error',
-        message: `DMARC policy is p=${dmarc.tags.p || 'unknown'}${pct !== 100 ? ` pct=${pct}` : ''} — BIMI requires p=quarantine or p=reject with pct=100.`,
+        message: `DMARC policy is ${dmarc.inherited && dmarc.tags.sp ? 'sp' : 'p'}=${dmarc.effectivePolicy || 'unknown'}${pct !== 100 ? ` pct=${pct}` : ''} — BIMI requires p=quarantine or p=reject with pct=100.`,
       });
     }
 
@@ -2241,7 +2305,7 @@ router.post(
           vmc = { url: tags.a, fetched: false, status: resource.status, statusText: resource.statusText };
           issues.push({
             severity: 'warning',
-            message: `VMC URL returned HTTP ${resource.status} ${resource.statusText}. Gmail requires a valid VMC.`,
+            message: `VMC URL returned HTTP ${resource.status} ${resource.statusText}. Gmail and Apple Mail require a valid VMC or CMC.`,
           });
         } else {
           const text = new TextDecoder('utf-8').decode(resource.bytes);
@@ -2356,14 +2420,14 @@ router.post(
         vmc = { url: tags.a, fetched: false, error: e.message };
         issues.push({
           severity: 'warning',
-          message: `Unable to fetch VMC: ${e.message}. Gmail BIMI requires a valid VMC.`,
+          message: `Unable to fetch VMC: ${e.message}. Gmail and Apple Mail require a valid VMC or CMC.`,
         });
       }
     } else {
       issues.push({
         severity: 'info',
         message:
-          'No VMC (a=) tag — your logo will display in Yahoo, Apple Mail, AOL, and Fastmail but not Gmail. Gmail strictly requires a Verified Mark Certificate.',
+          'No certificate (a=) tag — your logo can display in Yahoo, AOL and Fastmail but not in Gmail or Apple Mail, which require a Verified Mark Certificate (VMC) or Common Mark Certificate (CMC).',
       });
     }
 
@@ -2378,10 +2442,12 @@ router.post(
       dmarc,
       issues,
       valid: issues.filter((i) => i.severity === 'error').length === 0,
+      // Gmail and Apple Mail only show BIMI logos backed by a mark certificate
+      // (VMC or CMC); Yahoo, AOL and Fastmail do not require one.
       clientCompatibility: {
         gmail: !!(vmc && vmc.fetched && vmc.looksLikePem && vmc.expired !== true) && dmarc.eligible && !!(logo && logo.svgValid),
         yahoo: dmarc.eligible && !!(logo && logo.svgValid),
-        appleMail: dmarc.eligible && !!(logo && logo.svgValid),
+        appleMail: !!(vmc && vmc.fetched && vmc.looksLikePem && vmc.expired !== true) && dmarc.eligible && !!(logo && logo.svgValid),
         aol: dmarc.eligible && !!(logo && logo.svgValid),
         fastmail: dmarc.eligible && !!(logo && logo.svgValid),
       },
