@@ -155,10 +155,71 @@ function stripBrackets(host) {
 }
 
 /**
+ * Upper bound for a single DNS resolution when the caller supplies no tighter
+ * deadline. getaddrinfo follows the system resolver's own retry policy, which
+ * for an unresponsive authoritative server can run to ~30 s — far past the
+ * 10 s request timeouts the routes advertise.
+ */
+const DEFAULT_LOOKUP_TIMEOUT_MS = 10000;
+
+/** Error shaped like the one fetch() rejects with when its signal aborts. */
+function abortErrorFrom(signal, fallbackMessage = 'This operation was aborted') {
+  if (signal && signal.reason instanceof Error) return signal.reason;
+  const err = new Error(fallbackMessage);
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
+ * dns.lookup raced against the caller's AbortSignal and a hard timer.
+ *
+ * getaddrinfo itself cannot be cancelled (it runs on the libuv threadpool), so
+ * a losing lookup keeps running in the background — but its result is
+ * discarded and the caller is released at the deadline. Listener and timer
+ * are always cleaned up, whichever side settles first.
+ */
+function lookupWithDeadline(host, { signal, timeoutMs = DEFAULT_LOOKUP_TIMEOUT_MS } = {}) {
+  if (signal && signal.aborted) return Promise.reject(abortErrorFrom(signal));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+
+    const onAbort = () => finish(reject, abortErrorFrom(signal));
+    function finish(fn, value) {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      fn(value);
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        const err = new Error(`DNS lookup timed out after ${timeoutMs} ms`);
+        err.code = 'DNS_TIMEOUT';
+        finish(reject, err);
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    Promise.resolve()
+      .then(() => dns.lookup(host, { all: true, verbatim: true }))
+      .then((results) => finish(resolve, results), (err) => finish(reject, err));
+  });
+}
+
+/**
  * Resolve `hostname` (an IP literal or a domain) and confirm every resolved
  * address is public. Returns { valid, addresses } or { valid:false, error }.
+ *
+ * `options.signal` / `options.timeoutMs` bound the DNS step. A resolution cut
+ * short by either comes back as { valid:false, code:'ABORTED'|'DNS_TIMEOUT' }
+ * so callers can report a timeout instead of "could not be resolved". Either
+ * way it fails closed.
  */
-async function screenHostname(hostname) {
+async function screenHostname(hostname, options = {}) {
   const host = stripBrackets(String(hostname || '').trim().toLowerCase());
   if (!host) return { valid: false, error: 'Invalid host' };
 
@@ -169,9 +230,15 @@ async function screenHostname(hostname) {
 
   let addresses;
   try {
-    const results = await dns.lookup(host, { all: true, verbatim: true });
+    const results = await lookupWithDeadline(host, options);
     addresses = results.map((r) => r.address);
-  } catch {
+  } catch (err) {
+    if (options.signal && options.signal.aborted) {
+      return { valid: false, error: 'Request timeout', code: 'ABORTED', cause: abortErrorFrom(options.signal) };
+    }
+    if (err && err.code === 'DNS_TIMEOUT') {
+      return { valid: false, error: 'Host resolution timed out', code: 'DNS_TIMEOUT', cause: err };
+    }
     return { valid: false, error: 'Host could not be resolved' };
   }
   if (!addresses.length) return { valid: false, error: 'Host could not be resolved' };
@@ -184,10 +251,11 @@ async function screenHostname(hostname) {
 
 /**
  * Screen a full URL string. Enforces http/https (unless requireHttp is false),
- * then resolves and range-checks the host.
+ * then resolves and range-checks the host. `signal` / `timeoutMs` bound the
+ * DNS step (see screenHostname).
  * Returns { valid, url, hostname, addresses } or { valid:false, error }.
  */
-async function checkPublicUrl(rawUrl, { requireHttp = true } = {}) {
+async function checkPublicUrl(rawUrl, { requireHttp = true, signal, timeoutMs } = {}) {
   let url;
   try {
     url = new URL(rawUrl);
@@ -197,14 +265,14 @@ async function checkPublicUrl(rawUrl, { requireHttp = true } = {}) {
   if (requireHttp && !['http:', 'https:'].includes(url.protocol)) {
     return { valid: false, error: 'Only HTTP and HTTPS URLs are allowed' };
   }
-  const res = await screenHostname(url.hostname);
+  const res = await screenHostname(url.hostname, { signal, timeoutMs });
   if (!res.valid) return res;
   return { valid: true, url, hostname: url.hostname, addresses: res.addresses };
 }
 
 /** Screen a bare hostname/domain (no scheme). Resolves and range-checks. */
-async function checkPublicHostname(hostname) {
-  return screenHostname(hostname);
+async function checkPublicHostname(hostname, options) {
+  return screenHostname(hostname, options);
 }
 
 /**
@@ -236,6 +304,20 @@ function pinnedLookup(address) {
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /**
+ * Cancel an unread fetch Response body so its connection is released. Safe on
+ * bodiless/already-consumed responses and on test doubles without a body.
+ */
+async function discardBody(response) {
+  try {
+    if (response && response.body && !response.bodyUsed && typeof response.body.cancel === 'function') {
+      await response.body.cancel();
+    }
+  } catch {
+    // Already errored/locked streams have nothing left to release.
+  }
+}
+
+/**
  * Error thrown by safeFetch when a hop resolves to a private/reserved address.
  * Carries `code = 'SSRF_BLOCKED'` so routes can map it to HTTP 403.
  */
@@ -260,8 +342,14 @@ class SsrfBlockedError extends Error {
  * hop is private/reserved, or a TOO_MANY_REDIRECTS error past `maxRedirects`.
  * Method/body are downgraded to GET on 301/302/303 per RFC 9110; 307/308
  * preserve both.
+ *
+ * `options.signal` covers the per-hop DNS resolution as well as the request
+ * itself: an abort during resolution rejects with the same AbortError fetch()
+ * would. Each resolution is additionally capped at `lookupTimeoutMs`; hitting
+ * that cap rejects with name 'AbortError', code 'DNS_TIMEOUT', so routes that
+ * already map AbortError to a timeout response handle it unchanged.
  */
-async function safeFetch(rawUrl, options = {}, { maxRedirects = 5 } = {}) {
+async function safeFetch(rawUrl, options = {}, { maxRedirects = 5, lookupTimeoutMs = DEFAULT_LOOKUP_TIMEOUT_MS } = {}) {
   const baseOptions = { ...options };
   delete baseOptions.redirect; // we follow manually so each hop can be screened
   let currentUrl = String(rawUrl);
@@ -291,8 +379,15 @@ async function safeFetch(rawUrl, options = {}, { maxRedirects = 5 } = {}) {
   });
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
-    const guard = await checkPublicUrl(currentUrl);
+    const guard = await checkPublicUrl(currentUrl, { signal: options.signal, timeoutMs: lookupTimeoutMs });
     if (!guard.valid) {
+      if (guard.code === 'ABORTED') throw guard.cause;
+      if (guard.code === 'DNS_TIMEOUT') {
+        const err = new Error(guard.cause.message);
+        err.name = 'AbortError';
+        err.code = 'DNS_TIMEOUT';
+        throw err;
+      }
       throw new SsrfBlockedError(guard.error, currentUrl);
     }
 
@@ -332,6 +427,10 @@ async function safeFetch(rawUrl, options = {}, { maxRedirects = 5 } = {}) {
 
     redirectChain.push({ from: currentUrl, to: nextUrl, status: response.status });
 
+    // We are abandoning this 3xx response. Cancel its body so undici releases
+    // the socket now instead of when the Response is garbage-collected.
+    await discardBody(response);
+
     // RFC 9110: 303 always becomes GET; 301/302 historically downgrade POST to
     // GET (matching browser + undici `follow` behaviour). 307/308 preserve.
     if (response.status === 303 || (method === 'POST' && (response.status === 301 || response.status === 302))) {
@@ -354,6 +453,8 @@ module.exports = {
   checkPublicHostname,
   pinnedLookup,
   safeFetch,
+  discardBody,
   SsrfBlockedError,
   GENERIC_PRIVATE_ERROR,
+  DEFAULT_LOOKUP_TIMEOUT_MS,
 };
