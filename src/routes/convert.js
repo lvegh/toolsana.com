@@ -6,6 +6,7 @@ const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurity');
 const logger = require('../utils/logger');
 const { classifyInputError } = require('../utils/inputErrors');
+const { attachmentDisposition, headerSafeFilename } = require('../utils/headerFilename');
 const { vectorize, ColorMode, Hierarchical, PathSimplifyMode } = require('@neplex/vectorizer');
 
 const router = express.Router();
@@ -531,9 +532,9 @@ router.post('/image-to-base64', basicRateLimit, uploadAnyImage.single('file'), a
     // Set response headers
     res.set({
       'Content-Type': contentType,
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': Buffer.byteLength(output, 'utf8').toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Base64-Length': base64String.length.toString(),
       'X-Output-Format': copyFormat,
@@ -724,7 +725,7 @@ router.post('/base64-to-image', basicRateLimit, async (req, res) => {
     // Set response headers
     res.set({
       'Content-Type': outputMimeType,
-      'Content-Disposition': `attachment; filename="${outputFilename}"`,
+      'Content-Disposition': attachmentDisposition(outputFilename),
       'Content-Length': outputBuffer.length.toString(),
       'X-Original-Format': sourceFormat,
       'X-Output-Format': extension,
@@ -852,9 +853,9 @@ router.post('/png-to-svg', basicRateLimit, uploadPng.single('file'), async (req,
     // Set response headers
     res.set({
       'Content-Type': 'image/svg+xml',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': svgBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': svgBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -1073,9 +1074,9 @@ router.post('/jpg-to-svg', basicRateLimit, uploadJpg.single('file'), async (req,
     // Set response headers
     res.set({
       'Content-Type': 'image/svg+xml',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': svgBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': svgBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -1320,9 +1321,9 @@ router.post('/svg-to-jpg', basicRateLimit, uploadSvg.single('file'), async (req,
     // Set response headers
     res.set({
       'Content-Type': 'image/jpeg',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': jpegBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': jpegBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -1501,9 +1502,9 @@ router.post('/svg-to-png', basicRateLimit, uploadSvg.single('file'), async (req,
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': pngBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': pngBuffer.length.toString(),
       'X-Size-Change': `${sizeChange}%`,
@@ -1657,9 +1658,9 @@ router.post('/avif-to-png', basicRateLimit, uploadAvif.single('file'), async (re
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': pngBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': pngBuffer.length.toString(),
       'X-Size-Change': `${sizeChange}%`,
@@ -1820,9 +1821,9 @@ router.post('/avif-to-jpg', basicRateLimit, uploadAvif.single('file'), async (re
     // Set response headers
     res.set({
       'Content-Type': 'image/jpeg',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': jpegBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': jpegBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -1979,9 +1980,9 @@ router.post('/avif-to-webp', basicRateLimit, uploadAvif.single('file'), async (r
     // Set response headers
     res.set({
       'Content-Type': 'image/webp',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': webpBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': webpBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -2071,9 +2072,9 @@ router.post('/jpg-to-png', basicRateLimit, uploadJpg.single('file'), async (req,
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': pngBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': pngBuffer.length.toString(),
       'X-Compression-Level': compressionLevel.toString()
@@ -2229,9 +2230,9 @@ router.post('/png-to-avif', basicRateLimit, uploadPng.single('file'), async (req
     // Set response headers
     res.set({
       'Content-Type': 'image/avif',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': avifBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': avifBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -2385,9 +2386,9 @@ router.post('/jpg-to-avif', basicRateLimit, uploadJpg.single('file'), async (req
     // Set response headers
     res.set({
       'Content-Type': 'image/avif',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': avifBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': avifBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -2551,9 +2552,9 @@ router.post('/webp-to-jpg', basicRateLimit, uploadWebp.single('file'), async (re
     // Set response headers
     res.set({
       'Content-Type': 'image/jpeg',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': jpegBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': jpegBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -2701,9 +2702,9 @@ router.post('/webp-to-png', basicRateLimit, uploadWebp.single('file'), async (re
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': pngBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': pngBuffer.length.toString(),
       'X-Size-Change': `${sizeChange}%`,
@@ -2856,9 +2857,9 @@ router.post('/webp-to-avif', enhancedSecurityWithRateLimit(basicRateLimit), uplo
     // Set response headers
     res.set({
       'Content-Type': 'image/avif',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': avifBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': avifBuffer.length.toString(),
       'X-Compression-Ratio': compressionRatio + '%',
@@ -2970,9 +2971,9 @@ router.post('/png-to-jpg', enhancedSecurityWithRateLimit(basicRateLimit), upload
     // Set response headers
     res.set({
       'Content-Type': 'image/jpeg',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': jpgBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': jpgBuffer.length.toString(),
       'X-Quality': quality.toString(),
@@ -3058,9 +3059,9 @@ router.post('/png-to-webp', basicRateLimit, uploadPng.single('file'), async (req
     // Set response headers
     res.set({
       'Content-Type': 'image/webp',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': webpBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': webpBuffer.length.toString(),
       'X-Quality': lossless ? 'lossless' : quality.toString(),
@@ -3223,9 +3224,9 @@ router.post('/jpg-to-webp', basicRateLimit, uploadJpg.single('file'), async (req
     // Set response headers
     res.set({
       'Content-Type': 'image/webp',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': webpBuffer.length.toString(),
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       'X-Original-Size': originalBuffer.length.toString(),
       'X-Converted-Size': webpBuffer.length.toString(),
       'X-Quality': lossless ? 'lossless' : quality.toString(),

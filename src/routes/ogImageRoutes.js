@@ -4,6 +4,7 @@ const { body, query, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const { generateOGImage, getTemplates, getCacheKey } = require('../services/ogImageService');
 const redis = require('../config/redis');
+const { attachmentDisposition } = require('../utils/headerFilename');
 
 // Upper bound on the base64 blob accepted by /api/og/:encodedParams. Generous
 // next to the field limits enforced in ogImageService, but small enough that
@@ -146,7 +147,7 @@ router.get('/download', ogRateLimit, validateOGParams, async (req, res) => {
 
     res.set({
       'Content-Type': mimeType,
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Cache-Control': 'public, max-age=86400',
     });
 

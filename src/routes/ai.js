@@ -4,6 +4,7 @@ const { removeBackground } = require('@imgly/background-removal-node');
 const { basicRateLimit } = require('../middleware/rateLimit');
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const { enhancedSecurityWithRateLimitAi } = require('../middleware/enhancedSecurityAi');
+const { attachmentDisposition, headerSafeFilename } = require('../utils/headerFilename');
 
 const router = express.Router();
 
@@ -146,9 +147,9 @@ router.post('/remove-background', enhancedSecurityWithRateLimitAi(basicRateLimit
         // Set response headers
         res.set({
             'Content-Type': 'image/png',
-            'Content-Disposition': `attachment; filename="${filename}"`,
+            'Content-Disposition': attachmentDisposition(filename),
             'Content-Length': processedBuffer.length.toString(),
-            'X-Original-Filename': req.file.originalname,
+            'X-Original-Filename': headerSafeFilename(req.file.originalname),
             'X-Original-Size': originalBuffer.length.toString(),
             'X-Processed-Size': processedBuffer.length.toString(),
             'X-Compression-Ratio': compressionRatio + '%',

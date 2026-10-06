@@ -9,6 +9,7 @@ const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurit
 const { sendSuccess, sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 const { classifyInputError } = require('../utils/inputErrors');
+const { attachmentDisposition, headerSafeFilename } = require('../utils/headerFilename');
 const pngOptimizer = require('../services/pngOptimizer');
 const { compressJpeg } = require('../services/jpgOptimizer');
 const { compressWebp } = require('../services/webpOptimizer');
@@ -118,13 +119,13 @@ router.post('/jpg', enhancedSecurityWithRateLimit(basicRateLimit), uploadJpg.sin
     // Set response headers
     res.set({
       'Content-Type': 'image/jpeg',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': compressedSize.toString(),
       'X-Original-Size': originalSize.toString(),
       'X-Compressed-Size': compressedSize.toString(),
       'X-Compression-Ratio': compressionRatio,
       'X-Quality': String(usedQuality),
-      'X-Original-Filename': req.file.originalname
+      'X-Original-Filename': headerSafeFilename(req.file.originalname)
     });
 
     // Send the compressed image
@@ -191,13 +192,13 @@ router.post('/png', enhancedSecurityWithRateLimit(basicRateLimit), uploadPng.sin
     // Set response headers
     res.set({
       'Content-Type': 'image/png',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': compressionResult.compressedSize.toString(),
       'X-Original-Size': originalSize.toString(),
       'X-Compressed-Size': compressionResult.compressedSize.toString(),
       'X-Compression-Ratio': compressionResult.compressionRatio,
       'X-Compression-Strategy': compressionResult.strategy,
-      'X-Original-Filename': req.file.originalname
+      'X-Original-Filename': headerSafeFilename(req.file.originalname)
     });
 
     // Send the compressed image
@@ -281,13 +282,13 @@ router.post('/webp', enhancedSecurityWithRateLimit(basicRateLimit), uploadWebp.s
     // Set response headers
     res.set({
       'Content-Type': 'image/webp',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': compressedSize.toString(),
       'X-Original-Size': originalSize.toString(),
       'X-Compressed-Size': compressedSize.toString(),
       'X-Compression-Ratio': compressionRatio,
       'X-Quality': String(usedQuality),
-      'X-Original-Filename': req.file.originalname
+      'X-Original-Filename': headerSafeFilename(req.file.originalname)
     });
 
     // Send the compressed image

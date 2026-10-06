@@ -5,6 +5,7 @@ const { enhancedSecurityWithRateLimit } = require('../middleware/enhancedSecurit
 const { sendError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 const { classifyInputError } = require('../utils/inputErrors');
+const { attachmentDisposition, headerSafeFilename } = require('../utils/headerFilename');
 const pdfOptimizer = require('../services/pdfOptimizer');
 
 const router = express.Router();
@@ -77,7 +78,7 @@ router.post('/compress', enhancedSecurityWithRateLimit(basicRateLimit), uploadPd
 
     res.set({
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': attachmentDisposition(filename),
       'Content-Length': stats.compressedSize.toString(),
       'X-Original-Size': stats.originalSize.toString(),
       'X-Compressed-Size': stats.compressedSize.toString(),
@@ -87,7 +88,7 @@ router.post('/compress', enhancedSecurityWithRateLimit(basicRateLimit), uploadPd
       'X-Images-Recompressed': stats.imagesRecompressed.toString(),
       'X-Images-Skipped': stats.imagesSkipped.toString(),
       'X-Compression-Level': level,
-      'X-Original-Filename': req.file.originalname,
+      'X-Original-Filename': headerSafeFilename(req.file.originalname),
       // The frontend reads the X-* stats to explain the result, so they must
       // survive the cross-origin hop.
       'Access-Control-Expose-Headers': [
