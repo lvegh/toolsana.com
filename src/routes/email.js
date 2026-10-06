@@ -1,6 +1,5 @@
 const express = require('express');
 const { simpleParser } = require('mailparser');
-const geoip = require('geoip-lite');
 const dns = require('dns').promises;
 const net = require('net');
 const nodemailer = require('nodemailer');
@@ -210,6 +209,20 @@ function extractServer(receivedHeader) {
 }
 
 /**
+ * geoip-lite reads its whole IP database (~280 MB) into memory when it is
+ * required, so load it on the first lookup instead of in every cluster
+ * instance at boot. The load is synchronous (~70 ms) and happens once per
+ * instance.
+ */
+let geoip = null;
+function getGeoip() {
+  if (!geoip) {
+    geoip = require('geoip-lite');
+  }
+  return geoip;
+}
+
+/**
  * Perform IP geolocation with caching
  */
 async function geolocateIP(ip) {
@@ -222,7 +235,7 @@ async function geolocateIP(ip) {
   }
 
   // Use geoip-lite for fast, local geolocation
-  const geo = geoip.lookup(ip);
+  const geo = getGeoip().lookup(ip);
 
   if (!geo) {
     return {
